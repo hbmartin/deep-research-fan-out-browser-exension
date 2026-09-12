@@ -7,6 +7,9 @@ type ExtensionBrowser = typeof browser & {
     createDocument(options: { url: string; reasons: string[]; justification: string }): Promise<void>;
     closeDocument(): Promise<void>;
   };
+  runtime: typeof browser.runtime & {
+    getContexts?(filter: { contextTypes: string[]; documentUrls: string[] }): Promise<unknown[]>;
+  };
 };
 
 const api = browser as ExtensionBrowser;
@@ -36,7 +39,17 @@ export function handleOffscreenResponse(message: RuntimeRequest): boolean {
 
 async function ensureOffscreen(): Promise<void> {
   if (!api.offscreen) return;
-  offscreenReady ??= api.offscreen.createDocument({
+  if (offscreenReady) {
+    await offscreenReady;
+    if (!api.runtime.getContexts) return;
+    const contexts = await api.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [browser.runtime.getURL('/offscreen.html')],
+    });
+    if (contexts.length) return;
+    offscreenReady = undefined;
+  }
+  const creation = api.offscreen.createDocument({
     url: '/offscreen.html',
     reasons: ['CLIPBOARD'],
     justification: 'Read and restore research reports copied by the provider pages.',
@@ -44,7 +57,13 @@ async function ensureOffscreen(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     if (!/single offscreen|already exists/i.test(message)) throw error;
   });
-  await offscreenReady;
+  offscreenReady = creation;
+  try {
+    await creation;
+  } catch (error) {
+    if (offscreenReady === creation) offscreenReady = undefined;
+    throw error;
+  }
 }
 
 type OffscreenRequest =
@@ -63,7 +82,15 @@ async function offscreenRequest(message: OffscreenRequest): Promise<string> {
       reject(new Error('Clipboard operation timed out'));
     }, 3000);
   });
-  await browser.runtime.sendMessage({ ...message, requestId });
+  try {
+    await browser.runtime.sendMessage({ ...message, requestId });
+  } catch (error) {
+    const waiter = offscreenWaiters.get(requestId);
+    if (waiter) {
+      offscreenWaiters.delete(requestId);
+      waiter.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
   return result;
 }
 
@@ -157,3 +184,13 @@ export function createPlatform(): BrowserPlatform {
 export async function sendTabEvent(tabId: number, event: BackgroundEvent): Promise<unknown> {
   return browser.tabs.sendMessage(tabId, event);
 }
+
+export const platformTestHooks = {
+  ensureOffscreen,
+  offscreenRequest,
+  getOffscreenWaiterCount: () => offscreenWaiters.size,
+  resetOffscreenState: () => {
+    offscreenReady = undefined;
+    offscreenWaiters.clear();
+  },
+};

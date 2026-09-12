@@ -1,7 +1,7 @@
 import { ADAPTERS } from './adapters';
 import { buildArtifact } from './artifacts';
 import { reconcileCitations } from './citations';
-import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, listRuns, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
+import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
 import type { RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
@@ -10,10 +10,61 @@ import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type 
 
 const ALARM_NAME = 'reconcile-runs';
 let captureWorkerRunning = false;
+let reconcileWorkerRunning = false;
 let lastNonRunInteractionAt = 0;
 const knownRunTabIds = new Set<number>();
+const expectedTabActivations = new Map<number, number>();
+const finalizingRunIds = new Set<string>();
+const runMutationTails = new Map<string, Promise<void>>();
 
 class CaptureDeferredError extends Error {}
+
+async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
+  const previous = runMutationTails.get(runId)?.catch(() => undefined) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  runMutationTails.set(runId, tail);
+  await previous;
+  try {
+    const run = await getRun(runId);
+    if (!run) throw new Error('Run not found.');
+    const value = mutation(run);
+    await putRun(run);
+    return { run, value };
+  } finally {
+    release();
+    if (runMutationTails.get(runId) === tail) runMutationTails.delete(runId);
+  }
+}
+
+function setKnownRunTabs(runs: Run[]): void {
+  knownRunTabIds.clear();
+  for (const run of runs) for (const providerRun of Object.values(run.providerRuns)) knownRunTabIds.add(providerRun.tabId);
+}
+
+async function activateTabInternally(tabId: number): Promise<void> {
+  markExpectedTabActivation(tabId);
+  await browser.tabs.update(tabId, { active: true });
+}
+
+function markExpectedTabActivation(tabId: number, now = Date.now()): number {
+  const expiresAt = now + 2000;
+  expectedTabActivations.set(tabId, expiresAt);
+  setTimeout(() => {
+    if (expectedTabActivations.get(tabId) === expiresAt) expectedTabActivations.delete(tabId);
+  }, 2000);
+  return expiresAt;
+}
+
+function recordTabActivation(tabId: number, now = Date.now()): boolean {
+  const expectedUntil = expectedTabActivations.get(tabId);
+  expectedTabActivations.delete(tabId);
+  if (expectedUntil !== undefined && expectedUntil >= now) return false;
+  if (knownRunTabIds.has(tabId)) return false;
+  lastNonRunInteractionAt = now;
+  return true;
+}
 
 function errorResponse(error: unknown): RuntimeResponse {
   return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -25,8 +76,7 @@ function composeQuery(query: string, appendString: string): string {
 
 async function broadcastRuns(): Promise<void> {
   const runs = await listRuns();
-  knownRunTabIds.clear();
-  for (const run of runs) for (const providerRun of Object.values(run.providerRuns)) knownRunTabIds.add(providerRun.tabId);
+  setKnownRunTabs(runs);
   await browser.runtime.sendMessage({ type: 'runs:changed', runs }).catch(() => undefined);
   await updateBadge(runs);
 }
@@ -108,7 +158,7 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
     providerRuns,
     status: 'active',
     slug,
-    downloadFolder: createDownloadFolder(settings.downloadRoot, now, slug),
+    downloadFolder: createDownloadFolder(settings.downloadRoot, now, slug, id),
   };
   const tabIds = tabs.flatMap((tab) => tab.id === undefined ? [] : [tab.id]);
   const updateTab = browser.tabs.update as unknown as (tabId: number, properties: Record<string, unknown>) => Promise<unknown>;
@@ -128,17 +178,16 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
 }
 
 async function mutateProvider(runId: string, provider: ProviderId, status: ProviderRunStatus, detail?: string, submittedAt?: number): Promise<Run> {
-  const run = await getRun(runId);
-  if (!run) throw new Error('Run not found.');
-  const providerRun = run.providerRuns[provider];
-  if (!providerRun) throw new Error('Provider is not part of this run.');
-  assertTransition(providerRun.status, status);
-  providerRun.status = status;
-  providerRun.statusDetail = detail;
-  if (submittedAt) providerRun.submittedAt = submittedAt;
-  if (isTerminalProviderStatus(status)) providerRun.completedAt = Date.now();
-  run.status = deriveRunStatus(run);
-  await putRun(run);
+  const { run } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) throw new Error('Provider is not part of this run.');
+    assertTransition(providerRun.status, status);
+    providerRun.status = status;
+    providerRun.statusDetail = detail;
+    if (submittedAt) providerRun.submittedAt = submittedAt;
+    if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
+    storedRun.status = deriveRunStatus(storedRun);
+  });
   if (status === 'awaiting_user' || status === 'manual_required') {
     await createPlatform().notify(`attention:${runId}:${provider}`, `${ADAPTERS[provider].label} needs your input`, detail || 'Open the provider tab to continue.');
   }
@@ -151,7 +200,7 @@ async function mutateProvider(runId: string, provider: ProviderId, status: Provi
 }
 
 async function resolveCitationUrls(provider: ProviderId, citations: DomCitation[]): Promise<{ citations: DomCitation[]; resolved: number; unresolved: number }> {
-  if (provider !== 'gemini') return { citations, resolved: 0, unresolved: 0 };
+  if (ADAPTERS[provider].urlResolution !== 'follow_redirect') return { citations, resolved: 0, unresolved: 0 };
   let resolved = 0;
   let unresolved = 0;
   const output: DomCitation[] = [];
@@ -207,13 +256,90 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
   if (Date.now() - lastNonRunInteractionAt < 5000) throw new CaptureDeferredError('Waiting until the user is idle before focusing a provider tab.');
   const [current] = await browser.tabs.query({ active: true, currentWindow: true });
   try {
-    await browser.tabs.update(job.tabId, { active: true });
+    await activateTabInternally(job.tabId);
     await new Promise((resolve) => setTimeout(resolve, 150));
     return await attemptCapture();
   } catch {
     return undefined;
   } finally {
-    if (current?.id !== undefined && current.id !== job.tabId) await browser.tabs.update(current.id, { active: true }).catch(() => undefined);
+    if (current?.id !== undefined && current.id !== job.tabId) await activateTabInternally(current.id).catch(() => undefined);
+  }
+}
+
+async function completeProviderCapture(runId: string, provider: ProviderId, captureIdValue: string, degraded: boolean): Promise<boolean> {
+  const { run, value: completed } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) return false;
+    providerRun.captureId = captureIdValue;
+    providerRun.degraded ||= degraded;
+    if (isTerminalProviderStatus(providerRun.status)) return false;
+    assertTransition(providerRun.status, 'complete');
+    providerRun.status = 'complete';
+    providerRun.statusDetail = undefined;
+    providerRun.completedAt ??= Date.now();
+    storedRun.status = deriveRunStatus(storedRun);
+    return true;
+  });
+  if (!completed) return false;
+  await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
+  await maybeFinalize(run);
+  await broadcastRuns();
+  return true;
+}
+
+async function failProviderIfActive(runId: string, provider: ProviderId, detail: string): Promise<void> {
+  const { run, value: failed } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun || isTerminalProviderStatus(providerRun.status)) return false;
+    assertTransition(providerRun.status, 'failed');
+    providerRun.status = 'failed';
+    providerRun.statusDetail = detail;
+    providerRun.completedAt ??= Date.now();
+    storedRun.status = deriveRunStatus(storedRun);
+    return true;
+  });
+  if (!failed) return;
+  await maybeFinalize(run);
+  await broadcastRuns();
+}
+
+async function reconcilePersistedCaptureFailure(
+  runId: string,
+  provider: ProviderId,
+  captureIdValue: string,
+  degraded: boolean,
+  error: unknown,
+): Promise<void> {
+  const detail = error instanceof Error ? error.message : String(error);
+  const { run } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) return;
+    providerRun.captureId = captureIdValue;
+    providerRun.degraded ||= degraded;
+    if (!isTerminalProviderStatus(providerRun.status)) {
+      assertTransition(providerRun.status, 'failed');
+      providerRun.status = 'failed';
+      providerRun.statusDetail = `Capture was saved, but completion failed: ${detail}`;
+      providerRun.completedAt ??= Date.now();
+    }
+    storedRun.status = deriveRunStatus(storedRun);
+  });
+  await maybeFinalize(run);
+  await broadcastRuns();
+}
+
+async function containCaptureJobFailure(
+  runId: string,
+  provider: ProviderId,
+  error: unknown,
+  persisted?: { id: string; degraded: boolean },
+): Promise<void> {
+  console.error(`Capture job failed for ${provider}.`, error);
+  try {
+    if (persisted) await reconcilePersistedCaptureFailure(runId, provider, persisted.id, persisted.degraded, error);
+    else await failProviderIfActive(runId, provider, error instanceof Error ? error.message : String(error));
+  } catch (transitionError) {
+    console.error(`Could not persist the failed capture state for ${provider}.`, transitionError);
   }
 }
 
@@ -225,6 +351,11 @@ async function processCaptureQueue(): Promise<void> {
     for (;;) {
       const job = await nextCaptureJob();
       if (!job) break;
+      if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
+        await deleteJob(job.id).catch((error) => console.error('Could not remove an exhausted capture job.', error));
+        await containCaptureJobFailure(job.runId, job.provider, new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`));
+        continue;
+      }
       job.state = 'leased';
       job.leasedAt = Date.now();
       job.attempts += 1;
@@ -235,6 +366,7 @@ async function processCaptureQueue(): Promise<void> {
         await deleteJob(job.id);
         continue;
       }
+      let persisted: { id: string; degraded: boolean } | undefined;
       try {
         const copied = await clipboardCapture(platform, job);
         const rawMarkdown = copied?.text || job.domMarkdown;
@@ -253,16 +385,22 @@ async function processCaptureQueue(): Promise<void> {
           title: job.title,
         };
         const id = captureId(run.id, job.provider);
+        const degraded = !copied || reconciled.unplacedCitationCount > 0 || resolved.unresolved > 0;
         await putCapture(id, capture);
-        providerRun.captureId = id;
-        providerRun.degraded ||= !copied || reconciled.unplacedCitationCount > 0 || resolved.unresolved > 0;
-        await putRun(run);
+        persisted = { id, degraded };
         await deleteJob(job.id);
-        await mutateProvider(run.id, job.provider, 'complete');
+        try {
+          await completeProviderCapture(run.id, job.provider, id, degraded);
+        } catch (error) {
+          await containCaptureJobFailure(run.id, job.provider, error, persisted);
+        }
       } catch (error) {
-        if (error instanceof CaptureDeferredError) break;
-        await deleteJob(job.id);
-        await mutateProvider(run.id, job.provider, 'failed', error instanceof Error ? error.message : String(error));
+        if (error instanceof CaptureDeferredError && job.attempts < MAX_CAPTURE_ATTEMPTS) break;
+        await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
+        const failure = error instanceof CaptureDeferredError
+          ? new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`)
+          : error;
+        await containCaptureJobFailure(run.id, job.provider, failure, persisted);
       }
     }
   } finally {
@@ -283,69 +421,146 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
   void processCaptureQueue();
 }
 
-async function downloadProvider(run: Run, provider: ProviderId): Promise<void> {
-  const providerRun = run.providerRuns[provider];
-  if (!providerRun) return;
+async function downloadProvider(runId: string, provider: ProviderId, force = false): Promise<boolean> {
+  const run = await getRun(runId);
+  const providerRun = run?.providerRuns[provider];
+  if (!run || !providerRun || (!force && providerRun.downloadedAt)) return false;
   const capture = await getCapture(providerRun.captureId);
   const artifact = buildArtifact(run, providerRun, capture);
-  providerRun.downloadId = await createPlatform().downloadText(`${run.downloadFolder}/${provider}.md`, artifact);
-  providerRun.downloadedAt = Date.now();
+  const downloadId = await createPlatform().downloadText(`${run.downloadFolder}/${provider}.md`, artifact);
+  await mutateStoredRun(run.id, (storedRun) => {
+    const storedProviderRun = storedRun.providerRuns[provider];
+    if (!storedProviderRun) return;
+    storedProviderRun.downloadId = downloadId;
+    storedProviderRun.downloadedAt = Date.now();
+  });
+  return true;
 }
 
 async function maybeFinalize(runInput: Run): Promise<void> {
-  const run = await getRun(runInput.id) ?? runInput;
-  const providerRuns = Object.values(run.providerRuns);
-  if (!providerRuns.length || !providerRuns.every((item) => isTerminalProviderStatus(item.status)) || run.completedAt) return;
-  run.status = 'finalizing';
-  await putRun(run);
-  const failedDownloads: string[] = [];
-  for (const provider of PROVIDERS) {
-    if (!run.providerRuns[provider]) continue;
-    try { await downloadProvider(run, provider); } catch { failedDownloads.push(provider); }
+  const runId = runInput.id;
+  if (finalizingRunIds.has(runId)) return;
+  finalizingRunIds.add(runId);
+  try {
+    const { run, value: shouldFinalize } = await mutateStoredRun(runId, (storedRun) => {
+      const providerRuns = Object.values(storedRun.providerRuns);
+      if (!providerRuns.length || !providerRuns.every((item) => isTerminalProviderStatus(item.status)) || storedRun.completedAt) return false;
+      storedRun.status = 'finalizing';
+      return true;
+    });
+    if (!shouldFinalize) return;
+    const providerRuns = Object.values(run.providerRuns);
+    const failedDownloads: string[] = [];
+    for (const provider of PROVIDERS) {
+      if (!run.providerRuns[provider]) continue;
+      try { await downloadProvider(run.id, provider); } catch { failedDownloads.push(provider); }
+    }
+    const { run: completedRun } = await mutateStoredRun(run.id, (storedRun) => {
+      storedRun.status = 'complete';
+      storedRun.completedAt = Date.now();
+    });
+    if (completedRun.tabGroupId !== undefined) await browser.tabGroups.update(completedRun.tabGroupId, { collapsed: true }).catch(() => undefined);
+    await evictHistory();
+    const count = providerRuns.length - failedDownloads.length;
+    await createPlatform().notify(`run:${run.id}`, 'Research run complete', `${count} of ${providerRuns.length} files saved${failedDownloads.length ? '; retry failed downloads from history.' : '.'}`);
+  } finally {
+    finalizingRunIds.delete(runId);
   }
-  run.status = 'complete';
-  run.completedAt = Date.now();
-  await putRun(run);
-  if (run.tabGroupId !== undefined) await browser.tabGroups.update(run.tabGroupId, { collapsed: true }).catch(() => undefined);
-  await evictHistory();
-  const count = providerRuns.length - failedDownloads.length;
-  await createPlatform().notify(`run:${run.id}`, 'Research run complete', `${count} of ${providerRuns.length} files saved${failedDownloads.length ? '; retry failed downloads from history.' : '.'}`);
 }
 
 async function endProvider(runId: string, provider: ProviderId): Promise<void> {
-  const run = await getRun(runId);
-  const providerRun = run?.providerRuns[provider];
-  if (!run || !providerRun) throw new Error('Provider run not found.');
-  if (!isTerminalProviderStatus(providerRun.status)) await mutateProvider(runId, provider, 'abandoned', 'Ended by the user.');
+  const { run, value: ended } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) throw new Error('Provider run not found.');
+    if (isTerminalProviderStatus(providerRun.status)) return false;
+    assertTransition(providerRun.status, 'abandoned');
+    providerRun.status = 'abandoned';
+    providerRun.statusDetail = 'Ended by the user.';
+    providerRun.completedAt ??= Date.now();
+    storedRun.status = deriveRunStatus(storedRun);
+    return true;
+  });
+  if (!ended) return;
+  await maybeFinalize(run);
+  await broadcastRuns();
 }
 
-async function reconcileRuns(markInterrupted = false): Promise<void> {
-  const runs = await listRuns();
-  for (const run of runs.filter((item) => item.status !== 'complete')) {
-    for (const providerRun of Object.values(run.providerRuns)) {
-      if (isTerminalProviderStatus(providerRun.status)) continue;
-      if (markInterrupted) {
-        providerRun.status = 'interrupted';
-        providerRun.statusDetail = 'Browser restarted before completion.';
-        providerRun.completedAt = Date.now();
-        continue;
-      }
-      try {
-        const tab = await browser.tabs.get(providerRun.tabId);
-        if (!tab.url?.startsWith(ADAPTERS[providerRun.provider].origin)) throw new Error('Provider tab navigated away.');
-        await startContent(run, providerRun.provider);
-      } catch {
-        providerRun.status = 'interrupted';
-        providerRun.statusDetail = 'Provider tab was closed or navigated away.';
-        providerRun.completedAt = Date.now();
-      }
+function isProviderUrl(url: string | undefined, provider: ProviderId): boolean {
+  if (!url) return false;
+  try { return new URL(url).origin === ADAPTERS[provider].origin; }
+  catch { return false; }
+}
+
+async function recordReconcileCheck(runId: string, provider: ProviderId, valid: boolean): Promise<Run> {
+  return (await mutateStoredRun(runId, (run) => {
+    const providerRun = run.providerRuns[provider];
+    if (!providerRun || isTerminalProviderStatus(providerRun.status)) return;
+    if (valid) {
+      providerRun.reconcileFailureCount = undefined;
+      return;
     }
+    providerRun.reconcileFailureCount = (providerRun.reconcileFailureCount ?? 0) + 1;
+    if (providerRun.reconcileFailureCount < 3) return;
+    assertTransition(providerRun.status, 'interrupted');
+    providerRun.status = 'interrupted';
+    providerRun.statusDetail = 'Provider tab was unavailable or away from its provider for three checks.';
+    providerRun.completedAt ??= Date.now();
     run.status = deriveRunStatus(run);
-    await putRun(run);
+  })).run;
+}
+
+async function reconcileRuns(): Promise<void> {
+  if (reconcileWorkerRunning) return;
+  reconcileWorkerRunning = true;
+  try {
+    const runs = await listRuns();
+    setKnownRunTabs(runs);
+    for (const snapshot of runs.filter((item) => item.status !== 'complete')) {
+      for (const providerRun of Object.values(snapshot.providerRuns)) {
+        if (isTerminalProviderStatus(providerRun.status)) continue;
+        let valid = false;
+        try {
+          const tab = await browser.tabs.get(providerRun.tabId);
+          valid = isProviderUrl(tab.url, providerRun.provider);
+        } catch {
+          valid = false;
+        }
+        const run = await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
+        const currentProviderRun = run.providerRuns[providerRun.provider];
+        if (valid && currentProviderRun && !isTerminalProviderStatus(currentProviderRun.status)) await startContent(run, providerRun.provider);
+      }
+      const latest = await getRun(snapshot.id);
+      if (latest) await maybeFinalize(latest);
+    }
+    await processCaptureQueue();
+    await broadcastRuns();
+  } finally {
+    reconcileWorkerRunning = false;
+  }
+}
+
+async function interruptRemovedTab(tabId: number): Promise<void> {
+  const runs = await listRuns();
+  const matches = runs.flatMap((run) => Object.values(run.providerRuns)
+    .filter((providerRun) => providerRun.tabId === tabId && !isTerminalProviderStatus(providerRun.status))
+    .map((providerRun) => ({ runId: run.id, provider: providerRun.provider })));
+  let changed = false;
+  for (const match of matches) {
+    const { run, value: interrupted } = await mutateStoredRun(match.runId, (storedRun) => {
+      const providerRun = storedRun.providerRuns[match.provider];
+      if (!providerRun || isTerminalProviderStatus(providerRun.status)) return false;
+      assertTransition(providerRun.status, 'interrupted');
+      providerRun.status = 'interrupted';
+      providerRun.statusDetail = 'Provider tab was closed.';
+      providerRun.completedAt ??= Date.now();
+      storedRun.status = deriveRunStatus(storedRun);
+      return true;
+    });
+    if (!interrupted) continue;
+    changed = true;
     await maybeFinalize(run);
   }
-  await processCaptureQueue();
-  await broadcastRuns();
+  if (changed) await broadcastRuns();
 }
 
 async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.MessageSender): Promise<RuntimeResponse> {
@@ -380,13 +595,16 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const capture = await getCapture(providerRun?.captureId);
         if (!run || !providerRun || !capture) throw new Error('No captured report is available.');
         await createPlatform().writeClipboard(buildArtifact(run, providerRun, capture));
-        providerRun.copiedAt = Date.now();
-        await putRun(run); await broadcastRuns(); return { ok: true };
+        await mutateStoredRun(run.id, (storedRun) => {
+          const storedProviderRun = storedRun.providerRuns[message.provider];
+          if (storedProviderRun) storedProviderRun.copiedAt = Date.now();
+        });
+        await broadcastRuns(); return { ok: true };
       }
       case 'provider:download': {
         const run = await getRun(message.runId);
         if (!run) throw new Error('Run not found.');
-        await downloadProvider(run, message.provider); await putRun(run); await broadcastRuns(); return { ok: true };
+        await downloadProvider(run.id, message.provider, true); await broadcastRuns(); return { ok: true };
       }
       case 'content:hello': {
         const tabId = sender.tab?.id;
@@ -412,10 +630,7 @@ export function startCoordinator(): void {
   const platform = createPlatform();
   const action = (browser.action ?? (browser as unknown as { browserAction: typeof browser.action }).browserAction);
   void platform.configurePanelAction();
-  browser.runtime.onInstalled.addListener(() => {
-    void browser.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
-  });
-  browser.runtime.onStartup.addListener(() => { void reconcileRuns(true); });
+  browser.runtime.onStartup.addListener(() => { void reconcileRuns(); });
   browser.alarms.onAlarm.addListener((alarm) => { if (alarm.name === ALARM_NAME) void reconcileRuns(); });
   browser.runtime.onMessage.addListener((message: RuntimeRequest, sender) => handleRequest(message, sender));
   browser.omnibox.onInputChanged.addListener((text, suggest) => suggest([{ content: text, description: 'Deep research → ChatGPT, Claude, Gemini, Grok' }]));
@@ -430,10 +645,23 @@ export function startCoordinator(): void {
       void handleRequest({ type: 'provider:focus', runId: parts[1]!, provider: parts[2] as ProviderId }, {} as Browser.runtime.MessageSender);
     }
   });
-  browser.tabs.onRemoved.addListener(() => { void reconcileRuns(); });
-  browser.tabs.onActivated.addListener(({ tabId }) => {
-    if (!knownRunTabIds.has(tabId)) lastNonRunInteractionAt = Date.now();
-  });
-  void browser.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  browser.tabs.onRemoved.addListener((tabId) => { void interruptRemovedTab(tabId); });
+  browser.tabs.onActivated.addListener(({ tabId }) => { recordTabActivation(tabId); });
+  void browser.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
   void reconcileRuns();
 }
+
+export const coordinatorTestHooks = {
+  mutateStoredRun,
+  maybeFinalize,
+  recordReconcileCheck,
+  interruptRemovedTab,
+  resolveCitationUrls,
+  isProviderUrl,
+  markExpectedTabActivation,
+  recordTabActivation,
+  setKnownRunTabs,
+  processCaptureQueue,
+  reconcilePersistedCaptureFailure,
+  getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
+};

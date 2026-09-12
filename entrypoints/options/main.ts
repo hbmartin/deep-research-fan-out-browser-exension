@@ -79,8 +79,12 @@ function providerSection(provider: ProviderId): HTMLElement {
   const advanced = field('details');
   const summary = field('summary'); summary.textContent = 'Advanced';
   const debounceLabel = field('label', { for: `debounce-${provider}` }); debounceLabel.textContent = 'Completion debounce (milliseconds)';
-  const debounce = field('input', { id: `debounce-${provider}`, type: 'number', min: '3000', max: '60000', step: '500', value: String(settings.providers[provider].completionDebounceMs) });
-  debounce.addEventListener('input', () => { settings.providers[provider].completionDebounceMs = Number(debounce.value); });
+  const debounce = field('input', { id: `debounce-${provider}`, type: 'number', min: '3000', max: '60000', step: '500', required: '', value: String(settings.providers[provider].completionDebounceMs) });
+  debounce.addEventListener('input', () => {
+    const value = debounce.valueAsNumber;
+    if (!debounce.validity.valid || !Number.isInteger(value)) return;
+    settings.providers[provider].completionDebounceMs = value;
+  });
   advanced.append(summary, debounceLabel, debounce);
   section.append(suffixLabel, suffix, advanced);
   return section;

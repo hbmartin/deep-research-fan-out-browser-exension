@@ -17,6 +17,7 @@ export interface ProviderAdapter {
   submitStrategy: 'button' | 'enter';
   citationMarkerStyle: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
   urlResolution: 'none' | 'follow_redirect';
+  clarifyingPromptPattern?: RegExp;
   selectors: {
     composer: SelectorChain;
     submitButton: SelectorChain;
@@ -30,7 +31,6 @@ export interface ProviderAdapter {
     sourcesPanelToggle?: SelectorChain;
     loginWall: SelectorChain;
     quotaNotice: SelectorChain;
-    clarifyingPrompt?: SelectorChain;
     planApproval?: SelectorChain;
   };
 }
@@ -44,6 +44,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
     id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.1.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
+    clarifyingPromptPattern: /before i begin|clarif(y|ication)|could you specify/i,
     selectors: {
       composer: [{ kind: 'testid', value: 'prompt-textarea' }, { kind: 'css', value: '#prompt-textarea' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'testid', value: 'send-button' }, { kind: 'aria', role: 'button', name: /send/i }],
@@ -57,7 +58,6 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources|citations/i }],
       loginWall: commonLogin,
       quotaNotice: [{ kind: 'text', value: /deep research.*(limit|unavailable)|limit.*deep research/i }],
-      clarifyingPrompt: [{ kind: 'text', value: /before i begin|clarif(y|ication)|could you specify/i }],
     },
   },
   claude: {
@@ -93,7 +93,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources/i }],
       loginWall: commonLogin,
       quotaNotice: [{ kind: 'text', value: /deep research.*(limit|unavailable)|upgrade.*deep research/i }],
-      planApproval: [{ kind: 'aria', role: 'button', name: /start research|begin research|approve/i }, { kind: 'text', value: /start research|begin research/i }],
+      planApproval: [{ kind: 'aria', role: 'button', name: /start research|begin research|approve/i }],
     },
   },
   grok: {

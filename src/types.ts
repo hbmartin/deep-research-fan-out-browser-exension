@@ -70,6 +70,7 @@ export interface ProviderRun {
   downloadId?: number;
   downloadedAt?: number;
   copiedAt?: number;
+  reconcileFailureCount?: number;
 }
 
 export interface Run {

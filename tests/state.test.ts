@@ -30,6 +30,13 @@ describe('run naming', () => {
   it('creates a safe bounded slug and local folder', () => {
     expect(slugify('  Génétique / reimbursement: 2026!  ')).toBe('genetique-reimbursement-2026');
     expect(slugify('x'.repeat(80))).toHaveLength(48);
-    expect(createDownloadFolder('deep-research', new Date(2026, 8, 12, 14, 32).getTime(), 'topic')).toContain('deep-research/2026-09-12_1432_topic');
+    expect(createDownloadFolder('deep-research', new Date(2026, 8, 12, 14, 32).getTime(), 'topic', 'abcd-1234')).toBe('deep-research/2026-09-12_1432_topic_abcd1234');
+  });
+
+  it('gives same-minute runs distinct folders', () => {
+    const createdAt = new Date(2026, 8, 12, 14, 32).getTime();
+    const first = createDownloadFolder('deep-research', createdAt, 'topic', '11111111-aaaa');
+    const second = createDownloadFolder('deep-research', createdAt, 'topic', '22222222-bbbb');
+    expect(first).not.toBe(second);
   });
 });

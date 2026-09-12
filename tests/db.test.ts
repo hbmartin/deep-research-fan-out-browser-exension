@@ -1,7 +1,7 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { captureId, evictHistory, getCapture, listRuns, putCapture, putRun } from '../src/db';
+import { captureId, evictHistory, getCapture, getRedirect, listRuns, putCapture, putRedirect, putRun, REDIRECT_RETENTION_MS } from '../src/db';
 import type { Capture, Run } from '../src/types';
 
 const capture: Capture = {
@@ -37,5 +37,14 @@ describe('run history', () => {
     expect(runs.at(-1)?.id).toBe('run-02');
     expect(await getCapture(captureId('run-00', 'chatgpt'))).toBeUndefined();
     expect(await getCapture(captureId('run-02', 'chatgpt'))).toBeDefined();
+  });
+
+  it('evicts redirects outside the retention window', async () => {
+    await putRedirect('https://wrapper.test/old', 'https://canonical.test/old', Date.now() - REDIRECT_RETENTION_MS - 1);
+    await putRedirect('https://wrapper.test/current', 'https://canonical.test/current');
+
+    await evictHistory(20);
+    expect(await getRedirect('https://wrapper.test/old')).toBeUndefined();
+    expect(await getRedirect('https://wrapper.test/current')).toBe('https://canonical.test/current');
   });
 });

@@ -12,7 +12,7 @@ export default defineConfig({
     name: 'Deep Research Fan-Out',
     description:
       'Run and capture deep research across ChatGPT, Claude, Gemini, and Grok.',
-    minimum_chrome_version: browser === 'chrome' ? '116' : undefined,
+    minimum_chrome_version: browser === 'chrome' ? '145' : undefined,
     permissions: [
       'tabs',
       'tabGroups',
