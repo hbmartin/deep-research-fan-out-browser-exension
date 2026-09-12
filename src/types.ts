@@ -41,6 +41,58 @@ export interface DomCitation {
   contextAfter: string;
 }
 
+export type ResearchSearchKind = 'web' | 'x';
+
+export interface CapturedSource {
+  url: string;
+  title: string;
+  snippet?: string;
+  outboundUrls?: string[];
+}
+
+export interface CapturedSearch {
+  kind: ResearchSearchKind;
+  query: string;
+  expectedResultCount: number;
+  results: CapturedSource[];
+}
+
+export interface CapturedResearchTrail {
+  reportedResultCount?: number;
+  searches: CapturedSearch[];
+  openedPages: CapturedSource[];
+  warnings: string[];
+}
+
+export interface ResearchSearch {
+  index: number;
+  kind: ResearchSearchKind;
+  query: string;
+  expectedResultCount: number;
+  capturedResultCount: number;
+  sourceIds: string[];
+}
+
+export interface ResearchSource {
+  id: string;
+  url: string;
+  title: string;
+  snippet?: string;
+  outboundUrls: string[];
+  searchIndexes: number[];
+  opened: boolean;
+  cited: boolean;
+}
+
+export interface ResearchTrail {
+  searches: ResearchSearch[];
+  sources: ResearchSource[];
+  expectedResultCount: number;
+  capturedResultCount: number;
+  complete: boolean;
+  warnings: string[];
+}
+
 export interface Capture {
   rawMarkdown: string;
   normalizedMarkdown: string;
@@ -51,6 +103,7 @@ export interface Capture {
   urlsResolved: number;
   urlsUnresolved: number;
   title?: string;
+  researchTrail?: ResearchTrail;
 }
 
 export interface ProviderRun {
@@ -97,6 +150,7 @@ export interface CaptureJob {
   attempts: number;
   domMarkdown: string;
   domCitations: DomCitation[];
+  researchTrail?: CapturedResearchTrail;
   title?: string;
 }
 

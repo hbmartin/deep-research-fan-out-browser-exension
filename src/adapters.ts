@@ -97,7 +97,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
     },
   },
   grok: {
-    id: 'grok', label: 'Grok', version: 'grok@0.1.0', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
+    id: 'grok', label: 'Grok', version: 'grok@0.2.0', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     selectors: {
       composer: [{ kind: 'css', value: '[contenteditable="true"][role="textbox"]' }, { kind: 'aria', role: 'textbox' }],
@@ -107,8 +107,9 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-testid*="deep"][aria-pressed="true"]' }],
       streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /searching|thinking/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-testid="assistant-message"]', pick: 'last' }, { kind: 'css', value: 'article', pick: 'last' }],
-      copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
+      copyButton: [{ kind: 'aria', role: 'button', name: /^copy response$/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
+      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /^\d+\s+sources$/i, pick: 'last' }],
       loginWall: commonLogin,
       quotaNotice: [{ kind: 'text', value: /(deepsearch|research).*(limit|unavailable)|usage limit/i }],
     },

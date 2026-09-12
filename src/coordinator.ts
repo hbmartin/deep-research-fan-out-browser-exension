@@ -5,6 +5,7 @@ import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, li
 import type { RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
+import { normalizeResearchTrail } from './sources';
 import { assertTransition, createDownloadFolder, deriveRunStatus, slugify } from './state';
 import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
 
@@ -373,6 +374,9 @@ async function processCaptureQueue(): Promise<void> {
         if (rawMarkdown.trim().length < 40) throw new Error('Clipboard and DOM capture were both empty.');
         const resolved = await resolveCitationUrls(job.provider, job.domCitations);
         const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
+        const researchTrail = job.researchTrail
+          ? normalizeResearchTrail(job.researchTrail, reconciled.citations)
+          : undefined;
         const capture: Capture = {
           rawMarkdown,
           normalizedMarkdown: reconciled.markdown,
@@ -383,9 +387,13 @@ async function processCaptureQueue(): Promise<void> {
           urlsResolved: resolved.resolved,
           urlsUnresolved: resolved.unresolved,
           title: job.title,
+          researchTrail,
         };
         const id = captureId(run.id, job.provider);
-        const degraded = !copied || reconciled.unplacedCitationCount > 0 || resolved.unresolved > 0;
+        const degraded = !copied
+          || reconciled.unplacedCitationCount > 0
+          || resolved.unresolved > 0
+          || researchTrail?.complete === false;
         await putCapture(id, capture);
         persisted = { id, degraded };
         await deleteJob(job.id);
@@ -416,7 +424,7 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
   await putJob({
     id: captureId(run.id, request.provider), runId: run.id, provider: request.provider,
     tabId: providerRun.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
-    domMarkdown: request.domMarkdown, domCitations: request.domCitations, title: request.title,
+    domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
   });
   void processCaptureQueue();
 }
@@ -426,7 +434,8 @@ async function downloadProvider(runId: string, provider: ProviderId, force = fal
   const providerRun = run?.providerRuns[provider];
   if (!run || !providerRun || (!force && providerRun.downloadedAt)) return false;
   const capture = await getCapture(providerRun.captureId);
-  const artifact = buildArtifact(run, providerRun, capture);
+  const settings = await loadSettings();
+  const artifact = buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets });
   const downloadId = await createPlatform().downloadText(`${run.downloadFolder}/${provider}.md`, artifact);
   await mutateStoredRun(run.id, (storedRun) => {
     const storedProviderRun = storedRun.providerRuns[provider];
@@ -594,7 +603,8 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const providerRun = run?.providerRuns[message.provider];
         const capture = await getCapture(providerRun?.captureId);
         if (!run || !providerRun || !capture) throw new Error('No captured report is available.');
-        await createPlatform().writeClipboard(buildArtifact(run, providerRun, capture));
+        const settings = await loadSettings();
+        await createPlatform().writeClipboard(buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets }));
         await mutateStoredRun(run.id, (storedRun) => {
           const storedProviderRun = storedRun.providerRuns[message.provider];
           if (storedProviderRun) storedProviderRun.copiedAt = Date.now();

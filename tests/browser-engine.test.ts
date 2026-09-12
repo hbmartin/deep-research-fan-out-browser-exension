@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
 import { findElement } from '../src/selectors';
+import { ADAPTERS } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
   element.style.position = 'fixed';
@@ -47,6 +48,14 @@ describe('selector engine', () => {
     document.body.innerHTML = '<button aria-label="Send" aria-disabled="true">Send</button>';
     visible(document.querySelector('button')!);
     expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
+  });
+
+  it('targets Grok Copy response rather than nested table and code copy buttons', () => {
+    document.body.innerHTML = '<div id="answer"><button aria-label="Copy">Table</button><button aria-label="Copy">Code</button></div><button aria-label="Copy response">Response</button>';
+    document.querySelectorAll<HTMLElement>('button').forEach(visible);
+    const root = document.querySelector<HTMLElement>('#answer')!;
+    expect(findElement(ADAPTERS.grok.selectors.copyButton, root)).toBeNull();
+    expect(findElement(ADAPTERS.grok.selectors.copyButton)?.textContent).toBe('Response');
   });
 });
 

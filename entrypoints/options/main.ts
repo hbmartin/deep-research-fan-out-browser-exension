@@ -26,6 +26,7 @@ function render(): void {
   form.append(behaviorHeading);
   form.append(checkRow('gemini-auto', 'Automatically approve Gemini research plans', settings.geminiAutoApprove, (checked) => { settings.geminiAutoApprove = checked; }));
   form.append(checkRow('clipboard-restore', 'Restore the clipboard after capture when it is safe', settings.restoreClipboard, (checked) => { settings.restoreClipboard = checked; }));
+  form.append(checkRow('source-snippets', 'Include source snippets in Markdown', settings.includeSourceSnippets, (checked) => { settings.includeSourceSnippets = checked; }));
   const folderLabel = field('label', { for: 'download-root' }); folderLabel.textContent = 'Download subfolder';
   const folder = field('input', { id: 'download-root', type: 'text', maxlength: '80', value: settings.downloadRoot });
   folder.addEventListener('input', () => { settings.downloadRoot = folder.value; });

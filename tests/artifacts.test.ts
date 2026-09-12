@@ -16,6 +16,25 @@ const capture: Capture = {
   captureMethod: 'copy+dom', unplacedCitationCount: 0, capturedAt: 5000, urlsResolved: 1, urlsUnresolved: 0,
 };
 
+const researchCapture: Capture = {
+  ...capture,
+  researchTrail: {
+    expectedResultCount: 2,
+    capturedResultCount: 1,
+    complete: false,
+    warnings: ['Search 1 expected 2 results but captured 1.'],
+    searches: [{
+      index: 1, kind: 'web', query: 'source `query`', expectedResultCount: 2,
+      capturedResultCount: 1, sourceIds: ['SRC-001'],
+    }],
+    sources: [{
+      id: 'SRC-001', url: 'https://example.com/source', title: 'Source [title]',
+      snippet: 'A useful source snippet.', outboundUrls: ['https://example.com/outbound'],
+      searchIndexes: [1], opened: true, cited: true,
+    }],
+  },
+};
+
 describe('Markdown artifacts', () => {
   it('includes deterministic metadata, report, and references', () => {
     const artifact = buildArtifact(run, providerRun, capture);
@@ -30,5 +49,25 @@ describe('Markdown artifacts', () => {
     const artifact = buildArtifact({ ...run, providerRuns: { gemini: failed } }, failed);
     expect(artifact).toContain('# Gemini report unavailable');
     expect(artifact).toContain('Capture failed.');
+  });
+
+  it('renders a search index, deduplicated source catalog, and partial warning', () => {
+    const artifact = buildArtifact(run, providerRun, researchCapture, { includeSourceSnippets: true });
+    expect(artifact).toContain('expected_source_results: 2');
+    expect(artifact).toContain('## Searches');
+    expect(artifact).toContain('`` source `query` ``');
+    expect(artifact).toContain('Sources: SRC-001');
+    expect(artifact).toContain('## Sources');
+    expect(artifact).toContain('[Source \\[title\\]](https://example.com/source)');
+    expect(artifact).toContain('A useful source snippet.');
+    expect(artifact).toContain('Outbound links: <https://example.com/outbound>');
+    expect(artifact).toContain('Source capture warning');
+  });
+
+  it('omits snippets and nested links when configured while retaining titles and URLs', () => {
+    const artifact = buildArtifact(run, providerRun, researchCapture, { includeSourceSnippets: false });
+    expect(artifact).toContain('[Source \\[title\\]](https://example.com/source)');
+    expect(artifact).not.toContain('A useful source snippet.');
+    expect(artifact).not.toContain('https://example.com/outbound');
   });
 });

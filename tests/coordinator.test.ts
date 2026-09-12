@@ -2,7 +2,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putJob, putRun } from '../src/db';
+import { getCapture, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putJob, putRun } from '../src/db';
 import type { ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
@@ -35,10 +35,12 @@ function run(providerRuns: Run['providerRuns'], status: Run['status'] = 'active'
 beforeEach(() => {
   let downloadId = 100;
   platform.downloadText.mockReset().mockImplementation(async () => downloadId++);
+  platform.readClipboard.mockReset().mockResolvedValue('');
   platform.notify.mockClear();
   platform.setBadge.mockClear();
   vi.stubGlobal('browser', {
     runtime: { sendMessage: vi.fn(async () => undefined), getURL: vi.fn((path: string) => path) },
+    storage: { sync: { get: vi.fn(async () => ({})) } },
     tabs: { update: vi.fn(async () => undefined), get: vi.fn(), query: vi.fn(async () => []) },
     tabGroups: { update: vi.fn(async () => undefined) },
   });
@@ -176,5 +178,46 @@ describe('coordinator run guards', () => {
       captureId: `${stored.id}:chatgpt`,
       degraded: true,
     });
+  });
+
+  it('persists a partial research trail and marks the completed provider degraded', async () => {
+    const copiedReport = 'A sufficiently long copied research report for the capture pipeline.';
+    platform.readClipboard.mockResolvedValue(copiedReport);
+    const stored = run({ grok: provider('grok', 911, 'capturing') });
+    await putRun(stored);
+    await putJob({
+      id: `${stored.id}:grok`,
+      runId: stored.id,
+      provider: 'grok',
+      tabId: 911,
+      state: 'queued',
+      createdAt: Date.now(),
+      attempts: 0,
+      domMarkdown: copiedReport,
+      domCitations: [],
+      researchTrail: {
+        reportedResultCount: 2,
+        searches: [{
+          kind: 'web',
+          query: 'partial search',
+          expectedResultCount: 2,
+          results: [{ url: 'https://example.com/result', title: 'Captured result' }],
+        }],
+        openedPages: [],
+        warnings: [],
+      },
+    });
+
+    await coordinatorTestHooks.processCaptureQueue();
+
+    const updated = await getRun(stored.id);
+    expect(updated?.providerRuns.grok).toMatchObject({ status: 'complete', degraded: true });
+    const capture = await getCapture(updated?.providerRuns.grok?.captureId);
+    expect(capture?.researchTrail).toMatchObject({
+      expectedResultCount: 2,
+      capturedResultCount: 1,
+      complete: false,
+    });
+    expect(capture?.researchTrail?.warnings).toContain('Search 1 expected 2 results but captured 1.');
   });
 });

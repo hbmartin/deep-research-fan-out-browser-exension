@@ -13,4 +13,10 @@ describe('settings schema', () => {
     providers.chatgpt.appendString = 'x'.repeat(4001);
     expect(() => settingsSchema.parse({ ...DEFAULT_SETTINGS, providers })).toThrow();
   });
+
+  it('defaults snippet output on for legacy version-one exports', () => {
+    const legacy = structuredClone(DEFAULT_SETTINGS) as Partial<typeof DEFAULT_SETTINGS>;
+    delete legacy.includeSourceSnippets;
+    expect(importSettings(JSON.stringify(legacy)).includeSourceSnippets).toBe(true);
+  });
 });

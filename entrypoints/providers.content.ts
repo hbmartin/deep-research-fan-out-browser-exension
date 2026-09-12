@@ -5,6 +5,7 @@ import { sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
+import { captureGrokResearchTrail } from '@/src/sources';
 import type { ProviderRunStatus, RunId } from '@/src/types';
 
 interface ActiveRun {
@@ -133,7 +134,10 @@ async function capture(root: HTMLElement): Promise<void> {
     const before = domCitationInventory(root, capturingRun.adapter);
     const toggle = capturingRun.adapter.selectors.sourcesPanelToggle && (findElement(capturingRun.adapter.selectors.sourcesPanelToggle, root) || findElement(capturingRun.adapter.selectors.sourcesPanelToggle));
     let after = before;
-    if (toggle && sourceToggleState(toggle) === 'collapsed') {
+    const researchTrail = capturingRun.adapter.id === 'grok'
+      ? await captureGrokResearchTrail(document, toggle)
+      : undefined;
+    if (capturingRun.adapter.id !== 'grok' && toggle && sourceToggleState(toggle) === 'collapsed') {
       toggle.click();
       const started = Date.now();
       do {
@@ -147,6 +151,7 @@ async function capture(root: HTMLElement): Promise<void> {
       provider: capturingRun.adapter.id,
       domMarkdown: domToMarkdown(root),
       domCitations: mergeCitationInventories(before, after),
+      researchTrail,
       title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
     });
     if (active?.id === capturingRun.id) active.captureSent = true;
