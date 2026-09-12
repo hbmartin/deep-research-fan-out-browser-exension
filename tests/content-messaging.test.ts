@@ -24,4 +24,14 @@ describe('provider content messaging', () => {
     vi.stubGlobal('browser', { runtime: { sendMessage: vi.fn(async () => { throw new Error('worker asleep'); }) } });
     await expect(sendContentMessage({ type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/' })).resolves.toBeUndefined();
   });
+
+  it('preserves terminal-provider error codes for non-retryable capture rejection', async () => {
+    vi.stubGlobal('browser', {
+      runtime: { sendMessage: vi.fn(async () => ({ ok: false, error: 'ended', code: 'provider_terminal' })) },
+    });
+    const delivery = sendContentMessage({
+      type: 'content:capture', runId: 'run', provider: 'chatgpt', domMarkdown: 'report', domCitations: [],
+    });
+    await expect(delivery).rejects.toMatchObject({ code: 'provider_terminal' });
+  });
 });

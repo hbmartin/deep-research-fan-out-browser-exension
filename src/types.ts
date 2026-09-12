@@ -128,6 +128,7 @@ export interface ProviderRun {
 
 export interface Run {
   id: RunId;
+  browserSessionId?: string;
   query: string;
   createdAt: number;
   completedAt?: number;
@@ -148,6 +149,7 @@ export interface CaptureJob {
   createdAt: number;
   leasedAt?: number;
   attempts: number;
+  tabUnavailable?: boolean;
   domMarkdown: string;
   domCitations: DomCitation[];
   researchTrail?: CapturedResearchTrail;

@@ -1,5 +1,10 @@
 function normalized(value: string): string {
-  return value.replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ');
+  return value
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n+ */g, '\n')
+    .trim();
 }
 
 function currentText(element: HTMLElement): string {

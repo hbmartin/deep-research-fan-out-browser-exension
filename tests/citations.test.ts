@@ -78,6 +78,16 @@ describe('citation reconciliation', () => {
     expect(result.markdown).toContain('[2](https://second.test/)');
   });
 
+  it('moves fallback insertions outside Markdown link syntax', () => {
+    const result = reconcileCitations(
+      'A [durable response](https://existing.test) continues without terminal punctuation',
+      [citation('https://citation.test', undefined, 'durable response')],
+      'none',
+    );
+    expect(result.markdown).toContain('[durable response](https://existing.test)[1](https://citation.test/)');
+    expect(result.markdown).not.toContain('[durable response[1]');
+  });
+
   it('does not invent a fuzzy offset when the anchor token is absent', () => {
     const body = `${'prefix '.repeat(8)}alpha beta gamma delta epsilon zeta eta theta iota kappa lambda`;
     const result = reconcileCitations(body, [

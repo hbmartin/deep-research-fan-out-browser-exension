@@ -1,7 +1,7 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, providerFromLocation, type ProviderAdapter } from '@/src/adapters';
-import { createFinalResponseBaseline, domCitationInventory, isClarifyingResponse, isNewFinalResponse, mergeCitationInventories, sourceToggleState, type FinalResponseBaseline } from '@/src/dom-capture';
-import { sendContentMessage } from '@/src/content-messaging';
+import { createFinalResponseBaseline, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
+import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
@@ -15,9 +15,11 @@ interface ActiveRun {
   geminiAutoApprove: boolean;
   completionDebounceMs: number;
   status: ProviderRunStatus;
-  completionCandidateAt?: number;
+  completionCandidate?: StableResponseCandidate;
   captureSent: boolean;
   finalResponseBaseline: FinalResponseBaseline;
+  copyButtonBaseline: ReadonlySet<HTMLElement>;
+  automationStarted: boolean;
 }
 
 let active: ActiveRun | undefined;
@@ -137,23 +139,37 @@ async function capture(root: HTMLElement): Promise<void> {
     const researchTrail = capturingRun.adapter.id === 'grok'
       ? await captureGrokResearchTrail(document, toggle)
       : undefined;
-    if (capturingRun.adapter.id !== 'grok' && toggle && sourceToggleState(toggle) === 'collapsed') {
+    if (capturingRun.adapter.id !== 'grok' && toggle && shouldOpenSourceToggle(toggle)) {
+      const initialToggleState = sourceToggleState(toggle);
       toggle.click();
       const started = Date.now();
       do {
         await delay(100);
         after = domCitationInventory(root, capturingRun.adapter);
       } while (Date.now() - started < 1000 && after.length === before.length);
+      if (initialToggleState === 'unknown' && after.length < before.length) {
+        toggle.click();
+        after = before;
+      }
     }
-    await sendContentMessage({
-      type: 'content:capture',
-      runId: capturingRun.id,
-      provider: capturingRun.adapter.id,
-      domMarkdown: domToMarkdown(root),
-      domCitations: mergeCitationInventories(before, after),
-      researchTrail,
-      title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
-    });
+    try {
+      await sendContentMessage({
+        type: 'content:capture',
+        runId: capturingRun.id,
+        provider: capturingRun.adapter.id,
+        domMarkdown: domToMarkdown(root),
+        domCitations: mergeCitationInventories(before, after),
+        researchTrail,
+        title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
+      });
+    } catch (error) {
+      if (error instanceof ContentMessageError && error.code === 'provider_terminal') {
+        if (active?.id === capturingRun.id) active.captureSent = true;
+        stopMonitoring();
+        return;
+      }
+      throw error;
+    }
     if (active?.id === capturingRun.id) active.captureSent = true;
   } finally {
     captureInFlight = false;
@@ -182,23 +198,34 @@ function inspectPage(): void {
   }
   const latestResponse = finalRoots.at(-1) ?? null;
   const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
+  if (isQuotaResponse(newResponse, adapter.quotaResponsePattern)) {
+    void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
+    stopMonitoring();
+    return;
+  }
+  if (isProgressResponse(newResponse, adapter.progressResponsePattern)) {
+    active.completionCandidate = undefined;
+    if (active.status !== 'researching') void report('researching');
+    return;
+  }
   if (isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern)) {
+    active.completionCandidate = undefined;
     if (active.status !== 'awaiting_user') void report('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
   const streaming = findElement(adapter.selectors.streamingIndicator);
   if (streaming) {
-    active.completionCandidateAt = undefined;
+    active.completionCandidate = undefined;
     if (active.status === 'awaiting_user' || active.status === 'manual_required') void report('researching');
     return;
   }
   const root = newResponse;
-  if (!root) {
-    active.completionCandidateAt = undefined;
-    return;
-  }
-  active.completionCandidateAt ??= Date.now();
-  if (Date.now() - active.completionCandidateAt >= active.completionDebounceMs) {
+  const scopedCopy = root ? findElement(adapter.selectors.copyButton, root) : null;
+  const globalCopy = root ? findElement(adapter.selectors.copyButton) : null;
+  const copy = scopedCopy || (globalCopy && !active.copyButtonBaseline.has(globalCopy) ? globalCopy : null);
+  const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, Date.now(), active.completionDebounceMs);
+  active.completionCandidate = completion.candidate;
+  if (completion.ready && root) {
     void capture(root).catch((error) => console.error('Could not deliver captured report to the coordinator.', error));
   }
 }
@@ -229,20 +256,37 @@ function stopMonitoring(): void {
 }
 
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
-  if (active?.id === event.runId) return;
+  if (active?.id === event.runId) {
+    if (event.resumeOnly || active.automationStarted) return;
+    stopMonitoring();
+    active.finalResponseBaseline = createFinalResponseBaseline(findAll(active.adapter.selectors.finalMessageRoot));
+    active.copyButtonBaseline = new Set(findAll(active.adapter.selectors.copyButton));
+    active.captureSent = false;
+    active.automationStarted = true;
+    await automate();
+    return;
+  }
   stopMonitoring();
   const adapter = ADAPTERS[event.provider];
-  const finalResponseBaseline = createFinalResponseBaseline(findAll(adapter.selectors.finalMessageRoot));
+  const resumeExistingResponse = event.resumeOnly && !['opening', 'awaiting_ready', 'setting_mode', 'submitting'].includes(event.status);
+  const finalResponseBaseline = createFinalResponseBaseline(resumeExistingResponse ? [] : findAll(adapter.selectors.finalMessageRoot));
+  const copyButtonBaseline = new Set(resumeExistingResponse ? [] : findAll(adapter.selectors.copyButton));
   active = {
     id: event.runId,
     adapter,
     submittedQuery: event.appendString.trim() ? `${event.query}\n${event.appendString}` : event.query,
     geminiAutoApprove: event.geminiAutoApprove,
     completionDebounceMs: event.completionDebounceMs,
-    status: 'opening',
-    captureSent: false,
+    status: event.status,
+    captureSent: event.status === 'capturing',
     finalResponseBaseline,
+    copyButtonBaseline,
+    automationStarted: !event.resumeOnly,
   };
+  if (event.resumeOnly) {
+    if (!active.captureSent) beginMonitoring();
+    return;
+  }
   await automate();
 }
 
@@ -262,6 +306,11 @@ export default defineContentScript({
         const button = root ? findElement(active.adapter.selectors.copyButton, root) || findElement(active.adapter.selectors.copyButton) : null;
         if (!button) throw new Error('Provider copy button is unavailable.');
         button.click();
+        return { ok: true };
+      }
+      if (message.type === 'content:stop' && active?.id === message.runId) {
+        active.captureSent = true;
+        stopMonitoring();
         return { ok: true };
       }
       return undefined;

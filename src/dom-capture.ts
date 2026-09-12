@@ -31,14 +31,21 @@ export function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter
 }
 
 export function mergeCitationInventories(before: DomCitation[], after: DomCitation[]): DomCitation[] {
-  const merged = new Map<string, DomCitation>();
-  for (const citation of [...before, ...after]) {
-    const key = `${normalizeUrl(citation.url)}\u0000${citation.domOrder}`;
-    merged.set(key, citation);
+  if (!after.length) return before.map((citation, domOrder) => ({ ...citation, domOrder }));
+  const occurrenceKey = (citation: DomCitation) => normalizeUrl(citation.url);
+  const remainingAfter = new Map<string, number>();
+  for (const citation of after) {
+    const key = occurrenceKey(citation);
+    remainingAfter.set(key, (remainingAfter.get(key) ?? 0) + 1);
   }
-  return [...merged.values()]
-    .sort((left, right) => left.domOrder - right.domOrder)
-    .map((citation, domOrder) => ({ ...citation, domOrder }));
+  const beforeOnly = before.filter((citation) => {
+    const key = occurrenceKey(citation);
+    const remaining = remainingAfter.get(key) ?? 0;
+    if (!remaining) return true;
+    remainingAfter.set(key, remaining - 1);
+    return false;
+  });
+  return [...after, ...beforeOnly].map((citation, domOrder) => ({ ...citation, domOrder }));
 }
 
 export type ToggleState = 'expanded' | 'collapsed' | 'unknown';
@@ -53,12 +60,28 @@ export function sourceToggleState(toggle: HTMLElement): ToggleState {
   return 'unknown';
 }
 
-export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp, maximumLength = 600): boolean {
+export function shouldOpenSourceToggle(toggle: HTMLElement): boolean {
+  return sourceToggleState(toggle) !== 'expanded';
+}
+
+function isResponseMatch(root: HTMLElement | null, pattern?: RegExp, maximumLength?: number): boolean {
   if (!root || !pattern) return false;
   const text = normalizeVisibleText(root.innerText || root.textContent || '');
-  if (!text || text.length > maximumLength) return false;
+  if (!text || (maximumLength !== undefined && text.length > maximumLength)) return false;
   pattern.lastIndex = 0;
   return pattern.test(text);
+}
+
+export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
+  return isResponseMatch(root, pattern);
+}
+
+export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
+  return isResponseMatch(root, pattern, 1000);
+}
+
+export function isQuotaResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
+  return isResponseMatch(root, pattern, 2000);
 }
 
 export interface FinalResponseBaseline {
@@ -69,6 +92,32 @@ export interface FinalResponseBaseline {
 function finalResponseSignature(root: HTMLElement): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
   return stableId ? `id:${stableId}` : `text:${normalizeVisibleText(root.innerText || root.textContent || '')}`;
+}
+
+export function finalResponseFingerprint(root: HTMLElement): string {
+  const stableId = root.getAttribute('data-message-id') || root.id;
+  const text = normalizeVisibleText(root.innerText || root.textContent || '');
+  return `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${text}`;
+}
+
+export interface StableResponseCandidate {
+  fingerprint: string;
+  since: number;
+}
+
+export function evaluateStableResponse(
+  root: HTMLElement | null,
+  copyAvailable: boolean,
+  candidate: StableResponseCandidate | undefined,
+  now: number,
+  debounceMs: number,
+): { candidate?: StableResponseCandidate; ready: boolean } {
+  if (!root || !copyAvailable) return { ready: false };
+  const fingerprint = finalResponseFingerprint(root);
+  if (candidate?.fingerprint !== fingerprint) {
+    return { candidate: { fingerprint, since: now }, ready: false };
+  }
+  return { candidate, ready: now - candidate.since >= debounceMs };
 }
 
 export function createFinalResponseBaseline(roots: readonly HTMLElement[]): FinalResponseBaseline {

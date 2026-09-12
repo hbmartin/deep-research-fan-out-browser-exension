@@ -1,5 +1,7 @@
 import type { CaptureJob, CapturedResearchTrail, DomCitation, ProviderId, ProviderRunStatus, Run, RunId } from './types';
 
+export type RuntimeErrorCode = 'provider_terminal';
+
 export type RuntimeRequest =
   | { type: 'runs:list' }
   | { type: 'run:start'; query: string; windowId?: number }
@@ -20,7 +22,7 @@ export type RuntimeRequest =
 
 export type RuntimeResponse =
   | { ok: true; runs?: Run[]; run?: Run; job?: CaptureJob; text?: string }
-  | { ok: false; error: string };
+  | { ok: false; error: string; code?: RuntimeErrorCode };
 
 export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   type: 'content:start';
@@ -30,7 +32,10 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   appendString: string;
   geminiAutoApprove: boolean;
   completionDebounceMs: number;
-} | { type: 'capture:copy-now'; jobId: string };
+  resumeOnly: boolean;
+  status: ProviderRunStatus;
+} | { type: 'capture:copy-now'; jobId: string }
+  | { type: 'content:stop'; runId: RunId };
 
 export async function sendRequest(request: RuntimeRequest): Promise<RuntimeResponse> {
   return browser.runtime.sendMessage(request) as Promise<RuntimeResponse>;

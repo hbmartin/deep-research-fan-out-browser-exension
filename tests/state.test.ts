@@ -17,6 +17,8 @@ describe('provider state machine', () => {
   it('keeps manual states recoverable and nonterminal', () => {
     expect(canTransition('manual_required', 'researching')).toBe(true);
     expect(canTransition('awaiting_user', 'capturing')).toBe(true);
+    expect(canTransition('manual_required', 'quota_exhausted')).toBe(true);
+    expect(canTransition('awaiting_user', 'quota_exhausted')).toBe(true);
     expect(deriveRunStatus(run(['manual_required', 'complete']))).toBe('needs_attention');
   });
 

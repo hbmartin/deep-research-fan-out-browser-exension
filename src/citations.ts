@@ -79,6 +79,16 @@ function sentenceInsertionOffset(markdown: string, approximate: number): number 
   return punctuation >= 0 ? approximate + punctuation + 1 : approximate;
 }
 
+function outsideMarkdownLink(markdown: string, offset: number): number {
+  const linkPattern = /!?\[[^\]]+\]\([^)]*\)/g;
+  for (const match of markdown.matchAll(linkPattern)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (offset > start && offset < end) return end;
+  }
+  return offset;
+}
+
 export interface ReconcileResult {
   markdown: string;
   citations: Citation[];
@@ -166,7 +176,7 @@ export function reconcileCitations(
     const projectedEnd = Math.min(projection.rawOffsets.length - 1, index + needle.length - 1);
     const mappedOffset = projectedEnd >= 0 ? projection.rawOffsets[projectedEnd]! + 1 : placementBase.length;
     const approximate = rawIndex >= 0 ? rawIndex + rawNeedle.length : mappedOffset;
-    const insertion = sentenceInsertionOffset(placementBase, approximate);
+    const insertion = outsideMarkdownLink(placementBase, sentenceInsertionOffset(placementBase, approximate));
     const marker = `[${citation.index}](${citation.url})`;
     pendingInsertions.push({ insertion, marker, order });
     citation.placement = 'inline';

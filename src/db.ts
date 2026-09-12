@@ -37,6 +37,7 @@ export async function listRuns(): Promise<Run[]> {
 export async function putCapture(id: string, capture: Capture): Promise<void> { await (await db()).put('captures', capture, id); }
 export async function getCapture(id?: string): Promise<Capture | undefined> { return id ? (await db()).get('captures', id) : undefined; }
 export async function putJob(job: CaptureJob): Promise<void> { await (await db()).put('jobs', job); }
+export async function getJob(id: string): Promise<CaptureJob | undefined> { return (await db()).get('jobs', id); }
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();

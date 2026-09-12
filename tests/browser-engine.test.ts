@@ -70,16 +70,17 @@ describe('query injection', () => {
     expect(inputs).toBe(1);
   });
 
-  it('preserves meaningful spaces and browser-rendered block and line breaks', () => {
+  it('accepts browser-expanded line breaks while preserving line boundaries', () => {
     const blocks = document.createElement('div');
     Object.defineProperty(blocks, 'innerText', { configurable: true, value: 'alpha\n  beta' });
     expect(injectionTestHooks.verified(blocks, 'alpha\r\n  beta')).toBe(true);
-    expect(injectionTestHooks.verified(blocks, 'alpha\nbeta')).toBe(false);
+    expect(injectionTestHooks.verified(blocks, 'alpha\nbeta')).toBe(true);
+    expect(injectionTestHooks.verified(blocks, 'alpha beta')).toBe(false);
 
     const breaks = document.createElement('div');
     Object.defineProperty(breaks, 'innerText', { configurable: true, value: 'alpha\n\nbeta\u00a0gamma' });
     expect(injectionTestHooks.verified(breaks, 'alpha\r\n\r\nbeta gamma')).toBe(true);
-    expect(injectionTestHooks.verified(breaks, 'alpha\nbeta gamma')).toBe(false);
-    expect(injectionTestHooks.verified(breaks, 'alpha\n\nbeta  gamma')).toBe(false);
+    expect(injectionTestHooks.verified(breaks, 'alpha\nbeta gamma')).toBe(true);
+    expect(injectionTestHooks.verified(breaks, 'alpha\n\nbeta  gamma')).toBe(true);
   });
 });

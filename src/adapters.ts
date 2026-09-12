@@ -18,6 +18,8 @@ export interface ProviderAdapter {
   citationMarkerStyle: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
   urlResolution: 'none' | 'follow_redirect';
   clarifyingPromptPattern?: RegExp;
+  progressResponsePattern: RegExp;
+  quotaResponsePattern: RegExp;
   selectors: {
     composer: SelectorChain;
     submitButton: SelectorChain;
@@ -40,11 +42,15 @@ const commonLogin: SelectorChain = [
   { kind: 'text', value: /log in to continue|sign in to continue/i },
 ];
 
+const commonProgressResponse = /^(?:starting|beginning|conducting|continuing|researching|searching|working on|i(?:'ll| will| am going to) (?:start|begin|research|search))/i;
+
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
     id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.1.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
-    clarifyingPromptPattern: /before i begin|clarif(y|ication)|could you specify/i,
+    clarifyingPromptPattern: /^(?:before i begin\b|clarif(?:y|ication)\b|could you (?:please )?(?:clarify|specify)\b)/i,
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: /deep research.*(limit|unavailable)|limit.*deep research/i,
     selectors: {
       composer: [{ kind: 'testid', value: 'prompt-textarea' }, { kind: 'css', value: '#prompt-textarea' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'testid', value: 'send-button' }, { kind: 'aria', role: 'button', name: /send/i }],
@@ -63,6 +69,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   claude: {
     id: 'claude', label: 'Claude', version: 'claude@0.1.0', origin: 'https://claude.ai', entryUrl: 'https://claude.ai/new',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: /research.*(limit|unavailable)|usage limit|limit reached/i,
     selectors: {
       composer: [{ kind: 'css', value: '[contenteditable="true"][role="textbox"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /send message|send/i }],
@@ -80,6 +88,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   gemini: {
     id: 'gemini', label: 'Gemini', version: 'gemini@0.1.0', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'superscript', urlResolution: 'follow_redirect',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: /deep research.*(limit|unavailable)|upgrade.*deep research/i,
     selectors: {
       composer: [{ kind: 'css', value: 'rich-textarea [contenteditable="true"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /send message|send/i }],
@@ -99,6 +109,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   grok: {
     id: 'grok', label: 'Grok', version: 'grok@0.2.0', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: /(deepsearch|research).*(limit|unavailable)|usage limit/i,
     selectors: {
       composer: [{ kind: 'css', value: '[contenteditable="true"][role="textbox"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /submit|send/i }],

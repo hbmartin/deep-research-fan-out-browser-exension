@@ -2,23 +2,24 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { getCapture, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putJob, putRun } from '../src/db';
-import type { ProviderId, ProviderRun, Run } from '../src/types';
+import { getCapture, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
+import type { CaptureJob, ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
   configurePanelAction: vi.fn(async () => undefined),
   openPanel: vi.fn(async () => undefined),
   readClipboard: vi.fn(async () => ''),
-  writeClipboard: vi.fn(async () => undefined),
+  writeClipboard: vi.fn(async (_text: string) => undefined),
   downloadText: vi.fn<(...args: unknown[]) => Promise<number>>(),
   notify: vi.fn(async () => undefined),
   setBadge: vi.fn(async () => undefined),
+  sendTabEvent: vi.fn(async (_tabId: number, _event: unknown) => undefined),
 }));
 
 vi.mock('../src/platform', () => ({
   createPlatform: () => platform,
   handleOffscreenResponse: () => false,
-  sendTabEvent: vi.fn(async () => undefined),
+  sendTabEvent: platform.sendTabEvent,
 }));
 
 import { coordinatorTestHooks } from '../src/coordinator';
@@ -29,21 +30,30 @@ function provider(id: ProviderId, tabId: number, status: ProviderRun['status']):
 
 function run(providerRuns: Run['providerRuns'], status: Run['status'] = 'active'): Run {
   const id = crypto.randomUUID();
-  return { id, query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: id, downloadFolder: `deep-research/${id}` };
+  return { id, browserSessionId: 'current-session', query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: id, downloadFolder: `deep-research/${id}` };
 }
 
 beforeEach(() => {
   let downloadId = 100;
   platform.downloadText.mockReset().mockImplementation(async () => downloadId++);
   platform.readClipboard.mockReset().mockResolvedValue('');
+  platform.writeClipboard.mockReset().mockResolvedValue(undefined);
   platform.notify.mockClear();
   platform.setBadge.mockClear();
+  platform.sendTabEvent.mockReset().mockResolvedValue(undefined);
   vi.stubGlobal('browser', {
     runtime: { sendMessage: vi.fn(async () => undefined), getURL: vi.fn((path: string) => path) },
-    storage: { sync: { get: vi.fn(async () => ({})) } },
+    storage: {
+      sync: { get: vi.fn(async () => ({})) },
+      session: {
+        get: vi.fn(async () => ({ 'coordinator.browser-session.v1': 'current-session' })),
+        set: vi.fn(async () => undefined),
+      },
+    },
     tabs: { update: vi.fn(async () => undefined), get: vi.fn(), query: vi.fn(async () => []) },
     tabGroups: { update: vi.fn(async () => undefined) },
   });
+  coordinatorTestHooks.resetBrowserSession();
 });
 
 afterEach(() => {
@@ -138,8 +148,7 @@ describe('coordinator run guards', () => {
     }
   });
 
-  it('removes exhausted capture jobs and fails providers left capturing', async () => {
-    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  it('saves an exhausted job from its durable DOM fallback', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 909, 'capturing') });
     await putRun(stored);
     await putJob({
@@ -157,10 +166,10 @@ describe('coordinator run guards', () => {
     await coordinatorTestHooks.processCaptureQueue();
     expect(await nextCaptureJob()).toBeUndefined();
     expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
-      status: 'failed',
-      statusDetail: `Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`,
+      status: 'complete',
+      degraded: true,
     });
-    log.mockRestore();
+    expect(await getCapture(`${stored.id}:chatgpt`)).toMatchObject({ captureMethod: 'dom_only' });
   });
 
   it('links a persisted capture without overwriting a terminal status that won concurrently', async () => {
@@ -206,6 +215,7 @@ describe('coordinator run guards', () => {
         openedPages: [],
         warnings: [],
       },
+      tabUnavailable: true,
     });
 
     await coordinatorTestHooks.processCaptureQueue();
@@ -219,5 +229,143 @@ describe('coordinator run guards', () => {
       complete: false,
     });
     expect(capture?.researchTrail?.warnings).toContain('Search 1 expected 2 results but captured 1.');
+  });
+
+  it('rejects an unchanged clipboard and restores the sentinel without exposing prior text', async () => {
+    vi.useFakeTimers();
+    const privateText = 'Previously copied private material that must never become a report.';
+    let clipboard = privateText;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    const job: CaptureJob = {
+      id: 'run:chatgpt', runId: 'run', provider: 'chatgpt', tabId: 1, state: 'queued',
+      createdAt: 1, attempts: 0, tabUnavailable: true, domMarkdown: 'DOM fallback report', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(privateText);
+  });
+
+  it('accepts a changed clipboard and restores the user snapshot after capture', async () => {
+    vi.useFakeTimers();
+    const privateText = 'Previously copied private material that should be restored after capture.';
+    const report = 'A newly copied provider report with enough content to pass validation.';
+    let clipboard = privateText;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => { clipboard = report; });
+    const job: CaptureJob = {
+      id: 'run:chatgpt', runId: 'run', provider: 'chatgpt', tabId: 1, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: 'A newly rendered provider report with enough content to pass validation.', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toMatchObject({ text: report, restored: true });
+    expect(clipboard).toBe(privateText);
+  });
+
+  it('rejects unrelated clipboard text copied concurrently with provider capture', async () => {
+    vi.useFakeTimers();
+    const original = 'The original clipboard value that should survive the failed capture.';
+    const unrelated = 'Different private text copied by the user while capture was attempted.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => { clipboard = unrelated; });
+    const job: CaptureJob = {
+      id: 'run:chatgpt', runId: 'run', provider: 'chatgpt', tabId: 1, state: 'queued',
+      createdAt: 1, attempts: 0, tabUnavailable: true,
+      domMarkdown: 'A provider report about a completely separate research topic.', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(unrelated);
+  });
+
+  it('finishes a queued report from DOM after its provider tab closes', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 912, 'capturing') });
+    await putRun(stored);
+    await putJob({
+      id: `${stored.id}:chatgpt`, runId: stored.id, provider: 'chatgpt', tabId: 912,
+      state: 'queued', createdAt: Date.now(), attempts: 0,
+      domMarkdown: 'A complete DOM report that remains usable after its tab closes.', domCitations: [],
+    });
+    await coordinatorTestHooks.interruptRemovedTab(912);
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', degraded: true });
+    expect(await getCapture(`${stored.id}:chatgpt`)).toMatchObject({ captureMethod: 'dom_only' });
+  });
+
+  it('links a capture persisted before an exhausted job could update the run', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 913, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    await putCapture(id, {
+      rawMarkdown: 'Persisted report', normalizedMarkdown: 'Persisted report', citations: [],
+      captureMethod: 'copy_only', unplacedCitationCount: 0, capturedAt: Date.now(), urlsResolved: 0, urlsUnresolved: 0,
+    });
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 913, state: 'queued',
+      createdAt: Date.now(), attempts: MAX_CAPTURE_ATTEMPTS, domMarkdown: 'A durable DOM fallback report.', domCitations: [],
+    });
+    await coordinatorTestHooks.processCaptureQueue();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', captureId: id });
+    expect(await nextCaptureJob()).toBeUndefined();
+  });
+
+  it('processes later queued providers when an earlier one requires DOM fallback', async () => {
+    const stored = run({
+      chatgpt: provider('chatgpt', 914, 'capturing'),
+      claude: provider('claude', 915, 'capturing'),
+    });
+    await putRun(stored);
+    for (const providerId of ['chatgpt', 'claude'] as const) {
+      await putJob({
+        id: `${stored.id}:${providerId}`, runId: stored.id, provider: providerId,
+        tabId: stored.providerRuns[providerId]!.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
+        tabUnavailable: true, domMarkdown: `A sufficiently long ${providerId} DOM report for fallback capture.`, domCitations: [],
+      });
+    }
+    await coordinatorTestHooks.processCaptureQueue();
+    expect((await getRun(stored.id))?.providerRuns).toMatchObject({
+      chatgpt: { status: 'complete' },
+      claude: { status: 'complete' },
+    });
+  });
+
+  it('marks prior-browser-session work interrupted without restarting provider automation', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 916, 'researching') });
+    stored.browserSessionId = 'prior-session';
+    await putRun(stored);
+    await coordinatorTestHooks.reconcileRuns();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'interrupted',
+      statusDetail: 'Browser restarted before completion.',
+    });
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(916, expect.objectContaining({ type: 'content:start' }));
+  });
+
+  it('uses monitor-only resume when a provider content script reloads', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 917, 'researching') });
+    await putRun(stored);
+    await coordinatorTestHooks.handleRequest(
+      { type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/c/1' },
+      { tab: { id: 917 } } as Browser.runtime.MessageSender,
+    );
+    await vi.waitFor(() => expect(platform.sendTabEvent).toHaveBeenCalledWith(917, expect.objectContaining({
+      type: 'content:start', resumeOnly: true, status: 'researching',
+    })));
+  });
+
+  it('returns a terminal error code when an ended provider retries capture delivery', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 918, 'abandoned') }, 'complete');
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'content:capture', runId: stored.id, provider: 'chatgpt',
+      domMarkdown: 'A report that arrived after the provider was ended.', domCitations: [],
+    }, {} as Browser.runtime.MessageSender)).resolves.toMatchObject({
+      ok: false, code: 'provider_terminal',
+    });
   });
 });

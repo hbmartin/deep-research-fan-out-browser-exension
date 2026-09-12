@@ -1,8 +1,8 @@
 import { ADAPTERS } from './adapters';
 import { buildArtifact } from './artifacts';
-import { reconcileCitations } from './citations';
-import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
-import type { RuntimeRequest, RuntimeResponse } from './messages';
+import { reconcileCitations, tokenSimilarity } from './citations';
+import { captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
+import type { RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
 import { normalizeResearchTrail } from './sources';
@@ -10,6 +10,7 @@ import { assertTransition, createDownloadFolder, deriveRunStatus, slugify } from
 import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
 
 const ALARM_NAME = 'reconcile-runs';
+const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
 let captureWorkerRunning = false;
 let reconcileWorkerRunning = false;
 let lastNonRunInteractionAt = 0;
@@ -17,8 +18,41 @@ const knownRunTabIds = new Set<number>();
 const expectedTabActivations = new Map<number, number>();
 const finalizingRunIds = new Set<string>();
 const runMutationTails = new Map<string, Promise<void>>();
+let browserSessionIdPromise: Promise<string> | undefined;
+let fallbackBrowserSessionId: string | undefined;
 
-class CaptureDeferredError extends Error {}
+class CoordinatorRequestError extends Error {
+  constructor(message: string, readonly code: RuntimeErrorCode) {
+    super(message);
+    this.name = 'CoordinatorRequestError';
+  }
+}
+
+async function getBrowserSessionId(): Promise<string> {
+  browserSessionIdPromise ??= (async () => {
+    const session = (browser.storage as unknown as {
+      session?: {
+        get(key: string): Promise<Record<string, unknown>>;
+        set(value: Record<string, unknown>): Promise<void>;
+      };
+    }).session;
+    if (!session) {
+      fallbackBrowserSessionId ??= crypto.randomUUID();
+      return fallbackBrowserSessionId;
+    }
+    try {
+      const stored = await session.get(BROWSER_SESSION_KEY);
+      if (typeof stored[BROWSER_SESSION_KEY] === 'string') return stored[BROWSER_SESSION_KEY];
+      const id = crypto.randomUUID();
+      await session.set({ [BROWSER_SESSION_KEY]: id });
+      return id;
+    } catch {
+      fallbackBrowserSessionId ??= crypto.randomUUID();
+      return fallbackBrowserSessionId;
+    }
+  })();
+  return browserSessionIdPromise;
+}
 
 async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
   const previous = runMutationTails.get(runId)?.catch(() => undefined) ?? Promise.resolve();
@@ -68,7 +102,11 @@ function recordTabActivation(tabId: number, now = Date.now()): boolean {
 }
 
 function errorResponse(error: unknown): RuntimeResponse {
-  return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  return {
+    ok: false,
+    error: error instanceof Error ? error.message : String(error),
+    ...(error instanceof CoordinatorRequestError ? { code: error.code } : {}),
+  };
 }
 
 function composeQuery(query: string, appendString: string): string {
@@ -90,7 +128,7 @@ async function updateBadge(runs: Run[]): Promise<void> {
   await platform.setBadge(unread ? String(unread) : '', '#475467');
 }
 
-async function startContent(run: Run, provider: ProviderId): Promise<void> {
+async function startContent(run: Run, provider: ProviderId, resumeOnly = false): Promise<void> {
   const providerRun = run.providerRuns[provider];
   if (!providerRun || isTerminalProviderStatus(providerRun.status)) return;
   const settings = await loadSettings();
@@ -102,6 +140,8 @@ async function startContent(run: Run, provider: ProviderId): Promise<void> {
     appendString: providerRun.appendString,
     geminiAutoApprove: settings.geminiAutoApprove,
     completionDebounceMs: settings.providers[provider].completionDebounceMs,
+    resumeOnly,
+    status: providerRun.status,
   } as const;
   try {
     await sendTabEvent(providerRun.tabId, event);
@@ -124,6 +164,7 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
   const query = queryInput.trim();
   if (!query) throw new Error('Enter a research query.');
   const settings = await loadSettings();
+  const browserSessionId = await getBrowserSessionId();
   const enabled = PROVIDERS.filter((provider) => settings.providers[provider].enabled);
   if (!enabled.length) throw new Error('Enable at least one provider in Options.');
   const currentWindow = requestedWindowId
@@ -153,6 +194,7 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
   });
   const run: Run = {
     id,
+    browserSessionId,
     query,
     createdAt: now,
     windowId: currentWindow.id,
@@ -233,28 +275,45 @@ async function resolveCitationUrls(provider: ProviderId, citations: DomCitation[
 async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Promise<{ text: string; restored: boolean } | undefined> {
   const settings = await loadSettings();
   const attemptCapture = async (): Promise<{ text: string; restored: boolean }> => {
-    let original = '';
-    let hasSnapshot = false;
-    try { original = await platform.readClipboard(); hasSnapshot = true; } catch { /* Continue without a snapshot. */ }
-    await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const copied = await platform.readClipboard();
-    if (copied.trim().length < 40) throw new Error('Copied report was empty');
-    let restored = false;
-    if (settings.restoreClipboard && hasSnapshot) {
-      const current = await platform.readClipboard();
-      if (current === copied) {
-        await platform.writeClipboard(original);
-        restored = true;
+    const original = await platform.readClipboard();
+    const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
+    let primed = false;
+    let observed: string | undefined;
+    try {
+      await platform.writeClipboard(sentinel);
+      primed = true;
+      await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      observed = await platform.readClipboard();
+      const resemblesDomReport = job.domMarkdown.trim().length >= 20
+        && tokenSimilarity(observed, job.domMarkdown) >= 0.45;
+      if (observed === sentinel || observed === original || observed.trim().length < 40 || !resemblesDomReport) {
+        throw new Error('Provider copy did not produce a new report.');
       }
+      let restored = false;
+      if (settings.restoreClipboard) {
+        const current = await platform.readClipboard();
+        if (current === observed) {
+          await platform.writeClipboard(original);
+          restored = true;
+        }
+      }
+      return { text: observed, restored };
+    } catch (error) {
+      if (primed) {
+        const current = await platform.readClipboard().catch(() => undefined);
+        if (current === sentinel) {
+          await platform.writeClipboard(original).catch(() => undefined);
+        }
+      }
+      throw error;
     }
-    return { text: copied, restored };
   };
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try { return await attemptCapture(); }
     catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
   }
-  if (Date.now() - lastNonRunInteractionAt < 5000) throw new CaptureDeferredError('Waiting until the user is idle before focusing a provider tab.');
+  if (job.tabUnavailable || Date.now() - lastNonRunInteractionAt < 5000) return undefined;
   const [current] = await browser.tabs.query({ active: true, currentWindow: true });
   try {
     await activateTabInternally(job.tabId);
@@ -267,25 +326,70 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
   }
 }
 
+function captureIsDegraded(capture: Capture): boolean {
+  return capture.captureMethod === 'dom_only'
+    || capture.unplacedCitationCount > 0
+    || capture.urlsUnresolved > 0
+    || capture.researchTrail?.complete === false;
+}
+
+async function persistCaptureJob(
+  job: CaptureJob,
+  copied?: { text: string; restored: boolean },
+): Promise<{ id: string; degraded: boolean }> {
+  const rawMarkdown = copied?.text || job.domMarkdown;
+  if (rawMarkdown.trim().length < 40) throw new Error('Clipboard and DOM capture were both empty.');
+  const resolved = await resolveCitationUrls(job.provider, job.domCitations);
+  const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
+  const researchTrail = job.researchTrail
+    ? normalizeResearchTrail(job.researchTrail, reconciled.citations)
+    : undefined;
+  const capture: Capture = {
+    rawMarkdown,
+    normalizedMarkdown: reconciled.markdown,
+    citations: reconciled.citations,
+    captureMethod: copied ? (job.domCitations.length ? 'copy+dom' : 'copy_only') : 'dom_only',
+    unplacedCitationCount: reconciled.unplacedCitationCount,
+    capturedAt: Date.now(),
+    urlsResolved: resolved.resolved,
+    urlsUnresolved: resolved.unresolved,
+    title: job.title,
+    researchTrail,
+  };
+  const id = captureId(job.runId, job.provider);
+  await putCapture(id, capture);
+  return { id, degraded: captureIsDegraded(capture) };
+}
+
 async function completeProviderCapture(runId: string, provider: ProviderId, captureIdValue: string, degraded: boolean): Promise<boolean> {
-  const { run, value: completed } = await mutateStoredRun(runId, (storedRun) => {
+  const { run, value } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
-    if (!providerRun) return false;
+    if (!providerRun) return { completed: false, attached: false };
     providerRun.captureId = captureIdValue;
     providerRun.degraded ||= degraded;
-    if (isTerminalProviderStatus(providerRun.status)) return false;
+    if (isTerminalProviderStatus(providerRun.status)) {
+      if (providerRun.downloadedAt) {
+        providerRun.downloadedAt = undefined;
+        providerRun.downloadId = undefined;
+        storedRun.completedAt = undefined;
+      }
+      storedRun.status = deriveRunStatus(storedRun);
+      return { completed: false, attached: true };
+    }
     assertTransition(providerRun.status, 'complete');
     providerRun.status = 'complete';
     providerRun.statusDetail = undefined;
     providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
-    return true;
+    return { completed: true, attached: true };
   });
-  if (!completed) return false;
-  await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
+  if (!value.attached) return false;
+  if (value.completed) {
+    await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
+  }
   await maybeFinalize(run);
   await broadcastRuns();
-  return true;
+  return value.completed;
 }
 
 async function failProviderIfActive(runId: string, provider: ProviderId, detail: string): Promise<void> {
@@ -352,63 +456,56 @@ async function processCaptureQueue(): Promise<void> {
     for (;;) {
       const job = await nextCaptureJob();
       if (!job) break;
-      if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
-        await deleteJob(job.id).catch((error) => console.error('Could not remove an exhausted capture job.', error));
-        await containCaptureJobFailure(job.runId, job.provider, new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`));
-        continue;
-      }
-      job.state = 'leased';
-      job.leasedAt = Date.now();
-      job.attempts += 1;
-      await putJob(job);
       const run = await getRun(job.runId);
       const providerRun = run?.providerRuns[job.provider];
-      if (!run || !providerRun || isTerminalProviderStatus(providerRun.status)) {
+      if (!run || !providerRun) {
         await deleteJob(job.id);
         continue;
       }
+      const existingCapture = await getCapture(job.id);
+      if (existingCapture) {
+        try {
+          await completeProviderCapture(run.id, job.provider, job.id, captureIsDegraded(existingCapture));
+          await deleteJob(job.id);
+        } catch (error) {
+          console.error(`Could not link the persisted ${job.provider} capture; retaining its recovery job.`, error);
+          job.state = 'leased';
+          job.leasedAt = Date.now();
+          await putJob(job).catch(() => undefined);
+        }
+        continue;
+      }
+      const forceDomFallback = job.tabUnavailable
+        || isTerminalProviderStatus(providerRun.status)
+        || job.attempts >= MAX_CAPTURE_ATTEMPTS;
+      job.state = 'leased';
+      job.leasedAt = Date.now();
+      if (job.attempts < MAX_CAPTURE_ATTEMPTS) job.attempts += 1;
+      await putJob(job);
       let persisted: { id: string; degraded: boolean } | undefined;
       try {
-        const copied = await clipboardCapture(platform, job);
-        const rawMarkdown = copied?.text || job.domMarkdown;
-        if (rawMarkdown.trim().length < 40) throw new Error('Clipboard and DOM capture were both empty.');
-        const resolved = await resolveCitationUrls(job.provider, job.domCitations);
-        const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
-        const researchTrail = job.researchTrail
-          ? normalizeResearchTrail(job.researchTrail, reconciled.citations)
-          : undefined;
-        const capture: Capture = {
-          rawMarkdown,
-          normalizedMarkdown: reconciled.markdown,
-          citations: reconciled.citations,
-          captureMethod: copied ? (job.domCitations.length ? 'copy+dom' : 'copy_only') : 'dom_only',
-          unplacedCitationCount: reconciled.unplacedCitationCount,
-          capturedAt: Date.now(),
-          urlsResolved: resolved.resolved,
-          urlsUnresolved: resolved.unresolved,
-          title: job.title,
-          researchTrail,
-        };
-        const id = captureId(run.id, job.provider);
-        const degraded = !copied
-          || reconciled.unplacedCitationCount > 0
-          || resolved.unresolved > 0
-          || researchTrail?.complete === false;
-        await putCapture(id, capture);
-        persisted = { id, degraded };
-        await deleteJob(job.id);
+        const copied = forceDomFallback ? undefined : await clipboardCapture(platform, job);
+        persisted = await persistCaptureJob(job, copied);
         try {
-          await completeProviderCapture(run.id, job.provider, id, degraded);
+          await completeProviderCapture(run.id, job.provider, persisted.id, persisted.degraded);
+          await deleteJob(job.id);
         } catch (error) {
           await containCaptureJobFailure(run.id, job.provider, error, persisted);
         }
       } catch (error) {
-        if (error instanceof CaptureDeferredError && job.attempts < MAX_CAPTURE_ATTEMPTS) break;
-        await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
-        const failure = error instanceof CaptureDeferredError
-          ? new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`)
-          : error;
-        await containCaptureJobFailure(run.id, job.provider, failure, persisted);
+        if (persisted) {
+          await containCaptureJobFailure(run.id, job.provider, error, persisted);
+          continue;
+        }
+        if (job.attempts >= MAX_CAPTURE_ATTEMPTS && job.domMarkdown.trim().length < 40) {
+          await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
+          await containCaptureJobFailure(run.id, job.provider, error);
+          continue;
+        }
+        console.error(`Capture job attempt failed for ${job.provider}; retaining its DOM fallback.`, error);
+        job.state = 'leased';
+        job.leasedAt = Date.now();
+        await putJob(job).catch((putError) => console.error('Could not retain the failed capture job.', putError));
       }
     }
   } finally {
@@ -420,6 +517,9 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
   const run = await getRun(request.runId);
   const providerRun = run?.providerRuns[request.provider];
   if (!run || !providerRun) throw new Error('Run not found for capture.');
+  if (isTerminalProviderStatus(providerRun.status)) {
+    throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
+  }
   if (providerRun.status !== 'capturing') await mutateProvider(run.id, request.provider, 'capturing');
   await putJob({
     id: captureId(run.id, request.provider), runId: run.id, provider: request.provider,
@@ -477,7 +577,25 @@ async function maybeFinalize(runInput: Run): Promise<void> {
   }
 }
 
+async function markCaptureJobTabUnavailable(runId: string, provider: ProviderId): Promise<boolean> {
+  const job = await getJob(captureId(runId, provider));
+  if (!job) return false;
+  job.tabUnavailable = true;
+  job.state = 'queued';
+  job.leasedAt = undefined;
+  await putJob(job);
+  return true;
+}
+
 async function endProvider(runId: string, provider: ProviderId): Promise<void> {
+  const existing = await getRun(runId);
+  const existingProvider = existing?.providerRuns[provider];
+  if (!existing || !existingProvider) throw new Error('Provider run not found.');
+  await sendTabEvent(existingProvider.tabId, { type: 'content:stop', runId }).catch(() => undefined);
+  if (await markCaptureJobTabUnavailable(runId, provider)) {
+    await processCaptureQueue();
+    return;
+  }
   const { run, value: ended } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
     if (!providerRun) throw new Error('Provider run not found.');
@@ -522,9 +640,42 @@ async function reconcileRuns(): Promise<void> {
   if (reconcileWorkerRunning) return;
   reconcileWorkerRunning = true;
   try {
+    const browserSessionId = await getBrowserSessionId();
     const runs = await listRuns();
     setKnownRunTabs(runs);
     for (const snapshot of runs.filter((item) => item.status !== 'complete')) {
+      if (snapshot.browserSessionId !== browserSessionId) {
+        const recoveredJobIds: string[] = [];
+        for (const providerRun of Object.values(snapshot.providerRuns)) {
+          if (isTerminalProviderStatus(providerRun.status)) continue;
+          const id = captureId(snapshot.id, providerRun.provider);
+          const capture = await getCapture(id);
+          if (capture) {
+            providerRun.captureId = id;
+            providerRun.degraded ||= captureIsDegraded(capture);
+            providerRun.status = 'complete';
+            providerRun.statusDetail = undefined;
+            providerRun.completedAt ??= Date.now();
+            recoveredJobIds.push(id);
+            continue;
+          }
+          if (await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) {
+            providerRun.status = 'capturing';
+            providerRun.statusDetail = 'Saving a detected report after browser restart.';
+            providerRun.completedAt = undefined;
+            continue;
+          }
+          providerRun.status = 'interrupted';
+          providerRun.statusDetail = 'Browser restarted before completion.';
+          providerRun.completedAt ??= Date.now();
+        }
+        snapshot.status = deriveRunStatus(snapshot);
+        await putRun(snapshot);
+        await Promise.all(recoveredJobIds.map((id) => deleteJob(id).catch(() => undefined)));
+        const latest = await getRun(snapshot.id);
+        if (latest) await maybeFinalize(latest);
+        continue;
+      }
       for (const providerRun of Object.values(snapshot.providerRuns)) {
         if (isTerminalProviderStatus(providerRun.status)) continue;
         let valid = false;
@@ -534,9 +685,8 @@ async function reconcileRuns(): Promise<void> {
         } catch {
           valid = false;
         }
-        const run = await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
-        const currentProviderRun = run.providerRuns[providerRun.provider];
-        if (valid && currentProviderRun && !isTerminalProviderStatus(currentProviderRun.status)) await startContent(run, providerRun.provider);
+        if (!valid && await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) continue;
+        await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
       }
       const latest = await getRun(snapshot.id);
       if (latest) await maybeFinalize(latest);
@@ -555,6 +705,10 @@ async function interruptRemovedTab(tabId: number): Promise<void> {
     .map((providerRun) => ({ runId: run.id, provider: providerRun.provider })));
   let changed = false;
   for (const match of matches) {
+    if (await markCaptureJobTabUnavailable(match.runId, match.provider)) {
+      changed = true;
+      continue;
+    }
     const { run, value: interrupted } = await mutateStoredRun(match.runId, (storedRun) => {
       const providerRun = storedRun.providerRuns[match.provider];
       if (!providerRun || isTerminalProviderStatus(providerRun.status)) return false;
@@ -569,6 +723,7 @@ async function interruptRemovedTab(tabId: number): Promise<void> {
     changed = true;
     await maybeFinalize(run);
   }
+  await processCaptureQueue();
   if (changed) await broadcastRuns();
 }
 
@@ -620,8 +775,10 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const tabId = sender.tab?.id;
         if (tabId !== undefined) {
           const runs = await listRuns();
-          const run = runs.find((candidate) => Object.values(candidate.providerRuns).some((item) => item.tabId === tabId));
-          if (run) void startContent(run, message.provider);
+          const browserSessionId = await getBrowserSessionId();
+          const run = runs.find((candidate) => candidate.browserSessionId === browserSessionId
+            && candidate.providerRuns[message.provider]?.tabId === tabId);
+          if (run) void startContent(run, message.provider, true);
         }
         return { ok: true };
       }
@@ -662,6 +819,9 @@ export function startCoordinator(): void {
 }
 
 export const coordinatorTestHooks = {
+  clipboardCapture,
+  getBrowserSessionId,
+  handleRequest,
   mutateStoredRun,
   maybeFinalize,
   recordReconcileCheck,
@@ -672,6 +832,11 @@ export const coordinatorTestHooks = {
   recordTabActivation,
   setKnownRunTabs,
   processCaptureQueue,
+  reconcileRuns,
   reconcilePersistedCaptureFailure,
+  resetBrowserSession: () => {
+    browserSessionIdPromise = undefined;
+    fallbackBrowserSessionId = undefined;
+  },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };
