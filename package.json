@@ -1,0 +1,39 @@
+{
+  "name": "deep-research-fan-out",
+  "description": "Run deep research across ChatGPT, Claude, Gemini, and Grok.",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt -b chrome --mv3",
+    "dev:firefox": "wxt -b firefox --mv2",
+    "build": "pnpm build:chrome && pnpm build:firefox",
+    "build:chrome": "wxt build -b chrome --mv3",
+    "build:firefox": "wxt build -b firefox --mv2",
+    "zip": "pnpm zip:chrome && pnpm zip:firefox",
+    "zip:chrome": "wxt zip -b chrome --mv3",
+    "zip:firefox": "wxt zip -b firefox --mv2",
+    "compile": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint:firefox": "web-ext lint --source-dir .output/firefox-mv2",
+    "validate:manifests": "node scripts/validate-manifests.mjs",
+    "check": "pnpm compile && pnpm test && pnpm build && pnpm validate:manifests && pnpm lint:firefox",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "idb": "^8.0.3",
+    "turndown": "^7.2.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/turndown": "^5.0.6",
+    "fake-indexeddb": "^6.2.4",
+    "happy-dom": "^18.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "vitest": "^3.2.4",
+    "web-ext": "^10.5.0",
+    "wxt": "^0.21.3"
+  }
+}
