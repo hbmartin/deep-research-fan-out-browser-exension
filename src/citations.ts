@@ -17,13 +17,47 @@ export function normalizeUrl(value: string): string {
   }
 }
 
+interface PlainProjection {
+  text: string;
+  rawOffsets: number[];
+}
+
+function plainProjection(value: string): PlainProjection {
+  const linked: Array<{ character: string; rawOffset: number }> = [];
+  const linkPattern = /!?(\[([^\]]+)\])\([^)]*\)/g;
+  let consumed = 0;
+  for (const match of value.matchAll(linkPattern)) {
+    const start = match.index;
+    for (let index = consumed; index < start; index += 1) linked.push({ character: value[index]!, rawOffset: index });
+    const label = match[2]!;
+    const labelStart = start + match[0].indexOf(`[${label}]`) + 1;
+    for (let index = 0; index < label.length; index += 1) linked.push({ character: label[index]!, rawOffset: labelStart + index });
+    consumed = start + match[0].length;
+  }
+  for (let index = consumed; index < value.length; index += 1) linked.push({ character: value[index]!, rawOffset: index });
+
+  const normalized: Array<{ character: string; rawOffset: number }> = [];
+  let inWhitespace = false;
+  for (const item of linked) {
+    const character = /[`*_>#~|]/.test(item.character) ? ' ' : item.character;
+    if (/\s/u.test(character)) {
+      if (!inWhitespace) normalized.push({ character: ' ', rawOffset: item.rawOffset });
+      inWhitespace = true;
+      continue;
+    }
+    inWhitespace = false;
+    for (const lower of character.toLowerCase()) normalized.push({ character: lower, rawOffset: item.rawOffset });
+  }
+  while (normalized[0]?.character === ' ') normalized.shift();
+  while (normalized.at(-1)?.character === ' ') normalized.pop();
+  return {
+    text: normalized.map((item) => item.character).join(''),
+    rawOffsets: normalized.map((item) => item.rawOffset),
+  };
+}
+
 function plain(value: string): string {
-  return value
-    .replace(/!?(\[([^\]]+)\])\([^)]*\)/g, '$2')
-    .replace(/[`*_>#~|]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase()
-    .trim();
+  return plainProjection(value).text;
 }
 
 function tokens(value: string): Set<string> {
@@ -90,48 +124,58 @@ export function reconcileCitations(
   }
 
   if (style === 'superscript') {
-    for (const [position, item] of inventory.entries()) {
+    for (const item of inventory) {
       if (!item.markerText || !output.includes(item.markerText)) continue;
       const citation = ordered.find((entry) => entry.url === normalizeUrl(item.url));
       if (!citation) continue;
       output = output.replace(item.markerText, `[${citation.index}](${citation.url})`);
       citation.placement = 'inline';
       citation.confidence = 1;
-      if (position >= ordered.length) break;
     }
   }
 
-  let minimumOffset = 0;
-  for (const item of inventory) {
+  const placementBase = output;
+  const projection = plainProjection(placementBase);
+  const pendingInsertions: Array<{ insertion: number; marker: string; order: number }> = [];
+  let minimumPlainOffset = 0;
+  let minimumRawOffset = 0;
+  for (const [order, item] of inventory.entries()) {
     const citation = canonical.get(normalizeUrl(item.url));
     if (!citation || citation.placement === 'inline') continue;
     const context = plain(item.contextBefore).slice(-120);
     if (!context) continue;
-    const searchText = plain(output);
+    const searchText = projection.text;
     const needle = context.slice(-Math.min(context.length, 70));
-    let index = searchText.indexOf(needle, minimumOffset);
+    let index = searchText.indexOf(needle, minimumPlainOffset);
     let confidence = index >= 0 ? 1 : 0;
     if (index < 0) {
       const words = needle.split(' ');
-      for (let cursor = minimumOffset; cursor < searchText.length; cursor += 40) {
+      for (let cursor = minimumPlainOffset; cursor < searchText.length; cursor += 40) {
         const candidate = searchText.slice(cursor, cursor + Math.max(needle.length, 80));
         const score = tokenSimilarity(needle, candidate);
-        if (score > confidence) {
+        const tokenIndex = candidate.indexOf(words[0]!);
+        if (score > confidence && tokenIndex >= 0) {
           confidence = score;
-          index = cursor + candidate.indexOf(words[0]!);
+          index = cursor + tokenIndex;
         }
       }
     }
     if (index < 0 || confidence < threshold) continue;
     const rawNeedle = item.contextBefore.trim().slice(-60);
-    const rawIndex = output.toLowerCase().indexOf(rawNeedle.toLowerCase(), minimumOffset);
-    const approximate = rawIndex >= 0 ? rawIndex + rawNeedle.length : Math.min(output.length, index + context.length);
-    const insertion = sentenceInsertionOffset(output, approximate);
+    const rawIndex = placementBase.toLowerCase().indexOf(rawNeedle.toLowerCase(), minimumRawOffset);
+    const projectedEnd = Math.min(projection.rawOffsets.length - 1, index + needle.length - 1);
+    const mappedOffset = projectedEnd >= 0 ? projection.rawOffsets[projectedEnd]! + 1 : placementBase.length;
+    const approximate = rawIndex >= 0 ? rawIndex + rawNeedle.length : mappedOffset;
+    const insertion = sentenceInsertionOffset(placementBase, approximate);
     const marker = `[${citation.index}](${citation.url})`;
-    output = `${output.slice(0, insertion)}${marker}${output.slice(insertion)}`;
+    pendingInsertions.push({ insertion, marker, order });
     citation.placement = 'inline';
     citation.confidence = confidence;
-    minimumOffset = insertion + marker.length;
+    minimumPlainOffset = index + needle.length;
+    minimumRawOffset = insertion;
+  }
+  for (const item of pendingInsertions.sort((a, b) => b.insertion - a.insertion || b.order - a.order)) {
+    output = `${output.slice(0, item.insertion)}${item.marker}${output.slice(item.insertion)}`;
   }
 
   const placed = ordered.filter((citation) => citation.placement === 'inline');

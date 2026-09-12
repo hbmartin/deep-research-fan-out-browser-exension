@@ -36,11 +36,11 @@ function allForSelector(selector: Selector, root: ParentNode): HTMLElement[] {
   return elements.filter((element) => element.children.length === 0 && matches((element.textContent ?? '').trim(), selector.value));
 }
 
-export function findElement(chain: SelectorChain, root: ParentNode = document): HTMLElement | null {
+export function findElement(chain: SelectorChain, root: ParentNode = document, excludedRoots: readonly HTMLElement[] = []): HTMLElement | null {
   for (const selector of chain) {
     let results: HTMLElement[];
     try {
-      results = allForSelector(selector, root).filter(isVisible);
+      results = allForSelector(selector, root).filter((element) => isVisible(element) && !excludedRoots.some((excluded) => excluded.contains(element)));
     } catch {
       continue;
     }

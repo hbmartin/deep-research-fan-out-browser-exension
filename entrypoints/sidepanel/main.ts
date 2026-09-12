@@ -9,6 +9,10 @@ const app = document.querySelector<HTMLElement>('#app')!;
 let runs: Run[] = [];
 let settings: Settings;
 let notice = '';
+let queryTextarea: HTMLTextAreaElement;
+let previewsNode: HTMLElement | undefined;
+let noticeNode: HTMLElement | undefined;
+let historyNode: HTMLElement | undefined;
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -30,8 +34,7 @@ function button(label: string, action: () => Promise<void>, kind = ''): HTMLButt
 
 function setNotice(message: string): void {
   notice = message;
-  const live = document.querySelector<HTMLElement>('#notice');
-  if (live) live.textContent = notice;
+  renderNotice();
 }
 
 function elapsed(start?: number, end?: number): string {
@@ -98,7 +101,31 @@ function runCard(run: Run, index: number): HTMLElement {
   return details;
 }
 
-function render(): void {
+function renderPreviews(): void {
+  if (!previewsNode) return;
+  previewsNode.replaceChildren();
+  for (const provider of PROVIDERS.filter((id) => settings.providers[id].enabled)) {
+    const value = settings.providers[provider].appendString;
+    const line = element('div', 'preview');
+    line.append(element('strong', '', ADAPTERS[provider].label), element('span', '', value ? `+ ${value}` : 'No suffix'));
+    previewsNode.append(line);
+  }
+}
+
+function renderNotice(): void {
+  if (noticeNode) noticeNode.textContent = notice;
+}
+
+function renderHistory(): void {
+  const history = historyNode;
+  if (!history) return;
+  history.replaceChildren(element('h2', '', runs.length ? 'Runs' : 'No runs yet'));
+  if (!runs.length) history.append(element('p', 'empty', 'Start a query above or use “dr” in the address bar.'));
+  runs.forEach((run, index) => history.append(runCard(run, index)));
+  refreshTimers();
+}
+
+function renderShell(): void {
   app.replaceChildren();
   const header = element('header');
   const heading = element('div');
@@ -109,63 +136,52 @@ function render(): void {
   const launch = element('section', 'launch');
   const label = element('label', '', 'Research query');
   label.htmlFor = 'query';
-  const textarea = element('textarea') as HTMLTextAreaElement;
-  textarea.id = 'query';
-  textarea.rows = 6;
-  textarea.placeholder = 'What should all configured providers research?';
-  const previews = element('div', 'previews');
-  const renderPreviews = () => {
-    previews.replaceChildren();
-    for (const provider of PROVIDERS.filter((id) => settings.providers[id].enabled)) {
-      const value = settings.providers[provider].appendString;
-      const line = element('div', 'preview');
-      line.append(element('strong', '', ADAPTERS[provider].label), element('span', '', value ? `+ ${value}` : 'No suffix'));
-      previews.append(line);
-    }
-  };
+  queryTextarea = element('textarea') as HTMLTextAreaElement;
+  queryTextarea.id = 'query';
+  queryTextarea.rows = 6;
+  queryTextarea.placeholder = 'What should all configured providers research?';
+  previewsNode = element('div', 'previews');
   renderPreviews();
   const runButton = button('Run deep research', async () => {
-    const response = await sendRequest({ type: 'run:start', query: textarea.value });
+    const response = await sendRequest({ type: 'run:start', query: queryTextarea.value });
     if (!response.ok) throw new Error(response.error);
-    textarea.value = '';
+    queryTextarea.value = '';
     await reload();
   });
   runButton.classList.add('primary', 'run-button');
-  launch.append(label, textarea, element('p', 'hint', 'The provider suffixes below are appended after your query.'), previews, runButton);
+  launch.append(label, queryTextarea, element('p', 'hint', 'The provider suffixes below are appended after your query.'), previewsNode, runButton);
 
-  const noticeNode = element('p', 'notice', notice);
+  noticeNode = element('p', 'notice', notice);
   noticeNode.id = 'notice';
   noticeNode.setAttribute('role', 'status');
   noticeNode.setAttribute('aria-live', 'polite');
-  const history = element('section', 'history');
-  history.append(element('h2', '', runs.length ? 'Runs' : 'No runs yet'));
-  if (!runs.length) history.append(element('p', 'empty', 'Start a query above or use “dr” in the address bar.'));
-  runs.forEach((run, index) => history.append(runCard(run, index)));
-  app.append(header, launch, noticeNode, history);
-  refreshTimers();
+  historyNode = element('section', 'history');
+  app.append(header, launch, noticeNode, historyNode);
+  renderHistory();
 }
 
 async function reload(): Promise<void> {
   const response = await sendRequest({ type: 'runs:list' });
   if (!response.ok) return setNotice(response.error);
   runs = response.runs ?? [];
-  render();
+  renderHistory();
 }
 
 browser.runtime.onMessage.addListener((event: BackgroundEvent) => {
   if (event.type !== 'runs:changed') return;
   runs = event.runs;
   if (!settings) return;
-  render();
+  renderHistory();
 });
 
 browser.storage.onChanged.addListener((_changes, areaName) => {
   if (areaName !== 'sync') return;
-  void loadSettings().then((value) => { settings = value; render(); });
+  void loadSettings().then((value) => { settings = value; renderPreviews(); });
 });
 
 async function initialize(): Promise<void> {
   settings = await loadSettings();
+  renderShell();
   const action = (browser.action ?? (browser as unknown as { browserAction: typeof browser.action }).browserAction);
   await action.setBadgeText({ text: '' });
   await reload();

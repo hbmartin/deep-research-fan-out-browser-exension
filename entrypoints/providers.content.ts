@@ -1,9 +1,10 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, providerFromLocation, type ProviderAdapter } from '@/src/adapters';
+import { domCitationInventory, isClarifyingResponse, mergeCitationInventories, sourceToggleState } from '@/src/dom-capture';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent, RuntimeRequest } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
-import type { DomCitation, ProviderRunStatus, RunId } from '@/src/types';
+import type { ProviderRunStatus, RunId } from '@/src/types';
 
 interface ActiveRun {
   id: RunId;
@@ -73,7 +74,9 @@ async function automate(): Promise<void> {
   let composer: HTMLElement | null = null;
   for (let attempt = 0; attempt < 2 && !composer; attempt += 1) {
     if (findElement(adapter.selectors.loginWall)) return report('unauthenticated', `Not signed in to ${adapter.label}.`);
-    if (findElement(adapter.selectors.quotaNotice)) return report('quota_exhausted', `${adapter.label} deep research limit reached.`);
+    if (findElement(adapter.selectors.quotaNotice, document, findAll(adapter.selectors.finalMessageRoot))) {
+      return report('quota_exhausted', `${adapter.label} deep research limit reached.`);
+    }
     composer = await waitFor(() => findElement(adapter.selectors.composer), 15_000);
     if (!composer && attempt === 0) await delay(2000);
   }
@@ -114,28 +117,6 @@ async function automate(): Promise<void> {
   beginMonitoring();
 }
 
-function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter): DomCitation[] {
-  const anchors = findAll(adapter.selectors.citationAnchors, root).filter((element): element is HTMLAnchorElement => element instanceof HTMLAnchorElement);
-  const fullText = (root.innerText || root.textContent || '').replace(/\s+/g, ' ');
-  let cursor = 0;
-  return anchors.flatMap((anchor, domOrder) => {
-    const url = anchor.href;
-    if (!url.startsWith('http')) return [];
-    const markerText = (anchor.innerText || anchor.textContent || '').trim();
-    let position = markerText ? fullText.indexOf(markerText, cursor) : cursor;
-    if (position < 0) position = cursor;
-    cursor = position + markerText.length;
-    return [{
-      url,
-      title: anchor.getAttribute('aria-label') || anchor.getAttribute('title') || markerText || undefined,
-      markerText: markerText || undefined,
-      domOrder,
-      contextBefore: fullText.slice(Math.max(0, position - 120), position),
-      contextAfter: fullText.slice(cursor, cursor + 60),
-    }];
-  });
-}
-
 function domToMarkdown(root: HTMLElement): string {
   const clone = root.cloneNode(true) as HTMLElement;
   clone.querySelectorAll('button, script, style, svg, [aria-hidden="true"]').forEach((element) => element.remove());
@@ -148,17 +129,23 @@ async function capture(root: HTMLElement): Promise<void> {
   if (!active || active.captureSent) return;
   active.captureSent = true;
   await report('capturing');
+  const before = domCitationInventory(root, active.adapter);
   const toggle = active.adapter.selectors.sourcesPanelToggle && (findElement(active.adapter.selectors.sourcesPanelToggle, root) || findElement(active.adapter.selectors.sourcesPanelToggle));
-  if (toggle) {
+  let after = before;
+  if (toggle && sourceToggleState(toggle) === 'collapsed') {
     toggle.click();
-    await delay(300);
+    const started = Date.now();
+    do {
+      await delay(100);
+      after = domCitationInventory(root, active.adapter);
+    } while (Date.now() - started < 1000 && after.length === before.length);
   }
   await send({
     type: 'content:capture',
     runId: active.id,
     provider: active.adapter.id,
     domMarkdown: domToMarkdown(root),
-    domCitations: domCitationInventory(root, active.adapter),
+    domCitations: mergeCitationInventories(before, after),
     title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
   });
 }
@@ -166,12 +153,13 @@ async function capture(root: HTMLElement): Promise<void> {
 function inspectPage(): void {
   if (!active || active.captureSent) return;
   const { adapter } = active;
+  const finalRoots = findAll(adapter.selectors.finalMessageRoot);
   if (location.origin !== adapter.origin) {
     void report('interrupted', 'Provider tab navigated away.');
     stopMonitoring();
     return;
   }
-  if (findElement(adapter.selectors.quotaNotice)) {
+  if (findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
     void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
     stopMonitoring();
     return;
@@ -182,7 +170,8 @@ function inspectPage(): void {
     else if (active.status !== 'awaiting_user') void report('awaiting_user', 'Approve the Gemini research plan to continue.');
     return;
   }
-  if (adapter.selectors.clarifyingPrompt && findElement(adapter.selectors.clarifyingPrompt)) {
+  const latestResponse = finalRoots.at(-1) ?? null;
+  if (isClarifyingResponse(latestResponse, adapter.clarifyingPromptPattern)) {
     if (active.status !== 'awaiting_user') void report('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
@@ -265,6 +254,5 @@ export default defineContentScript({
     });
     const hello = () => send({ type: 'content:hello', provider, url: location.href });
     void hello();
-    window.setInterval(hello, 10_000);
   },
 });
