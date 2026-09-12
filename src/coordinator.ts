@@ -618,6 +618,12 @@ function isProviderUrl(url: string | undefined, provider: ProviderId): boolean {
   catch { return false; }
 }
 
+function isProviderAuthenticationUrl(url: string | undefined, provider: ProviderId): boolean {
+  if (!url) return false;
+  try { return ADAPTERS[provider].authenticationOrigins?.includes(new URL(url).origin) ?? false; }
+  catch { return false; }
+}
+
 async function recordReconcileCheck(runId: string, provider: ProviderId, valid: boolean): Promise<Run> {
   return (await mutateStoredRun(runId, (run) => {
     const providerRun = run.providerRuns[provider];
@@ -678,15 +684,18 @@ async function reconcileRuns(): Promise<void> {
       }
       for (const providerRun of Object.values(snapshot.providerRuns)) {
         if (isTerminalProviderStatus(providerRun.status)) continue;
+        let providerPage = false;
         let valid = false;
         try {
           const tab = await browser.tabs.get(providerRun.tabId);
-          valid = isProviderUrl(tab.url, providerRun.provider);
+          providerPage = isProviderUrl(tab.url, providerRun.provider);
+          valid = providerPage || isProviderAuthenticationUrl(tab.url, providerRun.provider);
         } catch {
           valid = false;
         }
         if (!valid && await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) continue;
         await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
+        if (providerPage) await startContent(snapshot, providerRun.provider, true);
       }
       const latest = await getRun(snapshot.id);
       if (latest) await maybeFinalize(latest);
@@ -828,6 +837,7 @@ export const coordinatorTestHooks = {
   interruptRemovedTab,
   resolveCitationUrls,
   isProviderUrl,
+  isProviderAuthenticationUrl,
   markExpectedTabActivation,
   recordTabActivation,
   setKnownRunTabs,

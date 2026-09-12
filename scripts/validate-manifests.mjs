@@ -11,10 +11,23 @@ function normalizedOrigins(patterns) {
   return [...new Set(patterns.map((pattern) => new URL(pattern.replace(/\*$/, '')).origin))].sort();
 }
 
+function normalizedPatterns(patterns) {
+  return [...new Set(patterns.map((pattern) => {
+    const url = new URL(pattern);
+    return `${url.origin}${url.pathname}${url.search}${url.hash}`;
+  }))].sort();
+}
+
 function assertExactOrigins(actual, expected, label) {
   const actualOrigins = normalizedOrigins(actual);
   const expectedOrigins = normalizedOrigins(expected);
   assert(JSON.stringify(actualOrigins) === JSON.stringify(expectedOrigins), `${label} origins differ: expected ${expectedOrigins.join(', ')}, received ${actualOrigins.join(', ')}`);
+}
+
+function assertExactPatterns(actual, expected, label) {
+  const actualPatterns = normalizedPatterns(actual);
+  const expectedPatterns = normalizedPatterns(expected);
+  assert(JSON.stringify(actualPatterns) === JSON.stringify(expectedPatterns), `${label} patterns differ: expected ${expectedPatterns.join(', ')}, received ${actualPatterns.join(', ')}`);
 }
 
 const origins = [
@@ -47,7 +60,7 @@ for (const manifest of [chrome, firefox]) {
   assert(manifest.omnibox?.keyword === 'dr', 'Omnibox keyword must be dr.');
   assert(!JSON.stringify(manifest).includes('<all_urls>'), 'Broad host access is forbidden.');
   const matches = manifest.content_scripts?.flatMap((script) => script.matches ?? []) ?? [];
-  assertExactOrigins(matches, origins.slice(0, 4), 'Provider content scripts');
+  assertExactPatterns(matches, origins.slice(0, 4), 'Provider content scripts');
 }
 
 console.log('Chrome and Firefox manifests satisfy release invariants.');

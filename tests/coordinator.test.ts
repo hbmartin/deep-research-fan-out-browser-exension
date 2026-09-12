@@ -15,6 +15,7 @@ const platform = vi.hoisted(() => ({
   setBadge: vi.fn(async () => undefined),
   sendTabEvent: vi.fn(async (_tabId: number, _event: unknown) => undefined),
 }));
+const tabsGet = vi.hoisted(() => vi.fn<(_tabId: number) => Promise<Browser.tabs.Tab>>());
 
 vi.mock('../src/platform', () => ({
   createPlatform: () => platform,
@@ -41,6 +42,7 @@ beforeEach(() => {
   platform.notify.mockClear();
   platform.setBadge.mockClear();
   platform.sendTabEvent.mockReset().mockResolvedValue(undefined);
+  tabsGet.mockReset();
   vi.stubGlobal('browser', {
     runtime: { sendMessage: vi.fn(async () => undefined), getURL: vi.fn((path: string) => path) },
     storage: {
@@ -50,7 +52,7 @@ beforeEach(() => {
         set: vi.fn(async () => undefined),
       },
     },
-    tabs: { update: vi.fn(async () => undefined), get: vi.fn(), query: vi.fn(async () => []) },
+    tabs: { update: vi.fn(async () => undefined), get: tabsGet, query: vi.fn(async () => []) },
     tabGroups: { update: vi.fn(async () => undefined) },
   });
   coordinatorTestHooks.resetBrowserSession();
@@ -110,6 +112,17 @@ describe('coordinator run guards', () => {
     await coordinatorTestHooks.recordReconcileCheck(stored.id, 'chatgpt', false);
     await coordinatorTestHooks.recordReconcileCheck(stored.id, 'chatgpt', false);
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('interrupted');
+  });
+
+  it('does not count a provider authentication redirect as a reconciliation failure', async () => {
+    const stored = run({ gemini: provider('gemini', 8, 'researching') });
+    stored.providerRuns.gemini!.reconcileFailureCount = 2;
+    await putRun(stored);
+    tabsGet.mockResolvedValue({ id: 8, url: 'https://accounts.google.com/v3/signin' } as Browser.tabs.Tab);
+    await coordinatorTestHooks.reconcileRuns();
+    expect((await getRun(stored.id))?.providerRuns.gemini).toMatchObject({ status: 'researching' });
+    expect((await getRun(stored.id))?.providerRuns.gemini?.reconcileFailureCount).toBeUndefined();
+    expect(platform.sendTabEvent).not.toHaveBeenCalled();
   });
 
   it('marks a positively removed provider tab interrupted immediately', async () => {
@@ -356,6 +369,16 @@ describe('coordinator run guards', () => {
     await vi.waitFor(() => expect(platform.sendTabEvent).toHaveBeenCalledWith(917, expect.objectContaining({
       type: 'content:start', resumeOnly: true, status: 'researching',
     })));
+  });
+
+  it('reattaches monitor-only capture using the persisted researching phase during reconciliation', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 919, 'researching') });
+    await putRun(stored);
+    tabsGet.mockResolvedValue({ id: 919, url: 'https://chatgpt.com/c/1' } as Browser.tabs.Tab);
+    await coordinatorTestHooks.reconcileRuns();
+    expect(platform.sendTabEvent).toHaveBeenCalledWith(919, expect.objectContaining({
+      type: 'content:start', resumeOnly: true, status: 'researching',
+    }));
   });
 
   it('returns a terminal error code when an ended provider retries capture delivery', async () => {

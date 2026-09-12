@@ -12,6 +12,7 @@ export interface ProviderAdapter {
   label: string;
   version: string;
   origin: string;
+  authenticationOrigins?: readonly string[];
   entryUrl: string;
   composerKind: 'contenteditable' | 'textarea';
   submitStrategy: 'button' | 'enter';
@@ -87,6 +88,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   },
   gemini: {
     id: 'gemini', label: 'Gemini', version: 'gemini@0.1.0', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
+    authenticationOrigins: ['https://accounts.google.com'],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'superscript', urlResolution: 'follow_redirect',
     progressResponsePattern: commonProgressResponse,
     quotaResponsePattern: /deep research.*(limit|unavailable)|upgrade.*deep research/i,
