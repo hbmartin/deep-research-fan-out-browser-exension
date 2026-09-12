@@ -3,7 +3,25 @@ import type { Selector, SelectorChain } from './adapters';
 function implicitRole(element: Element): string | null {
   if (element.hasAttribute('role')) return element.getAttribute('role');
   if (element instanceof HTMLButtonElement) return 'button';
-  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return 'textbox';
+  if (element instanceof HTMLTextAreaElement) return 'textbox';
+  if (element instanceof HTMLInputElement) {
+    switch (element.type) {
+      case 'button':
+      case 'image':
+      case 'reset':
+      case 'submit': return 'button';
+      case 'checkbox': return 'checkbox';
+      case 'radio': return 'radio';
+      case 'number': return 'spinbutton';
+      case 'range': return 'slider';
+      case 'search': return element.list ? 'combobox' : 'searchbox';
+      case 'email':
+      case 'tel':
+      case 'text':
+      case 'url': return element.list ? 'combobox' : 'textbox';
+      default: return null;
+    }
+  }
   if (element instanceof HTMLAnchorElement) return 'link';
   return null;
 }
@@ -64,5 +82,9 @@ export function findAll(chain: SelectorChain, root: ParentNode = document): HTML
 export function isVisible(element: HTMLElement): boolean {
   const style = getComputedStyle(element);
   const rect = element.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && !element.hasAttribute('disabled') && (rect.width > 0 || rect.height > 0 || style.position === 'fixed');
+  return style.display !== 'none'
+    && style.visibility !== 'hidden'
+    && !element.hasAttribute('disabled')
+    && element.getAttribute('aria-disabled')?.toLowerCase() !== 'true'
+    && (rect.width > 0 || rect.height > 0 || style.position === 'fixed');
 }

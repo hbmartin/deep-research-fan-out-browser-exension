@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { injectQuery } from '../src/injection';
+import { injectionTestHooks, injectQuery } from '../src/injection';
 import { findElement } from '../src/selectors';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -19,6 +19,35 @@ describe('selector engine', () => {
     visible(document.querySelector('button')!);
     expect(findElement([{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep research" i]' }])).toBeNull();
   });
+
+  it('maps input elements to their HTML-AAM implicit roles', () => {
+    document.body.innerHTML = `
+      <input type="submit" aria-label="Send">
+      <input type="checkbox" aria-label="Include">
+      <input type="radio" aria-label="Choice">
+      <input type="number" aria-label="Count">
+      <input type="range" aria-label="Volume">
+      <input type="search" aria-label="Search">
+      <input type="text" list="choices" aria-label="Preset">
+      <datalist id="choices"><option value="one"></datalist>
+      <input type="password" aria-label="Secret">
+    `;
+    document.querySelectorAll<HTMLElement>('input').forEach(visible);
+    expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'checkbox', name: 'Include' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'radio', name: 'Choice' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'spinbutton', name: 'Count' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'slider', name: 'Volume' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'searchbox', name: 'Search' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'combobox', name: 'Preset' }])).toBeInstanceOf(HTMLInputElement);
+    expect(findElement([{ kind: 'aria', role: 'textbox', name: 'Secret' }])).toBeNull();
+  });
+
+  it('does not select aria-disabled controls', () => {
+    document.body.innerHTML = '<button aria-label="Send" aria-disabled="true">Send</button>';
+    visible(document.querySelector('button')!);
+    expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
+  });
 });
 
 describe('query injection', () => {
@@ -30,5 +59,18 @@ describe('query injection', () => {
     await expect(injectQuery(textarea, 'textarea', 'line one\nline two')).resolves.toBe(true);
     expect(textarea.value).toBe('line one\nline two');
     expect(inputs).toBe(1);
+  });
+
+  it('preserves meaningful spaces and browser-rendered block and line breaks', () => {
+    const blocks = document.createElement('div');
+    Object.defineProperty(blocks, 'innerText', { configurable: true, value: 'alpha\n  beta' });
+    expect(injectionTestHooks.verified(blocks, 'alpha\r\n  beta')).toBe(true);
+    expect(injectionTestHooks.verified(blocks, 'alpha\nbeta')).toBe(false);
+
+    const breaks = document.createElement('div');
+    Object.defineProperty(breaks, 'innerText', { configurable: true, value: 'alpha\n\nbeta\u00a0gamma' });
+    expect(injectionTestHooks.verified(breaks, 'alpha\r\n\r\nbeta gamma')).toBe(true);
+    expect(injectionTestHooks.verified(breaks, 'alpha\nbeta gamma')).toBe(false);
+    expect(injectionTestHooks.verified(breaks, 'alpha\n\nbeta  gamma')).toBe(false);
   });
 });

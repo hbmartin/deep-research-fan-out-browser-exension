@@ -1,5 +1,5 @@
 function normalized(value: string): string {
-  return value.replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
+  return value.replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ');
 }
 
 function currentText(element: HTMLElement): string {
@@ -48,3 +48,5 @@ export function submitWithEnter(element: HTMLElement): void {
   element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
   element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
 }
+
+export const injectionTestHooks = { normalized, currentText, verified };

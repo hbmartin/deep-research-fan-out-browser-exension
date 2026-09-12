@@ -1,8 +1,9 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, providerFromLocation, type ProviderAdapter } from '@/src/adapters';
-import { domCitationInventory, isClarifyingResponse, mergeCitationInventories, sourceToggleState } from '@/src/dom-capture';
+import { createFinalResponseBaseline, domCitationInventory, isClarifyingResponse, isNewFinalResponse, mergeCitationInventories, sourceToggleState, type FinalResponseBaseline } from '@/src/dom-capture';
+import { sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
-import type { BackgroundEvent, RuntimeRequest } from '@/src/messages';
+import type { BackgroundEvent } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
 import type { ProviderRunStatus, RunId } from '@/src/types';
 
@@ -15,25 +16,23 @@ interface ActiveRun {
   status: ProviderRunStatus;
   completionCandidateAt?: number;
   captureSent: boolean;
+  finalResponseBaseline: FinalResponseBaseline;
 }
 
 let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
 let sweepTimer: number | undefined;
 let inspectionScheduled = false;
+let captureInFlight = false;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function send(message: RuntimeRequest): Promise<void> {
-  await browser.runtime.sendMessage(message).catch(() => undefined);
-}
-
 async function report(status: ProviderRunStatus, detail?: string, submittedAt?: number): Promise<void> {
   if (!active) return;
   active.status = status;
-  await send({ type: 'content:state', runId: active.id, provider: active.adapter.id, status, detail, submittedAt });
+  await sendContentMessage({ type: 'content:state', runId: active.id, provider: active.adapter.id, status, detail, submittedAt });
 }
 
 function waitFor(predicate: () => HTMLElement | null, timeoutMs: number): Promise<HTMLElement | null> {
@@ -126,28 +125,34 @@ function domToMarkdown(root: HTMLElement): string {
 }
 
 async function capture(root: HTMLElement): Promise<void> {
-  if (!active || active.captureSent) return;
-  active.captureSent = true;
-  await report('capturing');
-  const before = domCitationInventory(root, active.adapter);
-  const toggle = active.adapter.selectors.sourcesPanelToggle && (findElement(active.adapter.selectors.sourcesPanelToggle, root) || findElement(active.adapter.selectors.sourcesPanelToggle));
-  let after = before;
-  if (toggle && sourceToggleState(toggle) === 'collapsed') {
-    toggle.click();
-    const started = Date.now();
-    do {
-      await delay(100);
-      after = domCitationInventory(root, active.adapter);
-    } while (Date.now() - started < 1000 && after.length === before.length);
+  if (!active || active.captureSent || captureInFlight) return;
+  captureInFlight = true;
+  const capturingRun = active;
+  try {
+    await report('capturing');
+    const before = domCitationInventory(root, capturingRun.adapter);
+    const toggle = capturingRun.adapter.selectors.sourcesPanelToggle && (findElement(capturingRun.adapter.selectors.sourcesPanelToggle, root) || findElement(capturingRun.adapter.selectors.sourcesPanelToggle));
+    let after = before;
+    if (toggle && sourceToggleState(toggle) === 'collapsed') {
+      toggle.click();
+      const started = Date.now();
+      do {
+        await delay(100);
+        after = domCitationInventory(root, capturingRun.adapter);
+      } while (Date.now() - started < 1000 && after.length === before.length);
+    }
+    await sendContentMessage({
+      type: 'content:capture',
+      runId: capturingRun.id,
+      provider: capturingRun.adapter.id,
+      domMarkdown: domToMarkdown(root),
+      domCitations: mergeCitationInventories(before, after),
+      title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
+    });
+    if (active?.id === capturingRun.id) active.captureSent = true;
+  } finally {
+    captureInFlight = false;
   }
-  await send({
-    type: 'content:capture',
-    runId: active.id,
-    provider: active.adapter.id,
-    domMarkdown: domToMarkdown(root),
-    domCitations: mergeCitationInventories(before, after),
-    title: root.querySelector('h1, h2, h3')?.textContent?.trim(),
-  });
 }
 
 function inspectPage(): void {
@@ -171,7 +176,8 @@ function inspectPage(): void {
     return;
   }
   const latestResponse = finalRoots.at(-1) ?? null;
-  if (isClarifyingResponse(latestResponse, adapter.clarifyingPromptPattern)) {
+  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
+  if (isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern)) {
     if (active.status !== 'awaiting_user') void report('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
@@ -181,14 +187,15 @@ function inspectPage(): void {
     if (active.status === 'awaiting_user' || active.status === 'manual_required') void report('researching');
     return;
   }
-  const root = findElement(adapter.selectors.finalMessageRoot);
-  const copy = root ? findElement(adapter.selectors.copyButton, root) || findElement(adapter.selectors.copyButton) : null;
-  if (!root || !copy) {
+  const root = newResponse;
+  if (!root) {
     active.completionCandidateAt = undefined;
     return;
   }
   active.completionCandidateAt ??= Date.now();
-  if (Date.now() - active.completionCandidateAt >= active.completionDebounceMs) void capture(root);
+  if (Date.now() - active.completionCandidateAt >= active.completionDebounceMs) {
+    void capture(root).catch((error) => console.error('Could not deliver captured report to the coordinator.', error));
+  }
 }
 
 function scheduleInspection(): void {
@@ -220,6 +227,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   if (active?.id === event.runId) return;
   stopMonitoring();
   const adapter = ADAPTERS[event.provider];
+  const finalResponseBaseline = createFinalResponseBaseline(findAll(adapter.selectors.finalMessageRoot));
   active = {
     id: event.runId,
     adapter,
@@ -228,6 +236,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     completionDebounceMs: event.completionDebounceMs,
     status: 'opening',
     captureSent: false,
+    finalResponseBaseline,
   };
   await automate();
 }
@@ -252,7 +261,7 @@ export default defineContentScript({
       }
       return undefined;
     });
-    const hello = () => send({ type: 'content:hello', provider, url: location.href });
+    const hello = () => sendContentMessage({ type: 'content:hello', provider, url: location.href });
     void hello();
   },
 });

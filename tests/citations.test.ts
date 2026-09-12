@@ -15,19 +15,24 @@ describe('URL normalization', () => {
 });
 
 describe('citation reconciliation', () => {
-  it('processes the twelve-case provider fixture corpus', () => {
+  it('reconciles every distinct provider fixture scenario', () => {
     const fixtures = JSON.parse(readFileSync(new URL('./fixtures/provider-reports.json', import.meta.url), 'utf8')) as Array<{
-      provider: string; case: number; style: 'markdown_link' | 'superscript'; body: string;
+      provider: string;
+      case: string;
+      style: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
+      body: string;
+      citations: DomCitation[];
+      expectedMarkdown: string;
+      expectedCitationCount: number;
     }>;
-    expect(fixtures).toHaveLength(12);
     expect(new Set(fixtures.map((fixture) => fixture.provider))).toEqual(new Set(['chatgpt', 'claude', 'gemini', 'grok']));
+    expect(new Set(fixtures.map((fixture) => fixture.style))).toEqual(new Set(['markdown_link', 'numeric_bracket', 'superscript', 'none']));
     for (const fixture of fixtures) {
-      const url = fixture.style === 'markdown_link'
-        ? fixture.body.match(/https?:\/\/[^)]+/)![0]
-        : `https://gemini-${fixture.case}.test`;
-      const marker = fixture.style === 'superscript' ? fixture.body.match(/[¹²³]/)?.[0] : undefined;
-      const result = reconcileCitations(fixture.body, [citation(url, marker)], fixture.style);
-      expect(result.citations[0]?.placement, `${fixture.provider} case ${fixture.case}`).toBe('inline');
+      const result = reconcileCitations(fixture.body, fixture.citations, fixture.style);
+      expect(result.markdown, `${fixture.provider}: ${fixture.case}`).toBe(fixture.expectedMarkdown);
+      expect(result.citations, `${fixture.provider}: ${fixture.case}`).toHaveLength(fixture.expectedCitationCount);
+      expect(result.citations.filter((item) => item.placement === 'inline'), `${fixture.provider}: ${fixture.case}`).toHaveLength(fixture.expectedCitationCount);
+      expect(result.unplacedCitationCount, `${fixture.provider}: ${fixture.case}`).toBe(0);
     }
   });
 

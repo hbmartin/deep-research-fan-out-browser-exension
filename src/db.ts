@@ -10,6 +10,9 @@ interface ResearchDb extends DBSchema {
 
 let databasePromise: Promise<IDBPDatabase<ResearchDb>> | undefined;
 
+export const MAX_CAPTURE_ATTEMPTS = 3;
+export const REDIRECT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 function db(): Promise<IDBPDatabase<ResearchDb>> {
   databasePromise ??= openDB<ResearchDb>('deep-research-fan-out', 1, {
     upgrade(database) {
@@ -41,20 +44,25 @@ export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   return jobs.find((job) => job.state === 'queued' || (job.leasedAt && Date.now() - job.leasedAt > 60_000));
 }
 export async function getRedirect(wrapper: string): Promise<string | undefined> { return (await db()).get('redirects', wrapper).then((item) => item?.canonical); }
-export async function putRedirect(wrapper: string, canonical: string): Promise<void> { await (await db()).put('redirects', { wrapper, canonical, resolvedAt: Date.now() }); }
+export async function putRedirect(wrapper: string, canonical: string, resolvedAt = Date.now()): Promise<void> {
+  await (await db()).put('redirects', { wrapper, canonical, resolvedAt });
+}
 
 export async function evictHistory(limit = 20): Promise<void> {
   const database = await db();
   const completed = (await database.getAllFromIndex('runs', 'by-created')).filter((run) => run.status === 'complete');
-  if (completed.length <= limit) return;
-  const evicted = completed.slice(0, completed.length - limit);
-  const transaction = database.transaction(['runs', 'captures'], 'readwrite');
+  const evicted = completed.slice(0, Math.max(0, completed.length - limit));
+  const expiredRedirects = (await database.getAll('redirects'))
+    .filter((redirect) => Date.now() - redirect.resolvedAt > REDIRECT_RETENTION_MS);
+  if (!evicted.length && !expiredRedirects.length) return;
+  const transaction = database.transaction(['runs', 'captures', 'redirects'], 'readwrite');
   for (const run of evicted) {
     await transaction.objectStore('runs').delete(run.id);
     for (const providerRun of Object.values(run.providerRuns)) {
       if (providerRun.captureId) await transaction.objectStore('captures').delete(providerRun.captureId);
     }
   }
+  for (const redirect of expiredRedirects) await transaction.objectStore('redirects').delete(redirect.wrapper);
   await transaction.done;
 }
 

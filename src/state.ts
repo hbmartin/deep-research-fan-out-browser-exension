@@ -52,9 +52,10 @@ export function slugify(query: string): string {
     .replace(/-$/g, '') || 'research';
 }
 
-export function createDownloadFolder(root: string, createdAt: number, slug: string): string {
+export function createDownloadFolder(root: string, createdAt: number, slug: string, runId: string): string {
   const date = new Date(createdAt);
   const pad = (value: number) => String(value).padStart(2, '0');
   const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}`;
-  return `${root}/${stamp}_${slug}`;
+  const suffix = runId.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return `${root}/${stamp}_${slug}_${suffix}`;
 }

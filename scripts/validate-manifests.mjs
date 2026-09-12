@@ -7,6 +7,16 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function normalizedOrigins(patterns) {
+  return [...new Set(patterns.map((pattern) => new URL(pattern.replace(/\*$/, '')).origin))].sort();
+}
+
+function assertExactOrigins(actual, expected, label) {
+  const actualOrigins = normalizedOrigins(actual);
+  const expectedOrigins = normalizedOrigins(expected);
+  assert(JSON.stringify(actualOrigins) === JSON.stringify(expectedOrigins), `${label} origins differ: expected ${expectedOrigins.join(', ')}, received ${actualOrigins.join(', ')}`);
+}
+
 const origins = [
   'https://chatgpt.com/*',
   'https://claude.ai/*',
@@ -22,7 +32,7 @@ assert(chrome.side_panel?.default_path === 'sidepanel.html', 'Chrome side panel 
 for (const permission of ['offscreen', 'sidePanel', 'scripting', 'tabGroups', 'unlimitedStorage']) {
   assert(chrome.permissions.includes(permission), `Chrome permission missing: ${permission}`);
 }
-for (const origin of origins) assert(chrome.host_permissions.includes(origin), `Chrome origin missing: ${origin}`);
+assertExactOrigins(chrome.host_permissions, origins, 'Chrome host permissions');
 
 assert(firefox.manifest_version === 2, 'Firefox must use Manifest V2.');
 assert(firefox.background?.scripts?.includes('background.js'), 'Firefox background page is missing.');
@@ -31,12 +41,13 @@ assert(firefox.browser_specific_settings?.gecko?.strict_min_version === '142.0',
 assert(firefox.browser_specific_settings?.gecko?.data_collection_permissions?.required?.includes('none'), 'Firefox no-data-collection declaration is missing.');
 assert(!firefox.permissions.includes('offscreen') && !firefox.permissions.includes('sidePanel'), 'Firefox contains Chrome-only permissions.');
 assert(firefox.permissions.includes('tabGroups'), 'Firefox tabGroups permission is missing.');
-for (const origin of origins) assert(firefox.permissions.includes(origin), `Firefox origin missing: ${origin}`);
+assertExactOrigins(firefox.permissions.filter((permission) => /^https?:\/\//.test(permission)), origins, 'Firefox host permissions');
 
 for (const manifest of [chrome, firefox]) {
   assert(manifest.omnibox?.keyword === 'dr', 'Omnibox keyword must be dr.');
   assert(!JSON.stringify(manifest).includes('<all_urls>'), 'Broad host access is forbidden.');
-  assert(manifest.content_scripts?.[0]?.matches?.length === 4, 'Exactly four provider origins must receive content scripts.');
+  const matches = manifest.content_scripts?.flatMap((script) => script.matches ?? []) ?? [];
+  assertExactOrigins(matches, origins.slice(0, 4), 'Provider content scripts');
 }
 
 console.log('Chrome and Firefox manifests satisfy release invariants.');

@@ -60,3 +60,24 @@ export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp,
   pattern.lastIndex = 0;
   return pattern.test(text);
 }
+
+export interface FinalResponseBaseline {
+  roots: ReadonlySet<HTMLElement>;
+  signatures: ReadonlySet<string>;
+}
+
+function finalResponseSignature(root: HTMLElement): string {
+  const stableId = root.getAttribute('data-message-id') || root.id;
+  return stableId ? `id:${stableId}` : `text:${normalizeVisibleText(root.innerText || root.textContent || '')}`;
+}
+
+export function createFinalResponseBaseline(roots: readonly HTMLElement[]): FinalResponseBaseline {
+  return {
+    roots: new Set(roots),
+    signatures: new Set(roots.map(finalResponseSignature)),
+  };
+}
+
+export function isNewFinalResponse(root: HTMLElement | null, baseline: FinalResponseBaseline): root is HTMLElement {
+  return Boolean(root && !baseline.roots.has(root) && !baseline.signatures.has(finalResponseSignature(root)));
+}

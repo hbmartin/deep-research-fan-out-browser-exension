@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { domCitationInventory, isClarifyingResponse, mergeCitationInventories, sourceToggleState } from '../src/dom-capture';
+import { createFinalResponseBaseline, domCitationInventory, isClarifyingResponse, isNewFinalResponse, mergeCitationInventories, sourceToggleState } from '../src/dom-capture';
 import { findElement } from '../src/selectors';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -68,5 +68,20 @@ describe('provider DOM capture', () => {
     button.setAttribute('aria-label', 'Begin research');
     document.body.append(button);
     expect(findElement(ADAPTERS.gemini.selectors.planApproval!)).toBe(button);
+  });
+
+  it('accepts only responses that appear after monitoring is baselined', () => {
+    const prior = document.createElement('article');
+    prior.textContent = 'An earlier completed report.';
+    const baseline = createFinalResponseBaseline([prior]);
+    expect(isNewFinalResponse(prior, baseline)).toBe(false);
+
+    const rerenderedPrior = document.createElement('article');
+    rerenderedPrior.textContent = prior.textContent;
+    expect(isNewFinalResponse(rerenderedPrior, baseline)).toBe(false);
+
+    const current = document.createElement('article');
+    current.textContent = 'A newly completed report.';
+    expect(isNewFinalResponse(current, baseline)).toBe(true);
   });
 });

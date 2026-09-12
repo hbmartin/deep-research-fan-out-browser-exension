@@ -1,7 +1,7 @@
 import { ADAPTERS } from './adapters';
 import { buildArtifact } from './artifacts';
 import { reconcileCitations } from './citations';
-import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, listRuns, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
+import { captureId, deleteJob, evictHistory, getCapture, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
 import type { RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
@@ -158,7 +158,7 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
     providerRuns,
     status: 'active',
     slug,
-    downloadFolder: createDownloadFolder(settings.downloadRoot, now, slug),
+    downloadFolder: createDownloadFolder(settings.downloadRoot, now, slug, id),
   };
   const tabIds = tabs.flatMap((tab) => tab.id === undefined ? [] : [tab.id]);
   const updateTab = browser.tabs.update as unknown as (tabId: number, properties: Record<string, unknown>) => Promise<unknown>;
@@ -269,10 +269,11 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
 async function completeProviderCapture(runId: string, provider: ProviderId, captureIdValue: string, degraded: boolean): Promise<boolean> {
   const { run, value: completed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
-    if (!providerRun || isTerminalProviderStatus(providerRun.status)) return false;
-    assertTransition(providerRun.status, 'complete');
+    if (!providerRun) return false;
     providerRun.captureId = captureIdValue;
     providerRun.degraded ||= degraded;
+    if (isTerminalProviderStatus(providerRun.status)) return false;
+    assertTransition(providerRun.status, 'complete');
     providerRun.status = 'complete';
     providerRun.statusDetail = undefined;
     providerRun.completedAt ??= Date.now();
@@ -302,6 +303,46 @@ async function failProviderIfActive(runId: string, provider: ProviderId, detail:
   await broadcastRuns();
 }
 
+async function reconcilePersistedCaptureFailure(
+  runId: string,
+  provider: ProviderId,
+  captureIdValue: string,
+  degraded: boolean,
+  error: unknown,
+): Promise<void> {
+  const detail = error instanceof Error ? error.message : String(error);
+  const { run } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) return;
+    providerRun.captureId = captureIdValue;
+    providerRun.degraded ||= degraded;
+    if (!isTerminalProviderStatus(providerRun.status)) {
+      assertTransition(providerRun.status, 'failed');
+      providerRun.status = 'failed';
+      providerRun.statusDetail = `Capture was saved, but completion failed: ${detail}`;
+      providerRun.completedAt ??= Date.now();
+    }
+    storedRun.status = deriveRunStatus(storedRun);
+  });
+  await maybeFinalize(run);
+  await broadcastRuns();
+}
+
+async function containCaptureJobFailure(
+  runId: string,
+  provider: ProviderId,
+  error: unknown,
+  persisted?: { id: string; degraded: boolean },
+): Promise<void> {
+  console.error(`Capture job failed for ${provider}.`, error);
+  try {
+    if (persisted) await reconcilePersistedCaptureFailure(runId, provider, persisted.id, persisted.degraded, error);
+    else await failProviderIfActive(runId, provider, error instanceof Error ? error.message : String(error));
+  } catch (transitionError) {
+    console.error(`Could not persist the failed capture state for ${provider}.`, transitionError);
+  }
+}
+
 async function processCaptureQueue(): Promise<void> {
   if (captureWorkerRunning) return;
   captureWorkerRunning = true;
@@ -310,6 +351,11 @@ async function processCaptureQueue(): Promise<void> {
     for (;;) {
       const job = await nextCaptureJob();
       if (!job) break;
+      if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
+        await deleteJob(job.id).catch((error) => console.error('Could not remove an exhausted capture job.', error));
+        await containCaptureJobFailure(job.runId, job.provider, new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`));
+        continue;
+      }
       job.state = 'leased';
       job.leasedAt = Date.now();
       job.attempts += 1;
@@ -320,6 +366,7 @@ async function processCaptureQueue(): Promise<void> {
         await deleteJob(job.id);
         continue;
       }
+      let persisted: { id: string; degraded: boolean } | undefined;
       try {
         const copied = await clipboardCapture(platform, job);
         const rawMarkdown = copied?.text || job.domMarkdown;
@@ -338,18 +385,22 @@ async function processCaptureQueue(): Promise<void> {
           title: job.title,
         };
         const id = captureId(run.id, job.provider);
+        const degraded = !copied || reconciled.unplacedCitationCount > 0 || resolved.unresolved > 0;
         await putCapture(id, capture);
+        persisted = { id, degraded };
         await deleteJob(job.id);
-        await completeProviderCapture(
-          run.id,
-          job.provider,
-          id,
-          !copied || reconciled.unplacedCitationCount > 0 || resolved.unresolved > 0,
-        );
+        try {
+          await completeProviderCapture(run.id, job.provider, id, degraded);
+        } catch (error) {
+          await containCaptureJobFailure(run.id, job.provider, error, persisted);
+        }
       } catch (error) {
-        if (error instanceof CaptureDeferredError) break;
-        await deleteJob(job.id);
-        await failProviderIfActive(run.id, job.provider, error instanceof Error ? error.message : String(error));
+        if (error instanceof CaptureDeferredError && job.attempts < MAX_CAPTURE_ATTEMPTS) break;
+        await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
+        const failure = error instanceof CaptureDeferredError
+          ? new Error(`Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`)
+          : error;
+        await containCaptureJobFailure(run.id, job.provider, failure, persisted);
       }
     }
   } finally {
@@ -579,9 +630,6 @@ export function startCoordinator(): void {
   const platform = createPlatform();
   const action = (browser.action ?? (browser as unknown as { browserAction: typeof browser.action }).browserAction);
   void platform.configurePanelAction();
-  browser.runtime.onInstalled.addListener(() => {
-    void browser.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
-  });
   browser.runtime.onStartup.addListener(() => { void reconcileRuns(); });
   browser.alarms.onAlarm.addListener((alarm) => { if (alarm.name === ALARM_NAME) void reconcileRuns(); });
   browser.runtime.onMessage.addListener((message: RuntimeRequest, sender) => handleRequest(message, sender));
@@ -599,7 +647,7 @@ export function startCoordinator(): void {
   });
   browser.tabs.onRemoved.addListener((tabId) => { void interruptRemovedTab(tabId); });
   browser.tabs.onActivated.addListener(({ tabId }) => { recordTabActivation(tabId); });
-  void browser.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  void browser.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
   void reconcileRuns();
 }
 
@@ -613,5 +661,7 @@ export const coordinatorTestHooks = {
   markExpectedTabActivation,
   recordTabActivation,
   setKnownRunTabs,
+  processCaptureQueue,
+  reconcilePersistedCaptureFailure,
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };

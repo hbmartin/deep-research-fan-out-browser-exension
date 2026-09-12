@@ -2,7 +2,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { getRun, putRun } from '../src/db';
+import { getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putJob, putRun } from '../src/db';
 import type { ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
@@ -134,5 +134,47 @@ describe('coordinator run guards', () => {
     } finally {
       ADAPTERS.chatgpt.urlResolution = prior;
     }
+  });
+
+  it('removes exhausted capture jobs and fails providers left capturing', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const stored = run({ chatgpt: provider('chatgpt', 909, 'capturing') });
+    await putRun(stored);
+    await putJob({
+      id: `${stored.id}:chatgpt`,
+      runId: stored.id,
+      provider: 'chatgpt',
+      tabId: 909,
+      state: 'queued',
+      createdAt: Date.now(),
+      attempts: MAX_CAPTURE_ATTEMPTS,
+      domMarkdown: 'A sufficiently long DOM report that will not be processed.',
+      domCitations: [],
+    });
+
+    await coordinatorTestHooks.processCaptureQueue();
+    expect(await nextCaptureJob()).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'failed',
+      statusDetail: `Capture failed after ${MAX_CAPTURE_ATTEMPTS} attempts.`,
+    });
+    log.mockRestore();
+  });
+
+  it('links a persisted capture without overwriting a terminal status that won concurrently', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 910, 'interrupted') });
+    await putRun(stored);
+    await coordinatorTestHooks.reconcilePersistedCaptureFailure(
+      stored.id,
+      'chatgpt',
+      `${stored.id}:chatgpt`,
+      true,
+      new Error('completion transition lost'),
+    );
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'interrupted',
+      captureId: `${stored.id}:chatgpt`,
+      degraded: true,
+    });
   });
 });

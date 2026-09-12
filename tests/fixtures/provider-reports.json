@@ -1,14 +1,89 @@
 [
-  { "provider": "chatgpt", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
-  { "provider": "chatgpt", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
-  { "provider": "chatgpt", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." },
-  { "provider": "claude", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
-  { "provider": "claude", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
-  { "provider": "claude", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." },
-  { "provider": "gemini", "case": 1, "style": "superscript", "body": "Claim ¹." },
-  { "provider": "gemini", "case": 2, "style": "superscript", "body": "Claim ²." },
-  { "provider": "gemini", "case": 3, "style": "superscript", "body": "Claim ³." },
-  { "provider": "grok", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
-  { "provider": "grok", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
-  { "provider": "grok", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." }
+  {
+    "provider": "chatgpt",
+    "case": "markdown-with-surrounding-emphasis",
+    "style": "markdown_link",
+    "body": "**Market claim** [Source](https://EXAMPLE.com/a/?utm_source=fixture).",
+    "citations": [{ "url": "https://example.com/a", "domOrder": 0, "contextBefore": "", "contextAfter": "" }],
+    "expectedMarkdown": "**Market claim** [1](https://example.com/a).",
+    "expectedCitationCount": 1
+  },
+  {
+    "provider": "chatgpt",
+    "case": "multiple-markdown-links",
+    "style": "markdown_link",
+    "body": "First [Alpha](https://alpha.test/path). Second [Beta](https://beta.test/?gclid=1).",
+    "citations": [
+      { "url": "https://alpha.test/path", "domOrder": 0, "contextBefore": "", "contextAfter": "" },
+      { "url": "https://beta.test/", "domOrder": 1, "contextBefore": "", "contextAfter": "" }
+    ],
+    "expectedMarkdown": "First [1](https://alpha.test/path). Second [2](https://beta.test/).",
+    "expectedCitationCount": 2
+  },
+  {
+    "provider": "claude",
+    "case": "canonical-url-deduplication",
+    "style": "markdown_link",
+    "body": "[First](https://same.test/article?utm_source=one) and [Again](https://same.test/article#section).",
+    "citations": [
+      { "url": "https://same.test/article?utm_source=one", "domOrder": 0, "contextBefore": "", "contextAfter": "" },
+      { "url": "https://same.test/article#section", "domOrder": 1, "contextBefore": "", "contextAfter": "" }
+    ],
+    "expectedMarkdown": "[1](https://same.test/article) and [1](https://same.test/article).",
+    "expectedCitationCount": 1
+  },
+  {
+    "provider": "claude",
+    "case": "numeric-markers-with-markup",
+    "style": "numeric_bracket",
+    "body": "**First claim** [7]. _Second claim_ [9].",
+    "citations": [
+      { "url": "https://numeric-a.test", "domOrder": 0, "contextBefore": "", "contextAfter": "" },
+      { "url": "https://numeric-b.test", "domOrder": 1, "contextBefore": "", "contextAfter": "" }
+    ],
+    "expectedMarkdown": "**First claim** [1](https://numeric-a.test/). _Second claim_ [2](https://numeric-b.test/).",
+    "expectedCitationCount": 2
+  },
+  {
+    "provider": "gemini",
+    "case": "multiple-superscript-markers",
+    "style": "superscript",
+    "body": "Finding one¹ and finding two².",
+    "citations": [
+      { "url": "https://super-a.test", "markerText": "¹", "domOrder": 0, "contextBefore": "Finding one", "contextAfter": " and" },
+      { "url": "https://super-b.test", "markerText": "²", "domOrder": 1, "contextBefore": "finding two", "contextAfter": "." }
+    ],
+    "expectedMarkdown": "Finding one[1](https://super-a.test/) and finding two[2](https://super-b.test/).",
+    "expectedCitationCount": 2
+  },
+  {
+    "provider": "gemini",
+    "case": "duplicate-url-superscripts",
+    "style": "superscript",
+    "body": "Repeated¹ evidence and corroboration².",
+    "citations": [
+      { "url": "https://repeat.test/source", "markerText": "¹", "domOrder": 0, "contextBefore": "Repeated", "contextAfter": " evidence" },
+      { "url": "https://repeat.test/source?utm_campaign=again", "markerText": "²", "domOrder": 1, "contextBefore": "corroboration", "contextAfter": "." }
+    ],
+    "expectedMarkdown": "Repeated[1](https://repeat.test/source) evidence and corroboration[1](https://repeat.test/source).",
+    "expectedCitationCount": 1
+  },
+  {
+    "provider": "grok",
+    "case": "context-placement-around-heading",
+    "style": "none",
+    "body": "## Result\n\nThe evidence supports the conclusion.",
+    "citations": [{ "url": "https://context.test/source", "domOrder": 0, "contextBefore": "The evidence supports the conclusion.", "contextAfter": "" }],
+    "expectedMarkdown": "## Result\n\nThe evidence supports the conclusion.[1](https://context.test/source)",
+    "expectedCitationCount": 1
+  },
+  {
+    "provider": "grok",
+    "case": "blockquote-link-normalization",
+    "style": "markdown_link",
+    "body": "> Context [Report](https://report.test/item?fbclid=x) remains relevant.",
+    "citations": [{ "url": "https://report.test/item", "domOrder": 0, "contextBefore": "", "contextAfter": "" }],
+    "expectedMarkdown": "> Context [1](https://report.test/item) remains relevant.",
+    "expectedCitationCount": 1
+  }
 ]
