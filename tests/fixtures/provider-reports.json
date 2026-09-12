@@ -1,0 +1,14 @@
+[
+  { "provider": "chatgpt", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
+  { "provider": "chatgpt", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
+  { "provider": "chatgpt", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." },
+  { "provider": "claude", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
+  { "provider": "claude", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
+  { "provider": "claude", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." },
+  { "provider": "gemini", "case": 1, "style": "superscript", "body": "Claim ¹." },
+  { "provider": "gemini", "case": 2, "style": "superscript", "body": "Claim ²." },
+  { "provider": "gemini", "case": 3, "style": "superscript", "body": "Claim ³." },
+  { "provider": "grok", "case": 1, "style": "markdown_link", "body": "Claim [Source](https://one.test)." },
+  { "provider": "grok", "case": 2, "style": "markdown_link", "body": "Claim [Source](https://two.test)." },
+  { "provider": "grok", "case": 3, "style": "markdown_link", "body": "Claim [Source](https://three.test)." }
+]
