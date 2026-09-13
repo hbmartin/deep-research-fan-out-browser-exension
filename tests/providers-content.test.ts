@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS, type SelectorChain } from '../src/adapters';
 import type { BackgroundEvent, RuntimeRequest } from '../src/messages';
+import copyFeedback from './fixtures/chatgpt-copy-feedback.json';
 import { canTransition } from '../src/state';
 import type { ProviderRunStatus } from '../src/types';
 
@@ -286,12 +287,12 @@ describe('provider content-script recovery', () => {
     expect(findResponseControl(roots[1]!, roots, selector, new Set(), true)).toBe(document.querySelector('button'));
   });
 
-  it('rejects hidden and non-interactive decoy Copy controls', () => {
+  it('rejects hidden and disabled decoy Copy controls', () => {
     document.body.innerHTML = `
       <section>
         <div style="position:fixed" data-message-author-role="assistant">Final report</div>
         <button id="real-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
-        <button style="position:fixed;pointer-events:none" aria-label="Copy response">Copy</button>
+        <button style="position:fixed" disabled aria-label="Copy response">Copy</button>
         <div aria-hidden="true"><button style="position:fixed" aria-label="Copy response">Copy</button></div>
       </section>
     `;
@@ -380,5 +381,251 @@ describe('provider content-script recovery', () => {
     const selector = ADAPTERS.grok.selectors.sourcesPanelToggle!;
     expect(findResponseControl(roots[0]!, roots, selector)).toBe(document.querySelector('button'));
     expect(findResponseControl(roots[1]!, roots, selector)).toBeNull();
+  });
+});
+
+describe('provider reliability regressions', () => {
+  function setupPage() {
+    document.body.innerHTML = `<div id="prompt-textarea" contenteditable="true" role="textbox" style="position:fixed"></div><button data-testid="deep-research-pill" style="position:fixed"></button><button data-testid="send-button" style="position:fixed">Send</button>`;
+    const composer = document.querySelector<HTMLElement>('#prompt-textarea')!;
+    composer.addEventListener('paste', (event) => { composer.textContent = (event as ClipboardEvent).clipboardData!.getData('text/plain'); });
+    const send = vi.fn(() => { composer.textContent = ''; answer(); });
+    document.querySelector('[data-testid="send-button"]')!.addEventListener('click', send);
+    return send;
+  }
+  function setupEvent() {
+    return { type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '', geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: false, status: 'setting_mode' } as const;
+  }
+  it('resumes setting_mode without rewinding setup or submitting twice', async () => {
+    storedStatus = 'setting_mode';
+    const send = setupPage();
+    await listener(setupEvent());
+    await listener(setupEvent());
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'awaiting_ready' }));
+    expect(captures()).toHaveLength(1);
+  });
+  it('keeps monitoring after the first post-submit report fails', async () => {
+    storedStatus = 'setting_mode';
+    const send = setupPage();
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    let failed = false;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      if ((message as RuntimeRequest).type === 'content:state' && (message as {status?:string}).status === 'researching' && !failed) {
+        failed = true;
+        return { ok:false, error:'temporary transport failure' };
+      }
+      return original(message);
+    });
+    await listener(setupEvent());
+    await listener(setupEvent());
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(captures()).toHaveLength(1);
+  });
+  it('reattaches monitoring while a resumed-submission state report retries', async () => {
+    answer();
+    document.body.insertAdjacentHTML('beforeend','<button style="position:fixed" aria-label="Stop generating"></button>');
+    vi.mocked(browser.runtime.sendMessage).mockImplementationOnce(async () => ({ok:false,error:'temporary failure'}));
+    await resume('submitting');
+    document.querySelector('[aria-label="Stop generating"]')!.remove();
+    await resume('submitting');
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(captures()).toHaveLength(1);
+  });
+  it('latches timeout, preserves submittedAt, and still captures a late report', async () => {
+    document.body.innerHTML = '<button style="position:fixed" aria-label="Stop generating"></button>';
+    const submittedAt = Date.now() - 45 * 60 * 1000;
+    await resume('researching', false, submittedAt);
+    await vi.advanceTimersByTimeAsync(46 * 60 * 1000);
+    expect(storedStatus).toBe('manual_required');
+    expect(messages.filter((m) => m.type === 'content:state' && m.status === 'manual_required')).toHaveLength(1);
+    expect(messages).not.toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
+    expect(messages).toContainEqual(expect.objectContaining({type:'content:state',reason:'research_timeout',submittedAt}));
+    answer();
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+  });
+  it('restores a timeout latch on reload without re-reporting attention', async () => {
+    document.body.innerHTML = '<button style="position:fixed" aria-label="Stop generating"></button>';
+    storedStatus = 'manual_required';
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(messages.filter((m) => m.type === 'content:state')).toHaveLength(0);
+    answer();
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+  });
+  it('stops monitoring when the coordinator rejects a terminal report permanently', async () => {
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    let rejected = 0;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      if ((message as RuntimeRequest).type === 'content:state') {
+        rejected++;
+        return {ok:false,code:'provider_terminal',error:'ended',providerState:{status:'complete'}};
+      }
+      return original(message);
+    });
+    await resume('researching');
+    vi.stubGlobal('location',new URL('https://example.com/away'));
+    await vi.advanceTimersByTimeAsync(2000);
+    for (let i=0;i<10;i++) { document.body.append(document.createElement('div')); await vi.advanceTimersByTimeAsync(2000); }
+    expect(rejected).toBe(1);
+  });
+  it('does not capture a labeled progress pill even when an unrelated Copy exists', async () => {
+    document.body.innerHTML = '<main><div style="position:fixed" data-message-author-role="assistant"><button>Researching…</button><span>Elapsed 00:30</span></div></main><dialog open><button style="position:fixed" aria-label="Copy">Copy</button></dialog>';
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(captures()).toHaveLength(0);
+  });
+  it('keeps citation inventory behind a modal and prunes hidden descendant citations', async () => {
+    document.body.innerHTML = `<main aria-hidden="true" style="opacity:0"><div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p><a style="position:fixed" href="https://example.com/source">Evidence</a><span aria-hidden="true"><a style="position:fixed" href="https://example.com/hidden">Hidden</a></span></div></main>`;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(40000);
+    expect(captures()[0]).toMatchObject({domMarkdown:expect.stringContaining('https://example.com/source'),domCitations:[expect.objectContaining({url:'https://example.com/source'})]});
+  });
+  it('does not capture a stable partial response while streaming is behind a modal', async () => {
+    document.body.innerHTML = `<main aria-hidden="true"><div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p></div><button style="position:fixed" aria-label="Stop generating"></button></main>`;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(40000);
+    expect(captures()).toHaveLength(0);
+    document.querySelector('button')!.remove();
+    await vi.advanceTimersByTimeAsync(40000);
+    expect(captures()).toHaveLength(1);
+  });
+  it('defers Sources clicks until a modal unblocks the response', async () => {
+    document.body.innerHTML = `<main aria-hidden="true"><section><div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p></div><button style="position:fixed" aria-label="Sources">Sources</button></section></main>`;
+    const click = vi.fn();
+    document.querySelector('button')!.addEventListener('click',click);
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(40000);
+    expect(captures()).toHaveLength(0);
+    expect(click).not.toHaveBeenCalled();
+    document.querySelector('main')!.removeAttribute('aria-hidden');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(click).toHaveBeenCalledTimes(2);
+    expect(captures()).toHaveLength(1);
+  });
+  it('releases the capture guard when synchronous snapshot setup throws', async () => {
+    vi.spyOn(console,'error').mockImplementation(() => undefined);
+    answer();
+    const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
+    const clone = root.cloneNode.bind(root);
+    let clones = 0;
+    vi.spyOn(root,'cloneNode').mockImplementation((deep) => { if (++clones === 4) throw new Error('snapshot failed'); return clone(deep); });
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(captures()).toHaveLength(1);
+    expect(clones).toBeGreaterThan(4);
+  });
+  it('does not confirm arbitrary icon changes as Copy success', async () => {
+    answer();
+    await resume('researching');
+    document.querySelector('button')!.addEventListener('click', () => { document.querySelector('button')!.innerHTML = '<svg><path d="M0 0"></path></svg>'; });
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    await vi.advanceTimersByTimeAsync(600);
+    await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
+  });
+});
+
+
+describe('verified ChatGPT Copy feedback', () => {
+  it.each(['observed', 'icon-only'] as const)('confirms %s success using the captured ChatGPT glyph', async (mode) => {
+    answer();
+    const root = document.querySelector('[data-message-author-role="assistant"]')!;
+    document.querySelector('button')!.outerHTML = copyFeedback.before;
+    const button = root.querySelector<HTMLButtonElement>('button')!;
+    button.style.position = 'fixed';
+    const success = document.createElement('div');
+    success.innerHTML = copyFeedback.after;
+    button.addEventListener('click', () => {
+      button.innerHTML = success.querySelector('button')!.innerHTML;
+      if (mode === 'observed') {
+        button.setAttribute('aria-label','Response copied');
+        button.setAttribute('data-copy-state','copied');
+      }
+    });
+    await resume('researching');
+    await expect(listener({type:'capture:copy-now',jobId:'review-run:chatgpt'})).resolves.toEqual({ok:true,copyConfirmed:true});
+  });
+  it('does not accept a success icon that was already present before the click', async () => {
+    answer();
+    const button = document.querySelector('button')!;
+    button.innerHTML = '<svg><use href="#lightweight-conversation-check"></use></svg>';
+    await resume('researching');
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    await vi.advanceTimersByTimeAsync(600);
+    await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
+  });
+});
+
+describe('capture cancellation and setup exceptions', () => {
+  it('releases the guard after citation setup throws', async () => {
+    vi.spyOn(console,'error').mockImplementation(() => undefined);
+    answer();
+    const root=document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
+    root.insertAdjacentHTML('beforeend','<a style="position:fixed" href="https://example.com/source">Evidence</a>');
+    const anchor=root.querySelector('a')!;
+    const href=anchor.href;
+    let reads=0;
+    Object.defineProperty(anchor,'href',{configurable:true,get:()=> {if (++reads===1) throw new Error('citation failed'); return href;}});
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(captures()).toHaveLength(1);
+    expect(reads).toBeGreaterThan(1);
+  });
+  it('releases the guard after Sources-control setup throws', async () => {
+    vi.spyOn(console,'error').mockImplementation(() => undefined);
+    const {ResponseControlIndex}=await import('../src/response-controls');
+    const find=ResponseControlIndex.prototype.find;
+    const sourceSelectors=(await import('../src/adapters')).ADAPTERS.chatgpt.selectors.sourcesPanelToggle;
+    let failed=false;
+    vi.spyOn(ResponseControlIndex.prototype,'find').mockImplementation(function(this: InstanceType<typeof ResponseControlIndex>,root,selectors,baseline,hover,includeBlocked){
+      if (!failed && selectors===sourceSelectors && includeBlocked===undefined) { failed=true; throw new Error('source control failed'); }
+      return find.call(this,root,selectors,baseline,hover,includeBlocked);
+    });
+    answer();
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(failed).toBe(true);
+    expect(captures()).toHaveLength(1);
+  });
+  it('cancels old source capture without blocking or clearing a newer run', async () => {
+    vi.spyOn(console,'error').mockImplementation(() => undefined);
+    answer();
+    document.querySelector('[data-message-author-role="assistant"]')!.insertAdjacentHTML('beforeend','<button style="position:fixed" aria-label="Sources">Sources</button>');
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(4100);
+    expect(captures()).toHaveLength(0);
+    answer('A newer complete response with substantial evidence and a different conclusion.');
+    storedStatus='researching';
+    await listener({type:'content:start',runId:'newer-run',provider:'chatgpt',query:'New topic',appendString:'',geminiAutoApprove:true,completionDebounceMs:3000,resumeOnly:true,status:'researching'});
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+    expect(captures()[0]).toMatchObject({runId:'newer-run',domMarkdown:expect.stringContaining('newer complete response')});
+    await listener({type:'content:stop',runId:'newer-run'});
+  });
+  it('does not use an unrelated asynchronous copy event as provider confirmation', async () => {
+    answer();
+    await resume('researching');
+    const result=listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    document.dispatchEvent(new Event('copy'));
+    await vi.advanceTimersByTimeAsync(600);
+    await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
+  });
+  it('does not extend the timeout grace period when a partial response keeps changing', async () => {
+    answer();
+    await resume('researching',false,Date.now()-3600000);
+    for(let i=0;i<10;i++) {
+      document.querySelector('h2')!.textContent=`${report} Progress update ${i}.`;
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(storedStatus).toBe('manual_required');
+    expect(captures()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
   });
 });

@@ -4,6 +4,10 @@ export interface VisibilityOptions {
   allowTransparent?: boolean;
   ignoreAncestorAriaHidden?: boolean;
   ignoreAncestorOpacity?: boolean;
+  /** Ignore temporary aria-hidden/opacity only above this extraction boundary. */
+  extractionRoot?: HTMLElement;
+  /** Permit hover opacity only below a verified response/toolbar container. */
+  transparentWithin?: HTMLElement;
 }
 
 function implicitRole(element: Element): string | null {
@@ -98,15 +102,19 @@ function isUntilFound(element: HTMLElement): boolean {
 export function isEffectivelyHidden(element: HTMLElement, options: VisibilityOptions = {}): boolean {
   const elementStyle = getComputedStyle(element);
   if (elementStyle.visibility === 'hidden' || elementStyle.visibility === 'collapse') return true;
+  let outsideExtraction = false;
+  let withinTransparent = options.transparentWithin !== undefined;
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    if (current === options.transparentWithin) withinTransparent = false;
     const style = current === element ? elementStyle : getComputedStyle(current);
     const opacity = Number.parseFloat(style.opacity);
     const ancestor = current !== element;
     const transparentTargetAllowed = options.allowTransparent && !ancestor;
     if ((current.hidden && !isUntilFound(current))
-      || (!(ancestor && options.ignoreAncestorAriaHidden) && current.getAttribute('aria-hidden')?.toLowerCase() === 'true')
+      || (!(outsideExtraction || (ancestor && options.ignoreAncestorAriaHidden)) && current.getAttribute('aria-hidden')?.toLowerCase() === 'true')
       || style.display === 'none'
-      || (!(ancestor && options.ignoreAncestorOpacity) && !transparentTargetAllowed && !Number.isNaN(opacity) && opacity <= 0)) return true;
+      || (!(withinTransparent || outsideExtraction || (ancestor && options.ignoreAncestorOpacity)) && !transparentTargetAllowed && !Number.isNaN(opacity) && opacity <= 0)) return true;
+    if (current === options.extractionRoot) outsideExtraction = true;
   }
   return false;
 }
@@ -123,7 +131,7 @@ export function isVisible(element: HTMLElement, options: VisibilityOptions = {})
 export function cloneVisibleContent(root: HTMLElement, excludedSelector: string): HTMLElement {
   const clone = root.cloneNode(true) as HTMLElement;
 
-  const prune = (originalParent: HTMLElement, cloneParent: HTMLElement, hiddenByAncestor: boolean): void => {
+  const prune = (originalParent: HTMLElement, cloneParent: HTMLElement): void => {
     const originalChildren = Array.from(originalParent.children) as HTMLElement[];
     const cloneChildren = Array.from(cloneParent.children) as HTMLElement[];
     for (let index = 0; index < originalChildren.length; index += 1) {
@@ -135,8 +143,7 @@ export function cloneVisibleContent(root: HTMLElement, excludedSelector: string)
       }
       const style = getComputedStyle(original);
       const opacity = Number.parseFloat(style.opacity);
-      const irreversiblyHidden = hiddenByAncestor
-        || (original.hidden && !isUntilFound(original))
+      const irreversiblyHidden = (original.hidden && !isUntilFound(original))
         || original.getAttribute('aria-hidden')?.toLowerCase() === 'true'
         || style.display === 'none'
         || (!Number.isNaN(opacity) && opacity <= 0);
@@ -150,7 +157,7 @@ export function cloneVisibleContent(root: HTMLElement, excludedSelector: string)
           if (child.nodeType === Node.TEXT_NODE) child.remove();
         }
       }
-      prune(original, copy, false);
+      prune(original, copy);
       if (visibilityHidden && !(copy.textContent ?? '').trim() && copy.children.length === 0) copy.remove();
     }
   };
@@ -158,6 +165,6 @@ export function cloneVisibleContent(root: HTMLElement, excludedSelector: string)
   // The response root is an extraction boundary. Temporary state on an outer
   // dialog or sheet must not erase the response, while hidden descendants are
   // still pruned from the exported content.
-  prune(root, clone, false);
+  prune(root, clone);
   return clone;
 }

@@ -152,10 +152,12 @@ function reportedCount(toggle: HTMLElement): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
-async function waitFor<T>(read: () => T | undefined, deadline: number): Promise<T | undefined> {
+async function waitFor<T>(read: () => T | undefined, deadline: number, signal?: AbortSignal): Promise<T | undefined> {
+  signal?.throwIfAborted();
   let value = read();
   while (value === undefined && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
+    signal?.throwIfAborted();
     value = read();
   }
   return value;
@@ -165,7 +167,9 @@ export async function captureGrokResearchTrail(
   document: Document,
   toggle?: HTMLElement | null,
   timeoutMs = 5000,
+  signal?: AbortSignal,
 ): Promise<CapturedResearchTrail> {
+  signal?.throwIfAborted();
   const warnings: string[] = [];
   const total = toggle ? reportedCount(toggle) : undefined;
   let sidebar = findSourcesSidebar(document);
@@ -179,7 +183,7 @@ export async function captureGrokResearchTrail(
     close?.click();
     const closed = close && await waitFor(
       () => findSourcesSidebar(document) === undefined ? true : undefined,
-      Date.now() + Math.min(timeoutMs, 3000),
+      Date.now() + Math.min(timeoutMs, 3000), signal,
     );
     if (!closed) {
       return { reportedResultCount: total, searches: [], openedPages: [], warnings: ['Could not verify which answer owns the open Grok Sources sidebar.'] };
@@ -188,62 +192,67 @@ export async function captureGrokResearchTrail(
   }
   const openedByCapture = !sidebar;
   if (!sidebar) {
-    const sidebarsBeforeOpen = new Set(sourceSidebars(document));
+    const sidebarsBeforeOpen = new Set(sourceSidebars(document).filter((panel) => !isEffectivelyHidden(panel)));
     toggle.click();
     sidebar = await waitFor(() => {
-      const candidate = findSourcesSidebar(document);
-      if (!candidate) return undefined;
-      return sidebarBelongsToToggle(candidate, toggle) || !sidebarsBeforeOpen.has(candidate) ? candidate : undefined;
-    }, Date.now() + Math.min(timeoutMs, 3000));
+      const visible = sourceSidebars(document).filter((panel) => !isEffectivelyHidden(panel));
+      const owned = visible.filter((panel) => sidebarBelongsToToggle(panel, toggle));
+      if (owned.length === 1) return owned[0];
+      const opened = visible.filter((panel) => !sidebarsBeforeOpen.has(panel));
+      return opened.length === 1 && visible.length === 1 ? opened[0] : undefined;
+    }, Date.now() + Math.min(timeoutMs, 3000), signal);
   }
   if (!sidebar) {
     warnings.push('Grok Sources sidebar did not open.');
     return { reportedResultCount: total, searches: [], openedPages: [], warnings };
   }
 
-  const buttons = searchButtons(sidebar);
-  if (!buttons.length) warnings.push('No Grok search groups were found in the Sources sidebar.');
-  const searches: CapturedSearch[] = [];
-  const groupWaitMs = Math.max(50, Math.floor(timeoutMs / Math.max(1, buttons.length)));
-  for (const button of buttons) {
-    const parsed = parseSearchButton(button);
-    if (!parsed) {
-      warnings.push('A Grok search group heading could not be parsed.');
-      continue;
+  try {
+    const buttons = searchButtons(sidebar);
+    if (!buttons.length) warnings.push('No Grok search groups were found in the Sources sidebar.');
+    const searches: CapturedSearch[] = [];
+    const groupWaitMs = Math.max(50, Math.floor(timeoutMs / Math.max(1, buttons.length)));
+    for (const button of buttons) {
+      signal?.throwIfAborted();
+      const parsed = parseSearchButton(button);
+      if (!parsed) {
+        warnings.push('A Grok search group heading could not be parsed.');
+        continue;
+      }
+      if (button.getAttribute('aria-expanded') !== 'true') button.click();
+      const groupDeadline = Date.now() + groupWaitMs;
+      const panelId = button.getAttribute('aria-controls');
+      const panel = panelId
+        ? await waitFor(() => document.getElementById(panelId) as HTMLElement | null || undefined, groupDeadline, signal)
+        : undefined;
+      if (!panel) {
+        warnings.push(`The ${parsed.kind} search “${parsed.query}” did not expose a results panel.`);
+        searches.push({ ...parsed, results: [] });
+        continue;
+      }
+      const readResults = () => parsed.kind === 'web' ? webResults(panel) : xResults(panel);
+      let results = readResults();
+      while (results.length < parsed.expectedResultCount && Date.now() < groupDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        signal?.throwIfAborted();
+        results = readResults();
+      }
+      if (results.length !== parsed.expectedResultCount) {
+        warnings.push(`The ${parsed.kind} search “${parsed.query}” reported ${parsed.expectedResultCount} results but ${results.length} were captured.`);
+      }
+      searches.push({ ...parsed, results });
     }
-    if (button.getAttribute('aria-expanded') !== 'true') button.click();
-    const groupDeadline = Date.now() + groupWaitMs;
-    const panelId = button.getAttribute('aria-controls');
-    const panel = panelId
-      ? await waitFor(() => document.getElementById(panelId) as HTMLElement | null || undefined, groupDeadline)
-      : undefined;
-    if (!panel) {
-      warnings.push(`The ${parsed.kind} search “${parsed.query}” did not expose a results panel.`);
-      searches.push({ ...parsed, results: [] });
-      continue;
-    }
-    const readResults = () => parsed.kind === 'web' ? webResults(panel) : xResults(panel);
-    let results = readResults();
-    while (results.length < parsed.expectedResultCount && Date.now() < groupDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      results = readResults();
-    }
-    if (results.length !== parsed.expectedResultCount) {
-      warnings.push(`The ${parsed.kind} search “${parsed.query}” reported ${parsed.expectedResultCount} results but ${results.length} were captured.`);
-    }
-    searches.push({ ...parsed, results });
-  }
 
-  const openedPages = findOpenedPages(sidebar);
-  const capturedCount = searches.reduce((sum, search) => sum + search.results.length, 0);
-  if (total !== undefined && capturedCount !== total) {
-    warnings.push(`Grok reported ${total} sources but ${capturedCount} search results were captured.`);
-  }
+    const openedPages = findOpenedPages(sidebar);
+    const capturedCount = searches.reduce((sum, search) => sum + search.results.length, 0);
+    if (total !== undefined && capturedCount !== total) {
+      warnings.push(`Grok reported ${total} sources but ${capturedCount} search results were captured.`);
+    }
 
-  if (openedByCapture) {
-    sidebarCloseButton(sidebar)?.click();
+    return { reportedResultCount: total, searches, openedPages, warnings: [...new Set(warnings)] };
+  } finally {
+    if (openedByCapture && sidebar.isConnected) sidebarCloseButton(sidebar)?.click();
   }
-  return { reportedResultCount: total, searches, openedPages, warnings: [...new Set(warnings)] };
 }
 
 export function normalizeResearchTrail(captured: CapturedResearchTrail, citations: Citation[]): ResearchTrail {

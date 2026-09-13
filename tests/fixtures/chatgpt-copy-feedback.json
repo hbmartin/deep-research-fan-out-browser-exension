@@ -1,0 +1,9 @@
+{
+  "source": "https://chatgpt.com/",
+  "observedAt": "2026-09-13",
+  "surface": "Logged-out ChatGPT in the Codex in-app browser; not authenticated deep research or a Chrome/Firefox extension run.",
+  "method": "Observed button markup while clicking Copy on a non-sensitive test reply; removed styling, tooltip IDs, and unrelated attributes.",
+  "before": "<button aria-label=\"Copy response\" data-copy-message=\"\" data-copy-state=\"idle\"><svg aria-hidden=\"true\"><use href=\"#lightweight-conversation-copy\"></use></svg></button>",
+  "after": "<button aria-label=\"Response copied\" data-copy-message=\"\" data-copy-state=\"copied\"><svg aria-hidden=\"true\"><use href=\"#lightweight-conversation-check\"></use></svg></button>",
+  "limitations": "The icon-only test is a synthetic variation of these observed glyphs with text and data-state feedback omitted; it does not assert that every ChatGPT surface has identical markup."
+}

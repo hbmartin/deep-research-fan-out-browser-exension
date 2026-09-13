@@ -183,7 +183,7 @@ describe('provider DOM capture', () => {
     expect(evaluateStableResponse(response, false, undefined, 1000, 10_000)).toEqual({ ready: false });
     const initial = evaluateStableResponse(response, true, undefined, 1000, 10_000);
     expect(initial.ready).toBe(false);
-    response.textContent = 'The final research report.';
+    response.textContent = 'The final research report with substantive findings and recommendations.';
     const changed = evaluateStableResponse(response, true, initial.candidate, 11_000, 10_000);
     expect(changed.ready).toBe(false);
     expect(evaluateStableResponse(response, true, changed.candidate, 21_000, 10_000).ready).toBe(true);

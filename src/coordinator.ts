@@ -1,12 +1,12 @@
 import { ADAPTERS } from './adapters';
 import { buildArtifact } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
-import { captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
-import type { RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
+import { acceptCaptureJob, captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
+import type { ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
 import { normalizeResearchTrail } from './sources';
-import { assertTransition, createDownloadFolder, deriveRunStatus, slugify } from './state';
+import { canTransition, assertTransition, createDownloadFolder, deriveRunStatus, slugify } from './state';
 import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
 
 const ALARM_NAME = 'reconcile-runs';
@@ -23,7 +23,7 @@ let browserSessionIdPromise: Promise<string> | undefined;
 let fallbackBrowserSessionId: string | undefined;
 
 class CoordinatorRequestError extends Error {
-  constructor(message: string, readonly code: RuntimeErrorCode) {
+  constructor(message: string, readonly code: RuntimeErrorCode, readonly providerState?: ProviderSnapshot) {
     super(message);
     this.name = 'CoordinatorRequestError';
   }
@@ -55,7 +55,7 @@ async function getBrowserSessionId(): Promise<string> {
   return browserSessionIdPromise;
 }
 
-async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
+async function withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
   const previous = runMutationTails.get(runId)?.catch(() => undefined) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -63,14 +63,35 @@ async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Pro
   runMutationTails.set(runId, tail);
   await previous;
   try {
-    const run = await getRun(runId);
-    if (!run) throw new Error('Run not found.');
-    const value = mutation(run);
-    await putRun(run);
-    return { run, value };
+    return await operation();
   } finally {
     release();
     if (runMutationTails.get(runId) === tail) runMutationTails.delete(runId);
+  }
+}
+
+async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
+  return withRunLock(runId, async () => {
+    const run = await getRun(runId);
+    if (!run) throw new CoordinatorRequestError('Run not found.', 'run_not_found');
+    const value = mutation(run);
+    await putRun(run);
+    return { run, value };
+  });
+}
+
+function providerSnapshot(provider: ProviderRun): ProviderSnapshot {
+  return { status: provider.status, submittedAt: provider.submittedAt, researchTimedOutAt: provider.researchTimedOutAt };
+}
+
+function validateProviderTransition(provider: ProviderRun | undefined, status: ProviderRunStatus): asserts provider is ProviderRun {
+  if (!provider) throw new CoordinatorRequestError('Provider run not found.', 'run_not_found');
+  if (isTerminalProviderStatus(provider.status)) {
+    throw new CoordinatorRequestError('Provider run has ended.', 'provider_terminal', providerSnapshot(provider));
+  }
+  if (!canTransition(provider.status, status)
+    || (provider.researchTimedOutAt !== undefined && ['researching', 'awaiting_user'].includes(status))) {
+    throw new CoordinatorRequestError(`Invalid provider transition: ${provider.status} -> ${status}`, 'invalid_transition', providerSnapshot(provider));
   }
 }
 
@@ -121,7 +142,7 @@ function errorResponse(error: unknown): RuntimeResponse {
   return {
     ok: false,
     error: error instanceof Error ? error.message : String(error),
-    ...(error instanceof CoordinatorRequestError ? { code: error.code } : {}),
+    ...(error instanceof CoordinatorRequestError ? { code: error.code, providerState: error.providerState } : {}),
   };
 }
 
@@ -162,20 +183,22 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       resumeOnly,
       status: providerRun.status,
       submittedAt: providerRun.submittedAt,
+      researchTimedOutAt: providerRun.researchTimedOutAt,
       captureAccepted,
     } as const;
     try {
-      await sendTabEvent(providerRun.tabId, event);
-      return;
-    } catch {
+      await sendTabEvent(providerRun.tabId, { type: 'content:ping', provider });
+    } catch (error) {
+      // A rejected application request is not evidence that the receiver is missing.
+      if (!/receiving end does not exist|could not establish connection|no receiver/i.test(String(error))) throw error;
       const extensionBrowser = browser as typeof browser & {
         scripting?: { executeScript(options: { target: { tabId: number }; files: string[] }): Promise<unknown> };
       };
       if (extensionBrowser.scripting) await extensionBrowser.scripting.executeScript({ target: { tabId: providerRun.tabId }, files: ['/content-scripts/providers.js'] });
       else await browser.tabs.executeScript(providerRun.tabId, { file: '/content-scripts/providers.js' });
       await new Promise((resolve) => setTimeout(resolve, 100));
-      await sendTabEvent(providerRun.tabId, event);
     }
+    await sendTabEvent(providerRun.tabId, event);
   } catch {
     // The alarm sweep retries both storage reads and content-script startup.
   }
@@ -245,25 +268,32 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
   return run;
 }
 
-async function mutateProvider(runId: string, provider: ProviderId, status: ProviderRunStatus, detail?: string, submittedAt?: number): Promise<Run> {
-  const { run } = await mutateStoredRun(runId, (storedRun) => {
+async function mutateProvider(runId: string, provider: ProviderId, status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: 'research_timeout'): Promise<Run> {
+  const { run, value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
-    if (!providerRun) throw new Error('Provider is not part of this run.');
-    assertTransition(providerRun.status, status);
+    validateProviderTransition(providerRun, status);
+    const timeout = reason === 'research_timeout' && status === 'manual_required';
+    const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
+    const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
     providerRun.status = status;
     providerRun.statusDetail = detail;
-    if (submittedAt) providerRun.submittedAt = submittedAt;
+    providerRun.submittedAt ??= submittedAt ?? (status === 'researching' ? Date.now() : undefined);
+    if (firstTimeout) providerRun.researchTimedOutAt = Date.now();
     if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
+    return timeout ? firstTimeout : changed;
   });
-  if (status === 'awaiting_user' || status === 'manual_required') {
-    await createPlatform().notify(`attention:${runId}:${provider}`, `${ADAPTERS[provider].label} needs your input`, detail || 'Open the provider tab to continue.');
-  }
-  if (status === 'complete') {
-    await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
-  }
-  await maybeFinalize(run);
-  await broadcastRuns();
+  // The state is durable. UI side effects must not invalidate its acknowledgement.
+  try {
+    if (changed && (status === 'awaiting_user' || status === 'manual_required')) {
+      await createPlatform().notify(`attention:${runId}:${provider}`, `${ADAPTERS[provider].label} needs your input`, detail || 'Open the provider tab to continue.');
+    }
+    if (changed && status === 'complete') {
+      await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
+    }
+    await maybeFinalize(run);
+    await broadcastRuns();
+  } catch (error) { console.error('Could not update UI after persisting provider state.', error); }
   return run;
 }
 
@@ -510,6 +540,17 @@ async function processCaptureQueue(): Promise<void> {
         }
         continue;
       }
+      if (!isTerminalProviderStatus(providerRun.status) && providerRun.status !== 'capturing') {
+        try {
+          await ensureProviderCapturing(run.id, job.provider);
+        } catch (error) {
+          if (error instanceof CoordinatorRequestError && error.code === 'invalid_transition') {
+            await deleteJob(job.id);
+            continue;
+          }
+          if (!(error instanceof CoordinatorRequestError && error.code === 'provider_terminal')) throw error;
+        }
+      }
       const forceDomFallback = job.tabUnavailable
         || isTerminalProviderStatus(providerRun.status)
         || job.attempts >= MAX_CAPTURE_ATTEMPTS;
@@ -551,12 +592,8 @@ async function processCaptureQueue(): Promise<void> {
 async function ensureProviderCapturing(runId: string, provider: ProviderId): Promise<boolean> {
   const { value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
-    if (!providerRun) throw new Error('Provider is not part of this run.');
-    if (isTerminalProviderStatus(providerRun.status)) {
-      throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
-    }
+    validateProviderTransition(providerRun, 'capturing');
     if (providerRun.status === 'capturing') return false;
-    assertTransition(providerRun.status, 'capturing');
     providerRun.status = 'capturing';
     providerRun.statusDetail = undefined;
     storedRun.status = deriveRunStatus(storedRun);
@@ -566,33 +603,29 @@ async function ensureProviderCapturing(runId: string, provider: ProviderId): Pro
   return changed;
 }
 
-async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<void> {
+async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<Run> {
   const id = captureId(request.runId, request.provider);
-  await serializeCapture(id, async () => {
-    const run = await getRun(request.runId);
-    const providerRun = run?.providerRuns[request.provider];
-    if (!run || !providerRun) throw new Error('Run not found for capture.');
-    if (isTerminalProviderStatus(providerRun.status)) {
-      throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
-    }
-    // A retry after a lost acknowledgement must not replace a queued or leased payload.
-    if (await getJob(id)) {
-      if (providerRun.status !== 'capturing') await ensureProviderCapturing(run.id, request.provider);
-      return;
-    }
-    await putJob({
-      id, runId: run.id, provider: request.provider,
-      tabId: providerRun.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
+  const run = await serializeCapture(id, () => withRunLock(request.runId, async () => {
+    // The DB validator fills the tab ID from the same run version it commits.
+    const job: CaptureJob = {
+      id, runId: request.runId, provider: request.provider, tabId: 0,
+      state: 'queued', createdAt: Date.now(), attempts: 0,
       domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
+    };
+    return acceptCaptureJob(job, (storedRun) => {
+      if (!storedRun) throw new CoordinatorRequestError('Run not found for capture.', 'run_not_found');
+      const provider = storedRun.providerRuns[request.provider];
+      validateProviderTransition(provider, 'capturing');
+      job.tabId = provider.tabId;
+      provider.status = 'capturing';
+      provider.statusDetail = undefined;
+      storedRun.status = deriveRunStatus(storedRun);
+      return storedRun;
     });
-    try {
-      await ensureProviderCapturing(run.id, request.provider);
-    } catch (error) {
-      if (error instanceof CoordinatorRequestError && error.code === 'provider_terminal') await deleteJob(id).catch(() => undefined);
-      throw error;
-    }
-  });
-  void processCaptureQueue();
+  }));
+  void broadcastRuns().catch((error) => console.error('Could not broadcast accepted capture.', error));
+  void processCaptureQueue().catch((error) => console.error('Could not process accepted captures.', error));
+  return run;
 }
 
 async function downloadProvider(runId: string, provider: ProviderId, force = false): Promise<boolean> {
@@ -866,8 +899,14 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         }
         return { ok: true };
       }
-      case 'content:state': await mutateProvider(message.runId, message.provider, message.status, message.detail, message.submittedAt); return { ok: true };
-      case 'content:capture': await queueCapture(message); return { ok: true };
+      case 'content:state': {
+        const run = await mutateProvider(message.runId, message.provider, message.status, message.detail, message.submittedAt, message.reason);
+        return { ok: true, providerState: providerSnapshot(run.providerRuns[message.provider]!) };
+      }
+      case 'content:capture': {
+        const run = await queueCapture(message);
+        return { ok: true, providerState: providerSnapshot(run.providerRuns[message.provider]!) };
+      }
       case 'capture:clipboard-read':
       case 'capture:clipboard-write':
       case 'download:blob-create':
@@ -904,6 +943,8 @@ export function startCoordinator(): void {
 
 export const coordinatorTestHooks = {
   clipboardCapture,
+  startContent,
+  queueCapture,
   getBrowserSessionId,
   handleRequest,
   serializeCapture,

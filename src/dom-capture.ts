@@ -5,16 +5,16 @@ import type { DomCitation } from './types';
 
 const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
 const DOM_ONLY_COMPLETION_MIN_MS = 30_000;
-const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea';
+const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea, [role="status"], [role="progressbar"], time';
 
 export function normalizeVisibleText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-export function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter): DomCitation[] {
-  const anchors = findAll(adapter.selectors.citationAnchors, root)
+export function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter, snapshot?: ResponseSnapshot): DomCitation[] {
+  const anchors = findAll(adapter.selectors.citationAnchors, root, { extractionRoot: root })
     .filter((element): element is HTMLAnchorElement => element instanceof HTMLAnchorElement);
-  const fullText = normalizeVisibleText(root.innerText || root.textContent || '');
+  const fullText = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
   let cursor = 0;
   return anchors.flatMap((anchor, domOrder) => {
     const url = anchor.href;
@@ -107,6 +107,9 @@ function structurallySeparatedText(root: HTMLElement): string {
 
 export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   const content = cloneResponseContent(root);
+  for (const element of Array.from(content.querySelectorAll('*'))) {
+    if (!element.children.length && /^(?:(?:elapsed(?: time)?[:\s]*)?\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i.test(normalizeVisibleText(element.textContent ?? ''))) element.remove();
+  }
   return { root, content, text: structurallySeparatedText(content) };
 }
 
@@ -134,9 +137,9 @@ export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, c
     .some((element) => normalizeVisibleText(element.textContent ?? '').length >= 80);
   if (copyAvailable && content.querySelector('h1, h2, h3') && hasReportBody) return false;
   if (isTextMatch(text, pattern, 1000)) return true;
-  if (text) return false;
+  if (text.length >= 40) return false;
   return Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
-    .filter((button) => !isEffectivelyHidden(button))
+    .filter((button) => !isEffectivelyHidden(button, { extractionRoot: root }))
     .some((button) => isTextMatch(normalizeVisibleText(button.innerText || button.textContent || ''), pattern, 1000));
 }
 
@@ -171,11 +174,12 @@ export function evaluateStableResponse(
   candidate: StableResponseCandidate | undefined,
   now: number,
   debounceMs: number,
+  snapshot?: ResponseSnapshot,
 ): { candidate?: StableResponseCandidate; ready: boolean } {
   if (!root) return { ready: false };
-  const text = normalizeVisibleText(root.innerText || root.textContent || '');
-  if (!copyAvailable && text.length < DOM_ONLY_COMPLETION_MIN_CHARS) return { ready: false };
-  const fingerprint = finalResponseFingerprint(root);
+  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
+  if (text.length < (copyAvailable ? 40 : DOM_ONLY_COMPLETION_MIN_CHARS)) return { ready: false };
+  const fingerprint = `${root.getAttribute('data-message-id') || root.id}\u0000${text}`;
   if (candidate?.fingerprint !== fingerprint) {
     return { candidate: { fingerprint, since: now }, ready: false };
   }
