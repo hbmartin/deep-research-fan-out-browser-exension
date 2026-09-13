@@ -333,7 +333,7 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(report);
   });
 
-  it('rejects original clipboard text in the unverifiable copy-only fallback', async () => {
+  it('accepts a fresh copy-only report identical to the original clipboard', async () => {
     vi.useFakeTimers();
     const original = 'The original clipboard value is long enough to resemble a provider report.';
     let clipboard = original;
@@ -346,7 +346,7 @@ describe('coordinator run guards', () => {
     };
     const pending = coordinatorTestHooks.clipboardCapture(platform, job);
     await vi.runAllTimersAsync();
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toEqual({ text: original, restored: true });
     expect(clipboard).toBe(original);
   });
 

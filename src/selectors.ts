@@ -1,5 +1,11 @@
 import type { Selector, SelectorChain } from './adapters';
 
+export interface VisibilityOptions {
+  allowTransparent?: boolean;
+  ignoreAncestorAriaHidden?: boolean;
+  ignoreAncestorOpacity?: boolean;
+}
+
 function implicitRole(element: Element): string | null {
   if (element.hasAttribute('role')) return element.getAttribute('role');
   if (element instanceof HTMLButtonElement) return 'button';
@@ -54,11 +60,17 @@ function allForSelector(selector: Selector, root: ParentNode): HTMLElement[] {
   return elements.filter((element) => element.children.length === 0 && matches((element.textContent ?? '').trim(), selector.value));
 }
 
-export function findElement(chain: SelectorChain, root: ParentNode = document, excludedRoots: readonly HTMLElement[] = []): HTMLElement | null {
+export function findElement(
+  chain: SelectorChain,
+  root: ParentNode = document,
+  excludedRoots: readonly HTMLElement[] = [],
+  visibilityOptions: VisibilityOptions = {},
+): HTMLElement | null {
   for (const selector of chain) {
     let results: HTMLElement[];
     try {
-      results = allForSelector(selector, root).filter((element) => isVisible(element) && !excludedRoots.some((excluded) => excluded.contains(element)));
+      results = allForSelector(selector, root)
+        .filter((element) => isVisible(element, visibilityOptions) && !excludedRoots.some((excluded) => excluded.contains(element)));
     } catch {
       continue;
     }
@@ -67,10 +79,10 @@ export function findElement(chain: SelectorChain, root: ParentNode = document, e
   return null;
 }
 
-export function findAll(chain: SelectorChain, root: ParentNode = document): HTMLElement[] {
+export function findAll(chain: SelectorChain, root: ParentNode = document, visibilityOptions: VisibilityOptions = {}): HTMLElement[] {
   for (const selector of chain) {
     try {
-      const results = allForSelector(selector, root).filter(isVisible);
+      const results = allForSelector(selector, root).filter((element) => isVisible(element, visibilityOptions));
       if (results.length) return results;
     } catch {
       // Try the next selector in the chain.
@@ -79,24 +91,29 @@ export function findAll(chain: SelectorChain, root: ParentNode = document): HTML
   return [];
 }
 
-export function isEffectivelyHidden(element: HTMLElement): boolean {
+function isUntilFound(element: HTMLElement): boolean {
+  return element.getAttribute('hidden')?.toLowerCase() === 'until-found';
+}
+
+export function isEffectivelyHidden(element: HTMLElement, options: VisibilityOptions = {}): boolean {
+  const elementStyle = getComputedStyle(element);
+  if (elementStyle.visibility === 'hidden' || elementStyle.visibility === 'collapse') return true;
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
-    const style = getComputedStyle(current);
+    const style = current === element ? elementStyle : getComputedStyle(current);
     const opacity = Number.parseFloat(style.opacity);
-    if (current.hidden
-      || current.getAttribute('aria-hidden')?.toLowerCase() === 'true'
+    const ancestor = current !== element;
+    if ((current.hidden && !isUntilFound(current))
+      || (!(ancestor && options.ignoreAncestorAriaHidden) && current.getAttribute('aria-hidden')?.toLowerCase() === 'true')
       || style.display === 'none'
-      || style.visibility === 'hidden'
-      || style.visibility === 'collapse'
-      || (!Number.isNaN(opacity) && opacity <= 0)) return true;
+      || (!(ancestor && options.ignoreAncestorOpacity) && !options.allowTransparent && !Number.isNaN(opacity) && opacity <= 0)) return true;
   }
   return false;
 }
 
-export function isVisible(element: HTMLElement): boolean {
+export function isVisible(element: HTMLElement, options: VisibilityOptions = {}): boolean {
   const style = getComputedStyle(element);
   const rect = element.getBoundingClientRect();
-  return !isEffectivelyHidden(element)
+  return !isEffectivelyHidden(element, options)
     && !element.hasAttribute('disabled')
     && element.getAttribute('aria-disabled')?.toLowerCase() !== 'true'
     && (rect.width > 0 || rect.height > 0 || style.position === 'fixed');
@@ -104,11 +121,42 @@ export function isVisible(element: HTMLElement): boolean {
 
 export function cloneVisibleContent(root: HTMLElement, excludedSelector: string): HTMLElement {
   const clone = root.cloneNode(true) as HTMLElement;
-  const originals = [root, ...root.querySelectorAll<HTMLElement>('*')];
-  const copies = [clone, ...clone.querySelectorAll<HTMLElement>('*')];
-  for (let index = 1; index < originals.length; index += 1) {
-    const original = originals[index]!;
-    if (original.matches(excludedSelector) || isEffectivelyHidden(original)) copies[index]?.remove();
-  }
+
+  const prune = (originalParent: HTMLElement, cloneParent: HTMLElement, hiddenByAncestor: boolean): void => {
+    const originalChildren = Array.from(originalParent.children) as HTMLElement[];
+    const cloneChildren = Array.from(cloneParent.children) as HTMLElement[];
+    for (let index = 0; index < originalChildren.length; index += 1) {
+      const original = originalChildren[index]!;
+      const copy = cloneChildren[index]!;
+      if (original.matches(excludedSelector)) {
+        copy.remove();
+        continue;
+      }
+      const style = getComputedStyle(original);
+      const opacity = Number.parseFloat(style.opacity);
+      const irreversiblyHidden = hiddenByAncestor
+        || (original.hidden && !isUntilFound(original))
+        || original.getAttribute('aria-hidden')?.toLowerCase() === 'true'
+        || style.display === 'none'
+        || (!Number.isNaN(opacity) && opacity <= 0);
+      if (irreversiblyHidden) {
+        copy.remove();
+        continue;
+      }
+      const visibilityHidden = style.visibility === 'hidden' || style.visibility === 'collapse';
+      if (visibilityHidden) {
+        for (const child of Array.from(copy.childNodes)) {
+          if (child.nodeType === Node.TEXT_NODE) child.remove();
+        }
+      }
+      prune(original, copy, false);
+      if (visibilityHidden && !(copy.textContent ?? '').trim() && copy.children.length === 0) copy.remove();
+    }
+  };
+
+  // The response root is an extraction boundary. Temporary state on an outer
+  // dialog or sheet must not erase the response, while hidden descendants are
+  // still pruned from the exported content.
+  prune(root, clone, false);
   return clone;
 }

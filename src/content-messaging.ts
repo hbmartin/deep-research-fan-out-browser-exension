@@ -8,12 +8,14 @@ export class ContentMessageError extends Error {
 }
 
 export async function sendContentMessage(message: RuntimeRequest): Promise<void> {
+  const requiresAcknowledgement = message.type === 'content:capture' || message.type === 'content:state';
   try {
     const response = await browser.runtime.sendMessage(message) as RuntimeResponse | undefined;
-    if (message.type === 'content:capture' && response?.ok !== true) {
-      throw new ContentMessageError(response?.error || 'Capture delivery was not acknowledged.', response?.code);
+    if (requiresAcknowledgement && response?.ok !== true) {
+      const kind = message.type === 'content:capture' ? 'Capture delivery' : 'Provider state update';
+      throw new ContentMessageError(response?.error || `${kind} was not acknowledged.`, response?.code);
     }
   } catch (error) {
-    if (message.type === 'content:capture') throw error;
+    if (requiresAcknowledgement) throw error;
   }
 }
