@@ -2,7 +2,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { deleteJob, getCapture, getJob, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
+import { acceptCaptureJob, deleteJob, getCapture, getJob, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
 import type { CaptureJob, ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
@@ -408,7 +408,7 @@ describe('coordinator run guards', () => {
     await putJob(job);
     await expect(coordinatorTestHooks.handleRequest({
       type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
-    }, {})).resolves.toEqual({ ok: true });
+    }, {})).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
     expect(await getJob(id)).toEqual(job);
     await coordinatorTestHooks.processCaptureQueue();
     await deleteJob(id);
@@ -428,7 +428,7 @@ describe('coordinator run guards', () => {
     await putJob(job);
     await expect(coordinatorTestHooks.handleRequest({
       type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
-    }, {})).resolves.toEqual({ ok: true });
+    }, {})).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('capturing');
     expect(await getJob(id)).toEqual(job);
     await deleteJob(id);
@@ -651,5 +651,109 @@ describe('coordinator run guards', () => {
     }, {} as Browser.runtime.MessageSender)).resolves.toMatchObject({
       ok: false, code: 'provider_terminal',
     });
+  });
+});
+
+describe('durable acceptance and state recovery regressions', () => {
+  function captureRequest(stored: Run) {
+    return {type:'content:capture',runId:stored.id,provider:'chatgpt',domMarkdown:'A complete research report with sufficient meaningful evidence for persistence.',domCitations:[]} as const;
+  }
+  function jobFor(stored: Run): CaptureJob {
+    return {...captureRequest(stored),id:`${stored.id}:chatgpt`,tabId:1,state:'queued',createdAt:Date.now(),attempts:0,domCitations:[]};
+  }
+  it.each(['setting_mode','submitting','opening'] as const)('rejects capture in %s without leaving a job', async (status) => {
+    const stored = run({chatgpt:provider('chatgpt',1,status)});
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({...captureRequest(stored),domCitations:[]},{})).resolves.toMatchObject({ok:false,code:'invalid_transition',providerState:{status}});
+    expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe(status);
+  });
+  it('rolls back the job when the run write fails after the job write', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    await expect(acceptCaptureJob(jobFor(stored),(current) => {
+      current!.providerRuns.chatgpt!.status='capturing';
+      current!.query = (() => undefined) as unknown as string;
+      return current!;
+    })).rejects.toThrow();
+    expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('researching');
+  });
+  it('rolls back state when the payload cannot be stored', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    const job = jobFor(stored);
+    job.domMarkdown = (() => undefined) as unknown as string;
+    await expect(acceptCaptureJob(job,(current) => {current!.providerRuns.chatgpt!.status='capturing'; return current!;})).rejects.toThrow();
+    expect(await getJob(job.id)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('researching');
+  });
+  it('drops a legacy unaccepted job without failing its setup-phase provider', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'setting_mode')});
+    await putRun(stored);
+    await putJob(jobFor(stored));
+    await coordinatorTestHooks.processCaptureQueue();
+    expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('setting_mode');
+  });
+  it('reconciles a recoverable legacy job before completing it', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    await putJob({...jobFor(stored),tabUnavailable:true});
+    await coordinatorTestHooks.processCaptureQueue();
+    expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('complete');
+  });
+  it('preserves the first submission time and notifies only once for a persisted timeout', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    const submittedAt = Date.now()-3600000;
+    stored.providerRuns.chatgpt!.submittedAt=submittedAt;
+    await putRun(stored);
+    const request = {type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required',reason:'research_timeout',detail:'Timed out',submittedAt:Date.now()} as const;
+    const first = await coordinatorTestHooks.handleRequest(request,{});
+    const second = await coordinatorTestHooks.handleRequest(request,{});
+    expect(first).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt,researchTimedOutAt:expect.any(Number)}});
+    expect(second).toEqual(first);
+    expect(platform.notify).toHaveBeenCalledTimes(1);
+    await expect(coordinatorTestHooks.handleRequest({...request,status:'researching'},{})).resolves.toMatchObject({ok:false,code:'invalid_transition',providerState:{status:'manual_required',submittedAt}});
+    await coordinatorTestHooks.startContent((await getRun(stored.id))!,'chatgpt',true);
+    expect(platform.sendTabEvent).toHaveBeenCalledWith(1,expect.objectContaining({type:'content:start',submittedAt,researchTimedOutAt:expect.any(Number)}));
+  });
+  it('acknowledges a stored state even if notification delivery fails', async () => {
+    vi.spyOn(console,'error').mockImplementation(() => undefined);
+    const stored=run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    platform.notify.mockRejectedValue(new Error('notifications unavailable'));
+    await expect(coordinatorTestHooks.handleRequest({type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required'},{})).resolves.toMatchObject({ok:true,providerState:{status:'manual_required'}});
+    vi.restoreAllMocks();
+  });
+  it('returns a terminal snapshot for stale state reports', async () => {
+    const stored=run({chatgpt:provider('chatgpt',1,'complete')},'complete');
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching'},{})).resolves.toMatchObject({ok:false,code:'provider_terminal',providerState:{status:'complete'}});
+  });
+  it('does not inject another script when a reachable receiver rejects startup', async () => {
+    const stored=run({chatgpt:provider('chatgpt',1,'setting_mode')});
+    await putRun(stored);
+    const executeScript=vi.fn();
+    Object.assign(browser,{scripting:{executeScript}});
+    platform.sendTabEvent.mockImplementation(async (_tab,event) => {
+      if ((event as {type:string}).type==='content:ping') return {ok:true};
+      throw new Error('Invalid application state');
+    });
+    await coordinatorTestHooks.startContent(stored,'chatgpt');
+    expect(executeScript).not.toHaveBeenCalled();
+    expect(platform.sendTabEvent).toHaveBeenCalledTimes(2);
+  });
+  it('injects only after ping establishes that the receiver is missing', async () => {
+    const stored=run({chatgpt:provider('chatgpt',1,'opening')});
+    await putRun(stored);
+    const executeScript=vi.fn(async () => undefined);
+    Object.assign(browser,{scripting:{executeScript}});
+    platform.sendTabEvent.mockRejectedValueOnce(new Error('Could not establish connection. Receiving end does not exist.')).mockResolvedValue({ok:true});
+    const start=coordinatorTestHooks.startContent(stored,'chatgpt');
+    await start;
+    expect(executeScript).toHaveBeenCalledTimes(1);
+    expect(platform.sendTabEvent).toHaveBeenLastCalledWith(1,expect.objectContaining({type:'content:start'}));
   });
 });

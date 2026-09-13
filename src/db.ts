@@ -39,6 +39,23 @@ export async function getCapture(id?: string): Promise<Capture | undefined> { re
 export async function putJob(job: CaptureJob): Promise<void> { await (await db()).put('jobs', job); }
 export async function getJob(id: string): Promise<CaptureJob | undefined> { return (await db()).get('jobs', id); }
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
+
+/** Caller holds the run lock. Validation and both writes share one commit. */
+export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | undefined) => Run): Promise<Run> {
+  const transaction = (await db()).transaction(['runs', 'jobs'], 'readwrite');
+  try {
+    const run = validate(await transaction.objectStore('runs').get(job.runId));
+    const existing = await transaction.objectStore('jobs').get(job.id);
+    if (!existing) await transaction.objectStore('jobs').put(job);
+    await transaction.objectStore('runs').put(run);
+    await transaction.done;
+    return run;
+  } catch (error) {
+    try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
+    await transaction.done.catch(() => undefined);
+    throw error;
+  }
+}
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();
   const jobs = (await database.getAllFromIndex('jobs', 'by-created')).sort((a, b) => a.createdAt - b.createdAt);

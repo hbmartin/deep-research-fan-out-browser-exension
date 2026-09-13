@@ -115,6 +115,7 @@ export interface ProviderRun {
   appendString: string;
   startedAt?: number;
   submittedAt?: number;
+  researchTimedOutAt?: number;
   completedAt?: number;
   captureId?: string;
   attempts: number;

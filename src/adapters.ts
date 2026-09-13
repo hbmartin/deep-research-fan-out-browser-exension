@@ -21,6 +21,9 @@ export interface ProviderAdapter {
   clarifyingPromptPattern?: RegExp;
   progressResponsePattern: RegExp;
   quotaResponsePattern: RegExp;
+  /** Additional verified turn boundaries and post-click success markers. */
+  responseContainerSelector?: string;
+  copySuccessSelector?: string;
   selectors: {
     composer: SelectorChain;
     submitButton: SelectorChain;
@@ -51,7 +54,9 @@ const commonCopyButton: SelectorChain = [{ kind: 'aria', role: 'button', name: /
 
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
-    id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.1.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
+    // Success markers verified in tests/fixtures/chatgpt-copy-feedback.json.
+    copySuccessSelector: '[data-copy-state="copied"], svg use[href="#lightweight-conversation-check"]',
+    id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.2.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     clarifyingPromptPattern: /^(?:(?:great|thanks|thank you|sure|certainly|absolutely|of course|i can help with that)[^.!?]{0,120}[.!?—,:-]\s*)?(?:before i begin\b|could you (?:please )?(?:clarify|specify)\b)/i,
     progressResponsePattern: commonProgressResponse,

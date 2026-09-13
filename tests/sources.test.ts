@@ -195,3 +195,26 @@ describe('Grok Sources sidebar capture', () => {
     expect(trail.warnings).toEqual(captured.warnings);
   });
 });
+
+it('accepts a reused sidebar node that becomes visible without ownership ARIA', async () => {
+  document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside hidden><div>Sources</div><button aria-label="Close"></button>${searchGroup('web','current query',[2],2)}</aside>`;
+  const panel=document.querySelector<HTMLElement>('aside')!;
+  const toggle=document.querySelector<HTMLElement>('#target')!;
+  toggle.addEventListener('click',()=> {panel.hidden=false;});
+  panel.querySelector('button')!.addEventListener('click',()=> {panel.hidden=true;});
+  const result=await captureGrokResearchTrail(document,toggle,50);
+  expect(result.searches.map((search)=>search.query)).toEqual(['current query']);
+  expect(result.warnings).toEqual([]);
+  expect(panel.hidden).toBe(true);
+  document.body.replaceChildren();
+});
+
+it('rejects ambiguous simultaneously opened sidebars', async () => {
+  document.body.innerHTML = '<button id="target" aria-label="1 sources"></button>';
+  const toggle=document.querySelector<HTMLElement>('#target')!;
+  toggle.addEventListener('click',()=> {document.body.insertAdjacentHTML('beforeend','<aside><div>Sources</div></aside><aside><div>Sources</div></aside>');});
+  const result=await captureGrokResearchTrail(document,toggle,50);
+  expect(result.searches).toEqual([]);
+  expect(result.warnings).toContain('Grok Sources sidebar did not open.');
+  document.body.replaceChildren();
+});
