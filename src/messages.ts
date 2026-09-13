@@ -34,6 +34,7 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   completionDebounceMs: number;
   resumeOnly: boolean;
   status: ProviderRunStatus;
+  captureAccepted?: boolean;
 } | { type: 'capture:copy-now'; jobId: string }
   | { type: 'content:stop'; runId: RunId };
 

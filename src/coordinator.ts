@@ -132,6 +132,8 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
   const providerRun = run.providerRuns[provider];
   if (!providerRun || isTerminalProviderStatus(providerRun.status)) return;
   const settings = await loadSettings();
+  const id = captureId(run.id, provider);
+  const captureAccepted = Boolean(await getJob(id) || await getCapture(id));
   const event = {
     type: 'content:start',
     runId: run.id,
@@ -142,6 +144,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
     completionDebounceMs: settings.providers[provider].completionDebounceMs,
     resumeOnly,
     status: providerRun.status,
+    captureAccepted,
   } as const;
   try {
     await sendTabEvent(providerRun.tabId, event);
@@ -293,7 +296,7 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
       observed = await platform.readClipboard();
       const resemblesDomReport = hasVerifiableDom
         && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
-      if (observed === sentinel || observed === original || observed.trim().length < 40 || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
+      if (observed === sentinel || observed.trim().length < 40 || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
         throw new Error('Provider copy did not produce a new report.');
       }
       let restored = false;
@@ -528,6 +531,11 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
   if (!run || !providerRun) throw new Error('Run not found for capture.');
   if (isTerminalProviderStatus(providerRun.status)) {
     throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
+  }
+  // A retry after a lost acknowledgement must not replace a leased payload.
+  if (await getJob(captureId(run.id, request.provider))) {
+    void processCaptureQueue();
+    return;
   }
   if (providerRun.status !== 'capturing') await mutateProvider(run.id, request.provider, 'capturing');
   await putJob({

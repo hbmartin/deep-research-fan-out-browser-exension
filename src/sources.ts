@@ -108,7 +108,27 @@ function searchButtons(sidebar: HTMLElement): HTMLButtonElement[] {
 
 function findSourcesSidebar(document: Document): HTMLElement | undefined {
   return Array.from(document.querySelectorAll<HTMLElement>('aside'))
-    .find((aside) => renderedLines(aside).some((line) => line === 'Sources'));
+    .find((aside) => {
+      for (let element: HTMLElement | null = aside; element; element = element.parentElement) {
+        const style = document.defaultView?.getComputedStyle(element);
+        if (element.hidden || element.getAttribute('aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return false;
+      }
+      return renderedLines(aside).some((line) => line === 'Sources');
+    });
+}
+
+function sidebarCloseButton(sidebar: HTMLElement): HTMLButtonElement | undefined {
+  return Array.from(sidebar.querySelectorAll<HTMLButtonElement>('button'))
+    .find((button) => /^close$/i.test(accessibleName(button)));
+}
+
+function sidebarBelongsToToggle(sidebar: HTMLElement, toggle: HTMLElement): boolean {
+  if (toggle.getAttribute('aria-expanded') !== 'true') return false;
+  const controls = toggle.getAttribute('aria-controls')?.split(/\s+/) ?? [];
+  return controls.some((id) => {
+    const controlled = sidebar.ownerDocument.getElementById(id);
+    return controlled === sidebar || Boolean(controlled && sidebar.contains(controlled));
+  });
 }
 
 function findOpenedPages(sidebar: HTMLElement): CapturedSource[] {
@@ -150,7 +170,21 @@ export async function captureGrokResearchTrail(
   const warnings: string[] = [];
   const total = toggle ? reportedCount(toggle) : undefined;
   let sidebar = findSourcesSidebar(document);
-  const openedByCapture = !sidebar && Boolean(toggle);
+  if (!toggle) {
+    return { reportedResultCount: total, searches: [], openedPages: [], warnings: ['Grok Sources control was not found.'] };
+  }
+  // An open sidebar may belong to an older answer. Close it before activating
+  // the requested answer unless its expanded control explicitly owns the panel.
+  if (sidebar && !sidebarBelongsToToggle(sidebar, toggle)) {
+    const close = sidebarCloseButton(sidebar);
+    close?.click();
+    const closed = close && await waitFor(() => findSourcesSidebar(document) ? undefined : true, Date.now() + Math.min(timeoutMs, 3000));
+    if (!closed) {
+      return { reportedResultCount: total, searches: [], openedPages: [], warnings: ['Could not verify which answer owns the open Grok Sources sidebar.'] };
+    }
+    sidebar = undefined;
+  }
+  const openedByCapture = !sidebar;
   if (!sidebar && toggle) {
     toggle.click();
     sidebar = await waitFor(() => findSourcesSidebar(document), Date.now() + Math.min(timeoutMs, 3000));
@@ -200,8 +234,7 @@ export async function captureGrokResearchTrail(
   }
 
   if (openedByCapture) {
-    const close = Array.from(sidebar.querySelectorAll<HTMLButtonElement>('button')).find((button) => /^close$/i.test(accessibleName(button)));
-    close?.click();
+    sidebarCloseButton(sidebar)?.click();
   }
   return { reportedResultCount: total, searches, openedPages, warnings: [...new Set(warnings)] };
 }

@@ -2,7 +2,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { getCapture, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
+import { deleteJob, getCapture, getJob, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
 import type { CaptureJob, ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
@@ -295,6 +295,65 @@ describe('coordinator run guards', () => {
     await expect(pending).resolves.toMatchObject({ text: report, restored: true });
     expect(browser.tabs.update).toHaveBeenCalledWith(2, { active: true });
     expect(clipboard).toBe(privateText);
+  });
+
+  it('accepts a fresh provider copy identical to the original clipboard', async () => {
+    vi.useFakeTimers();
+    const report = 'A complete provider research report with sufficient content for a valid capture.';
+    let clipboard = report;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => { clipboard = report; });
+    const job: CaptureJob = {
+      id: 'review:chatgpt', runId: 'review', provider: 'chatgpt', tabId: 1, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: report, domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ text: report, restored: true });
+    expect(platform.sendTabEvent).toHaveBeenCalledTimes(1);
+    expect(clipboard).toBe(report);
+  });
+
+  it.each([false, true])('reports durable capture acceptance as %s when resuming capturing', async (accepted) => {
+    const stored = run({ chatgpt: provider('chatgpt', 930, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    if (accepted) await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 930, state: 'queued',
+      createdAt: Date.now(), attempts: 0, domMarkdown: 'A complete durable report available for recovery after a reload.', domCitations: [],
+    });
+    await coordinatorTestHooks.handleRequest(
+      { type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/c/1' },
+      { tab: { id: 930 } } as Browser.runtime.MessageSender,
+    );
+    await vi.waitFor(() => expect(platform.sendTabEvent).toHaveBeenCalledWith(930, expect.objectContaining({
+      status: 'capturing', resumeOnly: true, captureAccepted: accepted,
+    })));
+    await deleteJob(id);
+    stored.providerRuns.chatgpt!.status = 'complete';
+    stored.status = 'complete';
+    await putRun(stored);
+  });
+
+  it('retains a leased job when capture delivery is retried after a lost acknowledgement', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 931, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    const job: CaptureJob = {
+      id, runId: stored.id, provider: 'chatgpt', tabId: 931, state: 'leased', leasedAt: Date.now(),
+      createdAt: Date.now(), attempts: 2, domMarkdown: 'The original complete research report already accepted into the durable queue.', domCitations: [],
+    };
+    await putRun(stored);
+    await putJob(job);
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
+    }, {})).resolves.toEqual({ ok: true });
+    expect(await getJob(id)).toEqual(job);
+    await coordinatorTestHooks.processCaptureQueue();
+    await deleteJob(id);
+    stored.providerRuns.chatgpt!.status = 'complete';
+    stored.status = 'complete';
+    await putRun(stored);
   });
 
   it('rejects unrelated clipboard text copied concurrently with provider capture', async () => {

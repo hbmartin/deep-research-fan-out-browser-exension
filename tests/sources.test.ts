@@ -31,7 +31,8 @@ describe('Grok Sources sidebar capture', () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it('captures the inspected seven-search, 74-result shape and globally deduplicates it', async () => {
-    document.body.innerHTML = `<button aria-label="74 sources"></button>${sidebarHtml()}`;
+    document.body.innerHTML = `<button aria-label="74 sources" aria-controls="sources" aria-expanded="true"></button>${sidebarHtml()}`;
+    document.querySelector('aside')!.id = 'sources';
     const firstXPost = document.querySelector<HTMLAnchorElement>('a[href^="https://x.com/researcher_0/status/"]')!;
     const outbound = document.createElement('a');
     outbound.href = 'https://t.co/link-0';
@@ -82,8 +83,8 @@ describe('Grok Sources sidebar capture', () => {
 
   it('gives later search groups time to render after an earlier group stalls', async () => {
     vi.useFakeTimers();
-    document.body.innerHTML = `<aside><div>Sources</div>${searchGroup('web', 'stalled query', [1], 1)}${searchGroup('web', 'later query', [2], 2)}</aside>`;
-    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-controls]'));
+    document.body.innerHTML = `<button id="toggle" aria-controls="sources" aria-expanded="true"></button><aside id="sources"><div>Sources</div>${searchGroup('web', 'stalled query', [1], 1)}${searchGroup('web', 'later query', [2], 2)}</aside>`;
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('aside button[aria-controls]'));
     buttons[0]!.querySelector('span')!.textContent = '2';
     const laterPanel = document.querySelector<HTMLElement>('#group-2')!;
     laterPanel.remove();
@@ -92,7 +93,7 @@ describe('Grok Sources sidebar capture', () => {
       setTimeout(() => document.querySelector('aside')!.append(laterPanel), 25);
     }, { once: true });
 
-    const pending = captureGrokResearchTrail(document, undefined, 100);
+    const pending = captureGrokResearchTrail(document, document.querySelector<HTMLElement>('#toggle'), 100);
     await vi.runAllTimersAsync();
     const captured = await pending;
     expect(captured.searches[0]?.results).toHaveLength(1);
@@ -113,6 +114,27 @@ describe('Grok Sources sidebar capture', () => {
     expect(trail.sources).toHaveLength(1);
     expect(trail.complete).toBe(false);
     expect(trail.warnings.join(' ')).toContain('Expected 2 total search results but captured 1');
+  });
+
+  it('reopens the target answer sources when an unrelated sidebar is already open', async () => {
+    document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside><div>Sources</div><button aria-label="Close"></button>${searchGroup('web', 'old query', [1], 1)}</aside>`;
+    document.querySelector('aside button')!.addEventListener('click', () => document.querySelector('aside')!.remove());
+    const toggle = document.querySelector<HTMLElement>('#target')!;
+    toggle.addEventListener('click', () => {
+      document.body.insertAdjacentHTML('beforeend', `<aside><div>Sources</div>${searchGroup('web', 'current query', [2], 2)}</aside>`);
+    });
+    const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, toggle, 50), []);
+    expect(trail.searches.map((search) => search.query)).toEqual(['current query']);
+    expect(trail.sources.map((source) => source.url)).toEqual(['https://web.example/source-2']);
+    expect(trail.complete).toBe(true);
+  });
+
+  it('warns instead of exporting sources when sidebar ownership cannot be established', async () => {
+    document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside><div>Sources</div>${searchGroup('web', 'old query', [1], 1)}</aside>`;
+    const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, document.querySelector<HTMLElement>('#target'), 50), []);
+    expect(trail.sources).toEqual([]);
+    expect(trail.complete).toBe(false);
+    expect(trail.warnings.join(' ')).toContain('which answer owns');
   });
 
   it('does not duplicate mismatch warnings already recorded during capture', () => {

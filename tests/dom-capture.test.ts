@@ -89,7 +89,8 @@ describe('provider DOM capture', () => {
     expect(isQuotaResponse(report, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(true);
     Object.defineProperty(report, 'innerText', { configurable: true, value: "You've reached your usage limit." });
     expect(isQuotaResponse(report, ADAPTERS.claude.quotaResponsePattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Starting research across the requested sources…' });
+    Reflect.deleteProperty(report, 'innerText');
+    report.textContent = 'Starting research across the requested sources…';
     expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern)).toBe(true);
   });
 
