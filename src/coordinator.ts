@@ -309,14 +309,17 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
     try {
       await platform.writeClipboard(sentinel);
       primed = true;
-      await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
+      if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
+      const clickResult = await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
+      const copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
+        && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
       await new Promise((resolve) => setTimeout(resolve, 250));
       observed = await platform.readClipboard();
       const resemblesDomReport = hasVerifiableDom
         && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
       if (observed === sentinel
         || observed.trim().length < 40
-        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
+        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom && copyConfirmed))) {
         throw new Error('Provider copy did not produce a new report.');
       }
       let restored = false;

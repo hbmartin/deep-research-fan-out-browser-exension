@@ -300,6 +300,15 @@ describe('provider content-script recovery', () => {
       .toBe(document.querySelector('#real-copy'));
   });
 
+  it('confirms a Copy action only after observing provider copy feedback', async () => {
+    answer();
+    await resume('researching');
+    const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
+    button.addEventListener('click', () => document.dispatchEvent(new Event('copy')));
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt' }))
+      .resolves.toEqual({ ok: true, copyConfirmed: true });
+  });
+
   it('prefers the response Copy control over a nested Copy code control', () => {
     document.body.innerHTML = `
       <section>

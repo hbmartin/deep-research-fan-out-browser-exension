@@ -220,6 +220,34 @@ function isInteractiveProgressIndicator(element: HTMLElement | null): boolean {
     || (element instanceof HTMLInputElement && ['button', 'submit'].includes(element.type))));
 }
 
+function copyControlState(button: HTMLElement): string {
+  return [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function clickCopyControl(button: HTMLElement): Promise<boolean> {
+  const initialState = copyControlState(button);
+  let copyEventObserved = false;
+  const onCopy = () => { copyEventObserved = true; };
+  document.addEventListener('copy', onCopy, true);
+  try {
+    button.click();
+    const deadline = Date.now() + 500;
+    do {
+      const currentState = copyControlState(button);
+      if (copyEventObserved
+        || (currentState !== initialState && /\b(?:copied|copy successful|copied to clipboard)\b/i.test(currentState))) return true;
+      await delay(50);
+    } while (Date.now() < deadline);
+    return false;
+  } finally {
+    document.removeEventListener('copy', onCopy, true);
+  }
+}
+
 export function findResponseControl(
   root: HTMLElement,
   responseRoots: readonly HTMLElement[],
@@ -469,9 +497,10 @@ export default defineContentScript({
         const roots = responseRoots(active.adapter);
         const root = roots.at(-1) ?? null;
         const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton, new Set(), true) : null;
-        if (!button) throw new Error('Provider copy button is unavailable.');
-        button.click();
-        return { ok: true };
+        if (!button || !button.isConnected || !isVisible(button, HOVER_COPY_VISIBILITY)) {
+          throw new Error('Provider copy button is unavailable.');
+        }
+        return { ok: true, copyConfirmed: await clickCopyControl(button) };
       }
       if (message.type === 'content:stop' && active?.id === message.runId) {
         active.captureSent = true;
