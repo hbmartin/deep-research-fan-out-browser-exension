@@ -1,4 +1,6 @@
-import type { CaptureJob, DomCitation, ProviderId, ProviderRunStatus, Run, RunId } from './types';
+import type { CaptureJob, CapturedResearchTrail, DomCitation, ProviderId, ProviderRunStatus, Run, RunId } from './types';
+
+export type RuntimeErrorCode = 'provider_terminal';
 
 export type RuntimeRequest =
   | { type: 'runs:list' }
@@ -11,7 +13,7 @@ export type RuntimeRequest =
   | { type: 'provider:download'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
   | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number }
-  | { type: 'content:capture'; runId: RunId; provider: ProviderId; domMarkdown: string; domCitations: DomCitation[]; title?: string }
+  | { type: 'content:capture'; runId: RunId; provider: ProviderId; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string }
   | { type: 'capture:clipboard-read'; requestId: string }
   | { type: 'capture:clipboard-write'; requestId: string; text: string }
   | { type: 'download:blob-create'; requestId: string; text: string }
@@ -20,7 +22,7 @@ export type RuntimeRequest =
 
 export type RuntimeResponse =
   | { ok: true; runs?: Run[]; run?: Run; job?: CaptureJob; text?: string }
-  | { ok: false; error: string };
+  | { ok: false; error: string; code?: RuntimeErrorCode };
 
 export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   type: 'content:start';
@@ -30,7 +32,10 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   appendString: string;
   geminiAutoApprove: boolean;
   completionDebounceMs: number;
-} | { type: 'capture:copy-now'; jobId: string };
+  resumeOnly: boolean;
+  status: ProviderRunStatus;
+} | { type: 'capture:copy-now'; jobId: string }
+  | { type: 'content:stop'; runId: RunId };
 
 export async function sendRequest(request: RuntimeRequest): Promise<RuntimeResponse> {
   return browser.runtime.sendMessage(request) as Promise<RuntimeResponse>;

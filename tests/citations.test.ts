@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { normalizeUrl, reconcileCitations, tokenSimilarity } from '../src/citations';
+import { normalizeUrl, reconcileCitations, tokenContainment, tokenSimilarity } from '../src/citations';
 import type { DomCitation } from '../src/types';
 
 const citation = (url: string, markerText?: string, contextBefore = ''): DomCitation => ({
@@ -15,6 +15,10 @@ describe('URL normalization', () => {
 });
 
 describe('citation reconciliation', () => {
+  it('recognizes a short DOM excerpt contained in a longer copied report', () => {
+    expect(tokenContainment('Intro. A focused excerpt about lunar geology with more analysis afterward.', 'A focused excerpt about lunar geology')).toBe(1);
+  });
+
   it('reconciles every distinct provider fixture scenario', () => {
     const fixtures = JSON.parse(readFileSync(new URL('./fixtures/provider-reports.json', import.meta.url), 'utf8')) as Array<{
       provider: string;
@@ -76,6 +80,16 @@ describe('citation reconciliation', () => {
     expect(result.unplacedCitationCount).toBe(0);
     expect(result.markdown).toContain('[1](https://first.test/)');
     expect(result.markdown).toContain('[2](https://second.test/)');
+  });
+
+  it('moves fallback insertions outside Markdown link syntax', () => {
+    const result = reconcileCitations(
+      'A [durable response](https://existing.test) continues without terminal punctuation',
+      [citation('https://citation.test', undefined, 'durable response')],
+      'none',
+    );
+    expect(result.markdown).toContain('[durable response](https://existing.test)[1](https://citation.test/)');
+    expect(result.markdown).not.toContain('[durable response[1]');
   });
 
   it('does not invent a fuzzy offset when the anchor token is absent', () => {

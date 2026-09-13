@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
 import { findElement } from '../src/selectors';
+import { ADAPTERS } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
   element.style.position = 'fixed';
@@ -48,6 +49,14 @@ describe('selector engine', () => {
     visible(document.querySelector('button')!);
     expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
   });
+
+  it('targets Grok Copy response rather than nested table and code copy buttons', () => {
+    document.body.innerHTML = '<div id="answer"><button aria-label="Copy">Table</button><button aria-label="Copy">Code</button></div><button aria-label="Copy response">Response</button>';
+    document.querySelectorAll<HTMLElement>('button').forEach(visible);
+    const root = document.querySelector<HTMLElement>('#answer')!;
+    expect(findElement(ADAPTERS.grok.selectors.copyButton, root)).toBeNull();
+    expect(findElement(ADAPTERS.grok.selectors.copyButton)?.textContent).toBe('Response');
+  });
 });
 
 describe('query injection', () => {
@@ -61,16 +70,17 @@ describe('query injection', () => {
     expect(inputs).toBe(1);
   });
 
-  it('preserves meaningful spaces and browser-rendered block and line breaks', () => {
+  it('accepts browser-expanded line breaks while preserving line boundaries', () => {
     const blocks = document.createElement('div');
     Object.defineProperty(blocks, 'innerText', { configurable: true, value: 'alpha\n  beta' });
     expect(injectionTestHooks.verified(blocks, 'alpha\r\n  beta')).toBe(true);
-    expect(injectionTestHooks.verified(blocks, 'alpha\nbeta')).toBe(false);
+    expect(injectionTestHooks.verified(blocks, 'alpha\nbeta')).toBe(true);
+    expect(injectionTestHooks.verified(blocks, 'alpha beta')).toBe(false);
 
     const breaks = document.createElement('div');
     Object.defineProperty(breaks, 'innerText', { configurable: true, value: 'alpha\n\nbeta\u00a0gamma' });
     expect(injectionTestHooks.verified(breaks, 'alpha\r\n\r\nbeta gamma')).toBe(true);
-    expect(injectionTestHooks.verified(breaks, 'alpha\nbeta gamma')).toBe(false);
-    expect(injectionTestHooks.verified(breaks, 'alpha\n\nbeta  gamma')).toBe(false);
+    expect(injectionTestHooks.verified(breaks, 'alpha\nbeta gamma')).toBe(true);
+    expect(injectionTestHooks.verified(breaks, 'alpha\n\nbeta  gamma')).toBe(true);
   });
 });

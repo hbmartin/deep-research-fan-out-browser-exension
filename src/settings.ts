@@ -22,6 +22,7 @@ export const settingsSchema = z.object({
     .max(80)
     .refine((value) => !value.includes('..') && !/[\\/]/.test(value), 'Use one folder name'),
   restoreClipboard: z.boolean(),
+  includeSourceSnippets: z.boolean().default(true),
 });
 
 export type Settings = z.infer<typeof settingsSchema>;
@@ -44,6 +45,7 @@ export const DEFAULT_SETTINGS: Settings = {
   geminiAutoApprove: true,
   downloadRoot: 'deep-research',
   restoreClipboard: true,
+  includeSourceSnippets: true,
 };
 
 const GENERAL_KEY = 'settings.general.v1';
@@ -74,6 +76,7 @@ export async function saveSettings(settings: Settings): Promise<void> {
       geminiAutoApprove: parsed.geminiAutoApprove,
       downloadRoot: parsed.downloadRoot,
       restoreClipboard: parsed.restoreClipboard,
+      includeSourceSnippets: parsed.includeSourceSnippets,
     },
     ...Object.fromEntries(PROVIDERS.map((provider) => [providerKey(provider), parsed.providers[provider]])),
   });

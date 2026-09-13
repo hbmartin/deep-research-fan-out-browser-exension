@@ -73,10 +73,29 @@ export function tokenSimilarity(a: string, b: string): number {
   return (2 * common) / (left.size + right.size);
 }
 
+export function tokenContainment(candidate: string, reference: string): number {
+  const candidateTokens = tokens(candidate);
+  const referenceTokens = tokens(reference);
+  if (!candidateTokens.size || !referenceTokens.size) return 0;
+  let common = 0;
+  for (const token of referenceTokens) if (candidateTokens.has(token)) common += 1;
+  return common / referenceTokens.size;
+}
+
 function sentenceInsertionOffset(markdown: string, approximate: number): number {
   const after = markdown.slice(approximate, approximate + 120);
   const punctuation = after.search(/[.!?](?:["')\]]*)\s/);
   return punctuation >= 0 ? approximate + punctuation + 1 : approximate;
+}
+
+function outsideMarkdownLink(markdown: string, offset: number): number {
+  const linkPattern = /!?\[[^\]]+\]\([^)]*\)/g;
+  for (const match of markdown.matchAll(linkPattern)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (offset > start && offset < end) return end;
+  }
+  return offset;
 }
 
 export interface ReconcileResult {
@@ -166,7 +185,7 @@ export function reconcileCitations(
     const projectedEnd = Math.min(projection.rawOffsets.length - 1, index + needle.length - 1);
     const mappedOffset = projectedEnd >= 0 ? projection.rawOffsets[projectedEnd]! + 1 : placementBase.length;
     const approximate = rawIndex >= 0 ? rawIndex + rawNeedle.length : mappedOffset;
-    const insertion = sentenceInsertionOffset(placementBase, approximate);
+    const insertion = outsideMarkdownLink(placementBase, sentenceInsertionOffset(placementBase, approximate));
     const marker = `[${citation.index}](${citation.url})`;
     pendingInsertions.push({ insertion, marker, order });
     citation.placement = 'inline';

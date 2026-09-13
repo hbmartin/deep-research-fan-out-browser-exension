@@ -12,6 +12,9 @@ describe('side-panel rendering', () => {
   it('preserves the query node, draft, focus, and selection across data updates', async () => {
     let runtimeListener: ((event: BackgroundEvent) => void) | undefined;
     let storageListener: ((changes: unknown, areaName: string) => void) | undefined;
+    let storedSettings = {
+      'settings.provider.chatgpt.v1': { appendString: 'Initial suffix' },
+    };
     vi.stubGlobal('browser', {
       runtime: {
         onMessage: { addListener: vi.fn((listener: (event: BackgroundEvent) => void) => { runtimeListener = listener; }) },
@@ -19,14 +22,17 @@ describe('side-panel rendering', () => {
         openOptionsPage: vi.fn(async () => undefined),
       },
       storage: {
-        sync: { get: vi.fn(async () => ({})) },
+        sync: { get: vi.fn(async () => storedSettings) },
         onChanged: { addListener: vi.fn((listener: (changes: unknown, areaName: string) => void) => { storageListener = listener; }) },
       },
       action: { setBadgeText: vi.fn(async () => undefined) },
     });
     document.body.innerHTML = '<main id="app"></main>';
     await import('../entrypoints/sidepanel/main');
-    await vi.waitFor(() => expect(document.querySelector('#query')).toBeInstanceOf(HTMLTextAreaElement));
+    await vi.waitFor(() => {
+      expect(document.querySelector('#query')).toBeInstanceOf(HTMLTextAreaElement);
+      expect(document.querySelector('.preview')?.textContent).toContain('Initial suffix');
+    });
 
     const textarea = document.querySelector<HTMLTextAreaElement>('#query')!;
     textarea.value = 'draft query';
@@ -36,8 +42,14 @@ describe('side-panel rendering', () => {
       id: 'run', query: 'existing', createdAt: 1, windowId: 1, providerRuns: {}, status: 'active', slug: 'run', downloadFolder: 'deep-research/run',
     };
     runtimeListener?.({ type: 'runs:changed', runs: [update] });
+    storedSettings = {
+      'settings.provider.chatgpt.v1': { appendString: 'Updated suffix' },
+    };
     storageListener?.({}, 'sync');
-    await vi.waitFor(() => expect(document.querySelector('.history h2')?.textContent).toBe('Runs'));
+    await vi.waitFor(() => {
+      expect(document.querySelector('.history h2')?.textContent).toBe('Runs');
+      expect(document.querySelector('.preview')?.textContent).toContain('Updated suffix');
+    });
 
     expect(document.querySelector('#query')).toBe(textarea);
     expect(textarea.value).toBe('draft query');

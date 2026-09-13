@@ -12,12 +12,15 @@ export interface ProviderAdapter {
   label: string;
   version: string;
   origin: string;
+  authenticationOrigins?: readonly string[];
   entryUrl: string;
   composerKind: 'contenteditable' | 'textarea';
   submitStrategy: 'button' | 'enter';
   citationMarkerStyle: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
   urlResolution: 'none' | 'follow_redirect';
   clarifyingPromptPattern?: RegExp;
+  progressResponsePattern: RegExp;
+  quotaResponsePattern: RegExp;
   selectors: {
     composer: SelectorChain;
     submitButton: SelectorChain;
@@ -40,11 +43,16 @@ const commonLogin: SelectorChain = [
   { kind: 'text', value: /log in to continue|sign in to continue/i },
 ];
 
+const commonProgressResponse = /^(?:starting|beginning|conducting|continuing|researching|searching|working on|i(?:'ll| will| am going to) (?:start|begin|research|search))/i;
+const commonQuotaResponse = /^(?:(?:sorry|unfortunately)[,.!]?\s*)?(?:(?:you(?:'ve| have)?|your account has)\s+)?(?:reached|hit|exceeded)\s+(?:your\s+)?(?:(?:deepsearch|deep research|research|usage)\s+)?limit\b|^(?:your\s+)?(?:deepsearch|deep research|research|usage)\s+limit\s+(?:has been\s+)?(?:reached|exceeded)\b|^(?:deepsearch|deep research|research)\s+(?:is\s+)?unavailable\b|^upgrade\b.{0,80}\b(?:deepsearch|deep research|research)\b/i;
+
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
     id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.1.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
-    clarifyingPromptPattern: /before i begin|clarif(y|ication)|could you specify/i,
+    clarifyingPromptPattern: /^(?:(?:great|thanks|thank you|sure|certainly|absolutely|of course|i can help with that)[^.!?]{0,120}[.!?—,:-]\s*)?(?:before i begin\b|could you (?:please )?(?:clarify|specify)\b)/i,
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: commonQuotaResponse,
     selectors: {
       composer: [{ kind: 'testid', value: 'prompt-textarea' }, { kind: 'css', value: '#prompt-textarea' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'testid', value: 'send-button' }, { kind: 'aria', role: 'button', name: /send/i }],
@@ -55,14 +63,16 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       finalMessageRoot: [{ kind: 'css', value: '[data-message-author-role="assistant"]', pick: 'last' }],
       copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
-      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources|citations/i }],
+      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources|citations/i, pick: 'last' }],
       loginWall: commonLogin,
-      quotaNotice: [{ kind: 'text', value: /deep research.*(limit|unavailable)|limit.*deep research/i }],
+      quotaNotice: [{ kind: 'text', value: commonQuotaResponse }],
     },
   },
   claude: {
     id: 'claude', label: 'Claude', version: 'claude@0.1.0', origin: 'https://claude.ai', entryUrl: 'https://claude.ai/new',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: commonQuotaResponse,
     selectors: {
       composer: [{ kind: 'css', value: '[contenteditable="true"][role="textbox"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /send message|send/i }],
@@ -74,12 +84,15 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
       loginWall: commonLogin,
-      quotaNotice: [{ kind: 'text', value: /research.*(limit|unavailable)|usage limit|limit reached/i }],
+      quotaNotice: [{ kind: 'text', value: commonQuotaResponse }],
     },
   },
   gemini: {
     id: 'gemini', label: 'Gemini', version: 'gemini@0.1.0', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
+    authenticationOrigins: ['https://accounts.google.com'],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'superscript', urlResolution: 'follow_redirect',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: commonQuotaResponse,
     selectors: {
       composer: [{ kind: 'css', value: 'rich-textarea [contenteditable="true"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /send message|send/i }],
@@ -90,15 +103,17 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       finalMessageRoot: [{ kind: 'css', value: 'model-response', pick: 'last' }, { kind: 'css', value: '[data-test-id="model-response"]', pick: 'last' }],
       copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
-      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources/i }],
+      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources/i, pick: 'last' }],
       loginWall: commonLogin,
-      quotaNotice: [{ kind: 'text', value: /deep research.*(limit|unavailable)|upgrade.*deep research/i }],
+      quotaNotice: [{ kind: 'text', value: commonQuotaResponse }],
       planApproval: [{ kind: 'aria', role: 'button', name: /start research|begin research|approve/i }],
     },
   },
   grok: {
-    id: 'grok', label: 'Grok', version: 'grok@0.1.0', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
+    id: 'grok', label: 'Grok', version: 'grok@0.2.0', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
+    progressResponsePattern: commonProgressResponse,
+    quotaResponsePattern: commonQuotaResponse,
     selectors: {
       composer: [{ kind: 'css', value: '[contenteditable="true"][role="textbox"]' }, { kind: 'aria', role: 'textbox' }],
       submitButton: [{ kind: 'aria', role: 'button', name: /submit|send/i }],
@@ -107,10 +122,11 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-testid*="deep"][aria-pressed="true"]' }],
       streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /searching|thinking/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-testid="assistant-message"]', pick: 'last' }, { kind: 'css', value: 'article', pick: 'last' }],
-      copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
+      copyButton: [{ kind: 'aria', role: 'button', name: /^copy response$/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
+      sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /^\d+\s+sources$/i, pick: 'last' }],
       loginWall: commonLogin,
-      quotaNotice: [{ kind: 'text', value: /(deepsearch|research).*(limit|unavailable)|usage limit/i }],
+      quotaNotice: [{ kind: 'text', value: commonQuotaResponse }],
     },
   },
 };

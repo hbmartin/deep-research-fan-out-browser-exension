@@ -15,6 +15,7 @@ describe('options validation', () => {
     document.body.innerHTML = '<main id="app"></main>';
     await import('../entrypoints/options/main');
     await vi.waitFor(() => expect(document.querySelector('#debounce-chatgpt')).toBeInstanceOf(HTMLInputElement));
+    expect(document.querySelector<HTMLInputElement>('#source-snippets')?.checked).toBe(true);
 
     const input = document.querySelector<HTMLInputElement>('#debounce-chatgpt')!;
     expect(input.required).toBe(true);

@@ -9,6 +9,8 @@ A local-first WXT extension that launches the same query in the deep-research mo
 
 Both targets provide the address-bar keyword `dr`, side panel/sidebar dashboard, parallel tab groups, research-mode safety checks, completion notifications, Markdown capture, history, re-run, and settings import/export.
 
+Grok captures the complete Sources sidebar into a search index and globally deduplicated source catalog. Source titles and URLs are always included; snippets and outbound links are enabled by default and can be disabled in Options. If Grok reports more results than the extension can capture, the available sources are still saved with an explicit warning and degraded status.
+
 ## Development
 
 Requirements: Node.js 22 and pnpm 11.
