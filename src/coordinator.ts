@@ -1,6 +1,6 @@
 import { ADAPTERS } from './adapters';
 import { buildArtifact } from './artifacts';
-import { reconcileCitations, tokenSimilarity } from './citations';
+import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
 import { captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
 import type { RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
@@ -160,6 +160,10 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
   }
 }
 
+function shouldResumeContentOnly(status: ProviderRunStatus): boolean {
+  return !['pending', 'opening', 'awaiting_ready', 'setting_mode'].includes(status);
+}
+
 async function createRun(queryInput: string, requestedWindowId?: number): Promise<Run> {
   const query = queryInput.trim();
   if (!query) throw new Error('Enter a research query.');
@@ -274,7 +278,9 @@ async function resolveCitationUrls(provider: ProviderId, citations: DomCitation[
 
 async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Promise<{ text: string; restored: boolean } | undefined> {
   const settings = await loadSettings();
-  const attemptCapture = async (): Promise<{ text: string; restored: boolean }> => {
+  const domMarkdown = job.domMarkdown.trim();
+  const hasVerifiableDom = domMarkdown.length >= 20;
+  const attemptCapture = async (allowCopyOnly = false): Promise<{ text: string; restored: boolean }> => {
     const original = await platform.readClipboard();
     const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
     let primed = false;
@@ -285,9 +291,9 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
       await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
       await new Promise((resolve) => setTimeout(resolve, 250));
       observed = await platform.readClipboard();
-      const resemblesDomReport = job.domMarkdown.trim().length >= 20
-        && tokenSimilarity(observed, job.domMarkdown) >= 0.45;
-      if (observed === sentinel || observed === original || observed.trim().length < 40 || !resemblesDomReport) {
+      const resemblesDomReport = hasVerifiableDom
+        && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
+      if (observed === sentinel || observed === original || observed.trim().length < 40 || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
         throw new Error('Provider copy did not produce a new report.');
       }
       let restored = false;
@@ -309,16 +315,18 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
       throw error;
     }
   };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try { return await attemptCapture(); }
-    catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
+  if (hasVerifiableDom) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try { return await attemptCapture(); }
+      catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
+    }
   }
   if (job.tabUnavailable || Date.now() - lastNonRunInteractionAt < 5000) return undefined;
   const [current] = await browser.tabs.query({ active: true, currentWindow: true });
   try {
     await activateTabInternally(job.tabId);
     await new Promise((resolve) => setTimeout(resolve, 150));
-    return await attemptCapture();
+    return await attemptCapture(!hasVerifiableDom);
   } catch {
     return undefined;
   } finally {
@@ -365,10 +373,11 @@ async function completeProviderCapture(runId: string, provider: ProviderId, capt
   const { run, value } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
     if (!providerRun) return { completed: false, attached: false };
+    const captureChanged = providerRun.captureId !== captureIdValue || (degraded && !providerRun.degraded);
     providerRun.captureId = captureIdValue;
     providerRun.degraded ||= degraded;
     if (isTerminalProviderStatus(providerRun.status)) {
-      if (providerRun.downloadedAt) {
+      if (captureChanged && providerRun.downloadedAt) {
         providerRun.downloadedAt = undefined;
         providerRun.downloadId = undefined;
         storedRun.completedAt = undefined;
@@ -464,14 +473,14 @@ async function processCaptureQueue(): Promise<void> {
       }
       const existingCapture = await getCapture(job.id);
       if (existingCapture) {
+        job.state = 'leased';
+        job.leasedAt = Date.now();
+        await putJob(job);
         try {
           await completeProviderCapture(run.id, job.provider, job.id, captureIsDegraded(existingCapture));
           await deleteJob(job.id);
         } catch (error) {
           console.error(`Could not link the persisted ${job.provider} capture; retaining its recovery job.`, error);
-          job.state = 'leased';
-          job.leasedAt = Date.now();
-          await putJob(job).catch(() => undefined);
         }
         continue;
       }
@@ -497,7 +506,7 @@ async function processCaptureQueue(): Promise<void> {
           await containCaptureJobFailure(run.id, job.provider, error, persisted);
           continue;
         }
-        if (job.attempts >= MAX_CAPTURE_ATTEMPTS && job.domMarkdown.trim().length < 40) {
+        if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
           await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
           await containCaptureJobFailure(run.id, job.provider, error);
           continue;
@@ -651,33 +660,38 @@ async function reconcileRuns(): Promise<void> {
     setKnownRunTabs(runs);
     for (const snapshot of runs.filter((item) => item.status !== 'complete')) {
       if (snapshot.browserSessionId !== browserSessionId) {
-        const recoveredJobIds: string[] = [];
         for (const providerRun of Object.values(snapshot.providerRuns)) {
           if (isTerminalProviderStatus(providerRun.status)) continue;
           const id = captureId(snapshot.id, providerRun.provider);
           const capture = await getCapture(id);
           if (capture) {
-            providerRun.captureId = id;
-            providerRun.degraded ||= captureIsDegraded(capture);
-            providerRun.status = 'complete';
-            providerRun.statusDetail = undefined;
-            providerRun.completedAt ??= Date.now();
-            recoveredJobIds.push(id);
+            await mutateStoredRun(snapshot.id, (storedRun) => {
+              const currentProviderRun = storedRun.providerRuns[providerRun.provider];
+              if (!currentProviderRun || isTerminalProviderStatus(currentProviderRun.status)) return;
+              currentProviderRun.status = 'capturing';
+              currentProviderRun.statusDetail = 'Linking a saved report after browser restart.';
+              storedRun.status = deriveRunStatus(storedRun);
+            });
+            await completeProviderCapture(snapshot.id, providerRun.provider, id, captureIsDegraded(capture));
+            await deleteJob(id).catch(() => undefined);
             continue;
           }
-          if (await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) {
-            providerRun.status = 'capturing';
-            providerRun.statusDetail = 'Saving a detected report after browser restart.';
-            providerRun.completedAt = undefined;
-            continue;
-          }
-          providerRun.status = 'interrupted';
-          providerRun.statusDetail = 'Browser restarted before completion.';
-          providerRun.completedAt ??= Date.now();
+          const captureQueued = await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider);
+          await mutateStoredRun(snapshot.id, (storedRun) => {
+            const currentProviderRun = storedRun.providerRuns[providerRun.provider];
+            if (!currentProviderRun || isTerminalProviderStatus(currentProviderRun.status)) return;
+            if (captureQueued) {
+              currentProviderRun.status = 'capturing';
+              currentProviderRun.statusDetail = 'Saving a detected report after browser restart.';
+              currentProviderRun.completedAt = undefined;
+            } else {
+              currentProviderRun.status = 'interrupted';
+              currentProviderRun.statusDetail = 'Browser restarted before completion.';
+              currentProviderRun.completedAt ??= Date.now();
+            }
+            storedRun.status = deriveRunStatus(storedRun);
+          });
         }
-        snapshot.status = deriveRunStatus(snapshot);
-        await putRun(snapshot);
-        await Promise.all(recoveredJobIds.map((id) => deleteJob(id).catch(() => undefined)));
         const latest = await getRun(snapshot.id);
         if (latest) await maybeFinalize(latest);
         continue;
@@ -694,8 +708,11 @@ async function reconcileRuns(): Promise<void> {
           valid = false;
         }
         if (!valid && await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) continue;
-        await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
-        if (providerPage) await startContent(snapshot, providerRun.provider, true);
+        const checkedRun = await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
+        const checkedProviderRun = checkedRun.providerRuns[providerRun.provider];
+        if (providerPage && checkedProviderRun && !isTerminalProviderStatus(checkedProviderRun.status)) {
+          await startContent(checkedRun, providerRun.provider, shouldResumeContentOnly(checkedProviderRun.status));
+        }
       }
       const latest = await getRun(snapshot.id);
       if (latest) await maybeFinalize(latest);
@@ -787,7 +804,8 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
           const browserSessionId = await getBrowserSessionId();
           const run = runs.find((candidate) => candidate.browserSessionId === browserSessionId
             && candidate.providerRuns[message.provider]?.tabId === tabId);
-          if (run) void startContent(run, message.provider, true);
+          const providerRun = run?.providerRuns[message.provider];
+          if (run && providerRun) void startContent(run, message.provider, shouldResumeContentOnly(providerRun.status));
         }
         return { ok: true };
       }

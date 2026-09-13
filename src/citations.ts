@@ -73,6 +73,15 @@ export function tokenSimilarity(a: string, b: string): number {
   return (2 * common) / (left.size + right.size);
 }
 
+export function tokenContainment(candidate: string, reference: string): number {
+  const candidateTokens = tokens(candidate);
+  const referenceTokens = tokens(reference);
+  if (!candidateTokens.size || !referenceTokens.size) return 0;
+  let common = 0;
+  for (const token of referenceTokens) if (candidateTokens.has(token)) common += 1;
+  return common / referenceTokens.size;
+}
+
 function sentenceInsertionOffset(markdown: string, approximate: number): number {
   const after = markdown.slice(approximate, approximate + 120);
   const punctuation = after.search(/[.!?](?:["')\]]*)\s/);

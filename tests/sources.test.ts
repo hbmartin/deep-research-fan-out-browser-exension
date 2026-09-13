@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureGrokResearchTrail, normalizeResearchTrail } from '../src/sources';
 import type { CapturedResearchTrail, Citation } from '../src/types';
 
@@ -28,6 +28,7 @@ function sidebarHtml(): string {
 
 describe('Grok Sources sidebar capture', () => {
   beforeEach(() => { document.body.replaceChildren(); });
+  afterEach(() => { vi.useRealTimers(); });
 
   it('captures the inspected seven-search, 74-result shape and globally deduplicates it', async () => {
     document.body.innerHTML = `<button aria-label="74 sources"></button>${sidebarHtml()}`;
@@ -79,6 +80,25 @@ describe('Grok Sources sidebar capture', () => {
     expect(document.querySelector('aside')).toBeNull();
   });
 
+  it('gives later search groups time to render after an earlier group stalls', async () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = `<aside><div>Sources</div>${searchGroup('web', 'stalled query', [1], 1)}${searchGroup('web', 'later query', [2], 2)}</aside>`;
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-controls]'));
+    buttons[0]!.querySelector('span')!.textContent = '2';
+    const laterPanel = document.querySelector<HTMLElement>('#group-2')!;
+    laterPanel.remove();
+    buttons[1]!.setAttribute('aria-expanded', 'false');
+    buttons[1]!.addEventListener('click', () => {
+      setTimeout(() => document.querySelector('aside')!.append(laterPanel), 25);
+    }, { once: true });
+
+    const pending = captureGrokResearchTrail(document, undefined, 100);
+    await vi.runAllTimersAsync();
+    const captured = await pending;
+    expect(captured.searches[0]?.results).toHaveLength(1);
+    expect(captured.searches[1]?.results).toHaveLength(1);
+  });
+
   it('keeps partial source data and reports count mismatches', () => {
     const captured: CapturedResearchTrail = {
       reportedResultCount: 2,
@@ -93,5 +113,22 @@ describe('Grok Sources sidebar capture', () => {
     expect(trail.sources).toHaveLength(1);
     expect(trail.complete).toBe(false);
     expect(trail.warnings.join(' ')).toContain('Expected 2 total search results but captured 1');
+  });
+
+  it('does not duplicate mismatch warnings already recorded during capture', () => {
+    const captured: CapturedResearchTrail = {
+      reportedResultCount: 2,
+      searches: [{
+        kind: 'web', query: 'partial', expectedResultCount: 2,
+        results: [{ url: 'https://example.com/one', title: 'One' }],
+      }],
+      openedPages: [],
+      warnings: [
+        'The web search “partial” reported 2 results but 1 were captured.',
+        'Grok reported 2 sources but 1 search results were captured.',
+      ],
+    };
+    const trail = normalizeResearchTrail(captured, []);
+    expect(trail.warnings).toEqual(captured.warnings);
   });
 });

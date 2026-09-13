@@ -66,15 +66,29 @@ describe('provider DOM capture', () => {
     visible(report.firstElementChild as HTMLElement);
     document.body.replaceChildren(report);
     expect(findElement(ADAPTERS.claude.selectors.quotaNotice, document, [report])).toBeNull();
+    expect(isQuotaResponse(report, ADAPTERS.claude.quotaResponsePattern)).toBe(false);
+
+    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Research suggests the available evidence is limited by sample size.' });
+    expect(isQuotaResponse(report, ADAPTERS.grok.quotaResponsePattern)).toBe(false);
+    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Before the deep research, is there a budget limit?' });
+    expect(isQuotaResponse(report, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(false);
 
     Object.defineProperty(report, 'innerText', { configurable: true, value: 'Before I begin, could you specify the target market?' });
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
+    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Great — before I begin, could you clarify the target market?' });
+    expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
+    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Thanks! Could you specify the target market?' });
+    expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
     Object.defineProperty(report, 'innerText', { configurable: true, value: `Before I begin, ${'long report '.repeat(70)}` });
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
+    Object.defineProperty(report, 'innerText', { configurable: true, value: `Clarification of GDPR Article 6. ${'report '.repeat(1000)}` });
+    expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(false);
     Object.defineProperty(report, 'innerText', { configurable: true, value: 'The report cites a passage saying before I begin.' });
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(false);
     Object.defineProperty(report, 'innerText', { configurable: true, value: 'Your deep research limit has been reached.' });
     expect(isQuotaResponse(report, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(true);
+    Object.defineProperty(report, 'innerText', { configurable: true, value: "You've reached your usage limit." });
+    expect(isQuotaResponse(report, ADAPTERS.claude.quotaResponsePattern)).toBe(true);
     Object.defineProperty(report, 'innerText', { configurable: true, value: 'Starting research across the requested sources…' });
     expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern)).toBe(true);
   });
@@ -105,7 +119,7 @@ describe('provider DOM capture', () => {
     expect(isNewFinalResponse(current, baseline)).toBe(true);
   });
 
-  it('requires a copy control and stable response contents for the full debounce', () => {
+  it('prefers a copy control but permits a long stable DOM-only response after an extended debounce', () => {
     const response = document.createElement('article');
     response.textContent = 'Starting research…';
     expect(evaluateStableResponse(response, false, undefined, 1000, 10_000)).toEqual({ ready: false });
@@ -115,5 +129,11 @@ describe('provider DOM capture', () => {
     const changed = evaluateStableResponse(response, true, initial.candidate, 11_000, 10_000);
     expect(changed.ready).toBe(false);
     expect(evaluateStableResponse(response, true, changed.candidate, 21_000, 10_000).ready).toBe(true);
+
+    response.textContent = 'Detailed research result. '.repeat(50);
+    const domOnly = evaluateStableResponse(response, false, undefined, 30_000, 10_000);
+    expect(domOnly.ready).toBe(false);
+    expect(evaluateStableResponse(response, false, domOnly.candidate, 59_999, 10_000).ready).toBe(false);
+    expect(evaluateStableResponse(response, false, domOnly.candidate, 60_000, 10_000).ready).toBe(true);
   });
 });

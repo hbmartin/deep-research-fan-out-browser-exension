@@ -27,6 +27,8 @@ let observer: MutationObserver | undefined;
 let sweepTimer: number | undefined;
 let inspectionScheduled = false;
 let captureInFlight = false;
+let captureFailureCount = 0;
+let captureRetryAt = 0;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -147,9 +149,9 @@ async function capture(root: HTMLElement): Promise<void> {
         await delay(100);
         after = domCitationInventory(root, capturingRun.adapter);
       } while (Date.now() - started < 1000 && after.length === before.length);
-      if (initialToggleState === 'unknown' && after.length < before.length) {
+      if (initialToggleState === 'unknown') {
         toggle.click();
-        after = before;
+        if (after.length < before.length) after = before;
       }
     }
     try {
@@ -170,14 +172,24 @@ async function capture(root: HTMLElement): Promise<void> {
       }
       throw error;
     }
-    if (active?.id === capturingRun.id) active.captureSent = true;
+    if (active?.id === capturingRun.id) {
+      active.captureSent = true;
+      captureFailureCount = 0;
+      captureRetryAt = 0;
+    }
+  } catch (error) {
+    if (active?.id === capturingRun.id) {
+      captureFailureCount += 1;
+      captureRetryAt = Date.now() + Math.min(60_000, 5000 * 2 ** (captureFailureCount - 1));
+    }
+    throw error;
   } finally {
     captureInFlight = false;
   }
 }
 
 function inspectPage(): void {
-  if (!active || active.captureSent) return;
+  if (!active || active.captureSent || Date.now() < captureRetryAt) return;
   const { adapter } = active;
   const finalRoots = findAll(adapter.selectors.finalMessageRoot);
   if (location.origin !== adapter.origin) {
@@ -198,11 +210,6 @@ function inspectPage(): void {
   }
   const latestResponse = finalRoots.at(-1) ?? null;
   const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
-  if (isQuotaResponse(newResponse, adapter.quotaResponsePattern)) {
-    void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
-    stopMonitoring();
-    return;
-  }
   if (isProgressResponse(newResponse, adapter.progressResponsePattern)) {
     active.completionCandidate = undefined;
     if (active.status !== 'researching') void report('researching');
@@ -217,6 +224,11 @@ function inspectPage(): void {
   if (streaming) {
     active.completionCandidate = undefined;
     if (active.status === 'awaiting_user' || active.status === 'manual_required') void report('researching');
+    return;
+  }
+  if (isQuotaResponse(newResponse, adapter.quotaResponsePattern)) {
+    void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
+    stopMonitoring();
     return;
   }
   const root = newResponse;
@@ -263,10 +275,14 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     active.copyButtonBaseline = new Set(findAll(active.adapter.selectors.copyButton));
     active.captureSent = false;
     active.automationStarted = true;
+    captureFailureCount = 0;
+    captureRetryAt = 0;
     await automate();
     return;
   }
   stopMonitoring();
+  captureFailureCount = 0;
+  captureRetryAt = 0;
   const adapter = ADAPTERS[event.provider];
   const resumeExistingResponse = event.resumeOnly && !['opening', 'awaiting_ready', 'setting_mode', 'submitting'].includes(event.status);
   const finalResponseBaseline = createFinalResponseBaseline(resumeExistingResponse ? [] : findAll(adapter.selectors.finalMessageRoot));

@@ -148,13 +148,12 @@ export async function captureGrokResearchTrail(
   timeoutMs = 5000,
 ): Promise<CapturedResearchTrail> {
   const warnings: string[] = [];
-  const deadline = Date.now() + timeoutMs;
   const total = toggle ? reportedCount(toggle) : undefined;
   let sidebar = findSourcesSidebar(document);
   const openedByCapture = !sidebar && Boolean(toggle);
   if (!sidebar && toggle) {
     toggle.click();
-    sidebar = await waitFor(() => findSourcesSidebar(document), Math.min(deadline, Date.now() + 3000));
+    sidebar = await waitFor(() => findSourcesSidebar(document), Date.now() + Math.min(timeoutMs, 3000));
   }
   if (!sidebar) {
     warnings.push(toggle ? 'Grok Sources sidebar did not open.' : 'Grok Sources control was not found.');
@@ -164,6 +163,7 @@ export async function captureGrokResearchTrail(
   const buttons = searchButtons(sidebar);
   if (!buttons.length) warnings.push('No Grok search groups were found in the Sources sidebar.');
   const searches: CapturedSearch[] = [];
+  const groupWaitMs = Math.max(50, Math.floor(timeoutMs / Math.max(1, buttons.length)));
   for (const button of buttons) {
     const parsed = parseSearchButton(button);
     if (!parsed) {
@@ -171,9 +171,10 @@ export async function captureGrokResearchTrail(
       continue;
     }
     if (button.getAttribute('aria-expanded') !== 'true') button.click();
+    const groupDeadline = Date.now() + groupWaitMs;
     const panelId = button.getAttribute('aria-controls');
     const panel = panelId
-      ? await waitFor(() => document.getElementById(panelId) as HTMLElement | null || undefined, deadline)
+      ? await waitFor(() => document.getElementById(panelId) as HTMLElement | null || undefined, groupDeadline)
       : undefined;
     if (!panel) {
       warnings.push(`The ${parsed.kind} search “${parsed.query}” did not expose a results panel.`);
@@ -182,7 +183,7 @@ export async function captureGrokResearchTrail(
     }
     const readResults = () => parsed.kind === 'web' ? webResults(panel) : xResults(panel);
     let results = readResults();
-    while (results.length < parsed.expectedResultCount && Date.now() < deadline) {
+    while (results.length < parsed.expectedResultCount && Date.now() < groupDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       results = readResults();
     }
@@ -247,7 +248,8 @@ export function normalizeResearchTrail(captured: CapturedResearchTrail, citation
       const source = merge(candidate, index);
       return source ? [source.id] : [];
     });
-    if (sourceIds.length !== search.expectedResultCount) {
+    const mismatchAlreadyReported = warnings.some((warning) => warning.includes(`search “${search.query}” reported`));
+    if (sourceIds.length !== search.expectedResultCount && !mismatchAlreadyReported) {
       warnings.push(`Search ${index} expected ${search.expectedResultCount} results but captured ${sourceIds.length}.`);
     }
     return {
@@ -264,7 +266,8 @@ export function normalizeResearchTrail(captured: CapturedResearchTrail, citation
   const capturedResultCount = searches.reduce((sum, search) => sum + search.capturedResultCount, 0);
   const expectedResultCount = captured.reportedResultCount
     ?? searches.reduce((sum, search) => sum + search.expectedResultCount, 0);
-  if (capturedResultCount !== expectedResultCount) {
+  const totalMismatchAlreadyReported = warnings.some((warning) => warning.includes(`Grok reported ${expectedResultCount} sources`));
+  if (capturedResultCount !== expectedResultCount && !totalMismatchAlreadyReported) {
     warnings.push(`Expected ${expectedResultCount} total search results but captured ${capturedResultCount}.`);
   }
   const uniqueWarnings = [...new Set(warnings)];

@@ -39,7 +39,7 @@ beforeEach(() => {
   platform.downloadText.mockReset().mockImplementation(async () => downloadId++);
   platform.readClipboard.mockReset().mockResolvedValue('');
   platform.writeClipboard.mockReset().mockResolvedValue(undefined);
-  platform.notify.mockClear();
+  platform.notify.mockReset().mockResolvedValue(undefined);
   platform.setBadge.mockClear();
   platform.sendTabEvent.mockReset().mockResolvedValue(undefined);
   tabsGet.mockReset();
@@ -278,6 +278,25 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(privateText);
   });
 
+  it('accepts copy-only capture after focusing an idle provider when DOM extraction is empty', async () => {
+    vi.useFakeTimers();
+    const privateText = 'Previously copied private material that should be restored.';
+    const report = 'A complete provider report copied after the extension focused its idle tab.';
+    let clipboard = privateText;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => { clipboard = report; });
+    const job: CaptureJob = {
+      id: 'run:claude', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toMatchObject({ text: report, restored: true });
+    expect(browser.tabs.update).toHaveBeenCalledWith(2, { active: true });
+    expect(clipboard).toBe(privateText);
+  });
+
   it('rejects unrelated clipboard text copied concurrently with provider capture', async () => {
     vi.useFakeTimers();
     const original = 'The original clipboard value that should survive the failed capture.';
@@ -327,6 +346,66 @@ describe('coordinator run guards', () => {
     expect(await nextCaptureJob()).toBeUndefined();
   });
 
+  it('does not redownload when idempotently relinking the same completed capture', async () => {
+    const chatgpt = provider('chatgpt', 920, 'complete');
+    const stored = run({ chatgpt }, 'complete');
+    const id = `${stored.id}:chatgpt`;
+    stored.completedAt = 123;
+    chatgpt.captureId = id;
+    chatgpt.downloadedAt = 123;
+    chatgpt.downloadId = 99;
+    await putRun(stored);
+    await putCapture(id, {
+      rawMarkdown: 'Persisted report', normalizedMarkdown: 'Persisted report', citations: [],
+      captureMethod: 'copy_only', unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    });
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 920, state: 'queued',
+      createdAt: 1, attempts: 1, domMarkdown: 'Persisted report', domCitations: [],
+    });
+    await coordinatorTestHooks.processCaptureQueue();
+    expect(platform.downloadText).not.toHaveBeenCalled();
+    expect(platform.notify).not.toHaveBeenCalled();
+    expect(await getRun(stored.id)).toMatchObject({ completedAt: 123, providerRuns: { chatgpt: { downloadedAt: 123, downloadId: 99 } } });
+  });
+
+  it('leases an existing capture job before retrying a failed link', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 921, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    await putCapture(id, {
+      rawMarkdown: 'Persisted report', normalizedMarkdown: 'Persisted report', citations: [],
+      captureMethod: 'copy_only', unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    });
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 921, state: 'queued',
+      createdAt: 1, attempts: 1, domMarkdown: 'Persisted report', domCitations: [],
+    });
+    platform.notify.mockRejectedValueOnce(new Error('Notification failed'));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await coordinatorTestHooks.processCaptureQueue();
+    consoleError.mockRestore();
+    expect(await nextCaptureJob()).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('complete');
+  });
+
+  it('fails and removes a persistently invalid capture job after the attempt limit', async () => {
+    const stored = run({ grok: provider('grok', 922, 'capturing') });
+    const id = `${stored.id}:grok`;
+    await putRun(stored);
+    await putJob({
+      id, runId: stored.id, provider: 'grok', tabId: 922, state: 'queued',
+      createdAt: 1, attempts: MAX_CAPTURE_ATTEMPTS - 1, tabUnavailable: true,
+      domMarkdown: 'A long enough DOM report whose malformed source metadata cannot be normalized.', domCitations: [],
+      researchTrail: { searches: null, openedPages: [], warnings: [] } as unknown as NonNullable<CaptureJob['researchTrail']>,
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await coordinatorTestHooks.processCaptureQueue();
+    consoleError.mockRestore();
+    expect(await nextCaptureJob()).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.grok?.status).toBe('failed');
+  });
+
   it('processes later queued providers when an earlier one requires DOM fallback', async () => {
     const stored = run({
       chatgpt: provider('chatgpt', 914, 'capturing'),
@@ -359,6 +438,20 @@ describe('coordinator run guards', () => {
     expect(platform.sendTabEvent).not.toHaveBeenCalledWith(916, expect.objectContaining({ type: 'content:start' }));
   });
 
+  it('links a prior-session persisted capture through the serialized completion path', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 925, 'researching') });
+    const id = `${stored.id}:chatgpt`;
+    stored.browserSessionId = 'prior-session';
+    await putRun(stored);
+    await putCapture(id, {
+      rawMarkdown: 'Recovered report', normalizedMarkdown: 'Recovered report', citations: [],
+      captureMethod: 'copy_only', unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    });
+    await coordinatorTestHooks.reconcileRuns();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', captureId: id });
+    expect(platform.notify).toHaveBeenCalledWith(`complete:${stored.id}:chatgpt`, 'ChatGPT finished', expect.any(String));
+  });
+
   it('uses monitor-only resume when a provider content script reloads', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 917, 'researching') });
     await putRun(stored);
@@ -371,6 +464,18 @@ describe('coordinator run guards', () => {
     })));
   });
 
+  it('retries automation when an opening provider content script says hello', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 923, 'opening') });
+    await putRun(stored);
+    await coordinatorTestHooks.handleRequest(
+      { type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/' },
+      { tab: { id: 923 } } as Browser.runtime.MessageSender,
+    );
+    await vi.waitFor(() => expect(platform.sendTabEvent).toHaveBeenCalledWith(923, expect.objectContaining({
+      type: 'content:start', resumeOnly: false, status: 'opening',
+    })));
+  });
+
   it('reattaches monitor-only capture using the persisted researching phase during reconciliation', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 919, 'researching') });
     await putRun(stored);
@@ -379,6 +484,22 @@ describe('coordinator run guards', () => {
     expect(platform.sendTabEvent).toHaveBeenCalledWith(919, expect.objectContaining({
       type: 'content:start', resumeOnly: true, status: 'researching',
     }));
+  });
+
+  it('does not send a stale resume after the provider becomes terminal during reconciliation', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 924, 'researching') });
+    await putRun(stored);
+    tabsGet.mockImplementation(async () => {
+      await coordinatorTestHooks.mutateStoredRun(stored.id, (current) => {
+        current.providerRuns.chatgpt!.status = 'complete';
+        current.providerRuns.chatgpt!.completedAt = 1;
+        current.status = 'complete';
+        current.completedAt = 1;
+      });
+      return { id: 924, url: 'https://chatgpt.com/c/1' } as Browser.tabs.Tab;
+    });
+    await coordinatorTestHooks.reconcileRuns();
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(924, expect.objectContaining({ type: 'content:start' }));
   });
 
   it('returns a terminal error code when an ended provider retries capture delivery', async () => {

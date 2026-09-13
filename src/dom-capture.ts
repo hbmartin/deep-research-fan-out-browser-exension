@@ -3,6 +3,9 @@ import { normalizeUrl } from './citations';
 import { findAll } from './selectors';
 import type { DomCitation } from './types';
 
+const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
+const DOM_ONLY_COMPLETION_MIN_MS = 30_000;
+
 export function normalizeVisibleText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
@@ -73,7 +76,7 @@ function isResponseMatch(root: HTMLElement | null, pattern?: RegExp, maximumLeng
 }
 
 export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
-  return isResponseMatch(root, pattern);
+  return isResponseMatch(root, pattern, 5000);
 }
 
 export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
@@ -112,12 +115,15 @@ export function evaluateStableResponse(
   now: number,
   debounceMs: number,
 ): { candidate?: StableResponseCandidate; ready: boolean } {
-  if (!root || !copyAvailable) return { ready: false };
+  if (!root) return { ready: false };
+  const text = normalizeVisibleText(root.innerText || root.textContent || '');
+  if (!copyAvailable && text.length < DOM_ONLY_COMPLETION_MIN_CHARS) return { ready: false };
   const fingerprint = finalResponseFingerprint(root);
   if (candidate?.fingerprint !== fingerprint) {
     return { candidate: { fingerprint, since: now }, ready: false };
   }
-  return { candidate, ready: now - candidate.since >= debounceMs };
+  const requiredStabilityMs = copyAvailable ? debounceMs : Math.max(DOM_ONLY_COMPLETION_MIN_MS, debounceMs * 3);
+  return { candidate, ready: now - candidate.since >= requiredStabilityMs };
 }
 
 export function createFinalResponseBaseline(roots: readonly HTMLElement[]): FinalResponseBaseline {
