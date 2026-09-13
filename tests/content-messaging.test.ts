@@ -25,6 +25,13 @@ describe('provider content messaging', () => {
     await expect(sendContentMessage({ type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/' })).resolves.toBeUndefined();
   });
 
+  it('does not acknowledge capture delivery when the coordinator returns no response', async () => {
+    vi.stubGlobal('browser', { runtime: { sendMessage: vi.fn(async () => undefined) } });
+    await expect(sendContentMessage({
+      type: 'content:capture', runId: 'run', provider: 'chatgpt', domMarkdown: 'report', domCitations: [],
+    })).rejects.toThrow('not acknowledged');
+  });
+
   it('preserves terminal-provider error codes for non-retryable capture rejection', async () => {
     vi.stubGlobal('browser', {
       runtime: { sendMessage: vi.fn(async () => ({ ok: false, error: 'ended', code: 'provider_terminal' })) },

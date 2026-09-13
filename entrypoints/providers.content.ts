@@ -134,7 +134,6 @@ async function capture(root: HTMLElement): Promise<void> {
   captureInFlight = true;
   const capturingRun = active;
   try {
-    await report('capturing');
     const before = domCitationInventory(root, capturingRun.adapter);
     const toggle = capturingRun.adapter.selectors.sourcesPanelToggle && (findElement(capturingRun.adapter.selectors.sourcesPanelToggle, root) || findElement(capturingRun.adapter.selectors.sourcesPanelToggle));
     let after = before;
@@ -203,14 +202,20 @@ function inspectPage(): void {
     return;
   }
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
+  const latestResponse = finalRoots.at(-1) ?? null;
+  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
+  const streaming = findElement(adapter.selectors.streamingIndicator);
+  if (active.status === 'manual_required' && (newResponse || streaming || plan)) void report('researching');
   if (plan) {
     if (active.geminiAutoApprove) plan.click();
     else if (active.status !== 'awaiting_user') void report('awaiting_user', 'Approve the Gemini research plan to continue.');
     return;
   }
-  const latestResponse = finalRoots.at(-1) ?? null;
-  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
-  if (isProgressResponse(newResponse, adapter.progressResponsePattern)) {
+  const root = newResponse;
+  const scopedCopy = root ? findElement(adapter.selectors.copyButton, root) : null;
+  const globalCopy = root ? findElement(adapter.selectors.copyButton) : null;
+  const copy = scopedCopy || (globalCopy && !active.copyButtonBaseline.has(globalCopy) ? globalCopy : null);
+  if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy))) {
     active.completionCandidate = undefined;
     if (active.status !== 'researching') void report('researching');
     return;
@@ -220,7 +225,6 @@ function inspectPage(): void {
     if (active.status !== 'awaiting_user') void report('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
-  const streaming = findElement(adapter.selectors.streamingIndicator);
   if (streaming) {
     active.completionCandidate = undefined;
     if (active.status === 'awaiting_user' || active.status === 'manual_required') void report('researching');
@@ -231,10 +235,6 @@ function inspectPage(): void {
     stopMonitoring();
     return;
   }
-  const root = newResponse;
-  const scopedCopy = root ? findElement(adapter.selectors.copyButton, root) : null;
-  const globalCopy = root ? findElement(adapter.selectors.copyButton) : null;
-  const copy = scopedCopy || (globalCopy && !active.copyButtonBaseline.has(globalCopy) ? globalCopy : null);
   const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, Date.now(), active.completionDebounceMs);
   active.completionCandidate = completion.candidate;
   if (completion.ready && root) {
@@ -284,7 +284,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   captureFailureCount = 0;
   captureRetryAt = 0;
   const adapter = ADAPTERS[event.provider];
-  const resumeExistingResponse = event.resumeOnly && !['opening', 'awaiting_ready', 'setting_mode', 'submitting'].includes(event.status);
+  const resumeExistingResponse = event.resumeOnly && !['opening', 'awaiting_ready', 'setting_mode'].includes(event.status);
   const finalResponseBaseline = createFinalResponseBaseline(resumeExistingResponse ? [] : findAll(adapter.selectors.finalMessageRoot));
   const copyButtonBaseline = new Set(resumeExistingResponse ? [] : findAll(adapter.selectors.copyButton));
   active = {
@@ -294,12 +294,15 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     geminiAutoApprove: event.geminiAutoApprove,
     completionDebounceMs: event.completionDebounceMs,
     status: event.status,
-    captureSent: event.status === 'capturing',
+    captureSent: event.captureAccepted === true,
     finalResponseBaseline,
     copyButtonBaseline,
     automationStarted: !event.resumeOnly,
   };
   if (event.resumeOnly) {
+    if (event.status === 'submitting' && !active.captureSent) {
+      await report('manual_required', 'Submission could not be confirmed after reload. Check the provider tab before sending again.');
+    }
     if (!active.captureSent) beginMonitoring();
     return;
   }

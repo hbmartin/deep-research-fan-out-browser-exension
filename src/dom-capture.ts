@@ -79,8 +79,14 @@ export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp)
   return isResponseMatch(root, pattern, 5000);
 }
 
-export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
-  return isResponseMatch(root, pattern, 1000);
+export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, copyAvailable = false): boolean {
+  if (!root) return false;
+  const content = root.cloneNode(true) as HTMLElement;
+  content.querySelectorAll('button, svg, [aria-hidden="true"]').forEach((element) => element.remove());
+  const hasReportBody = Array.from(content.querySelectorAll('p, li, table'))
+    .some((element) => normalizeVisibleText(element.textContent ?? '').length >= 80);
+  if (copyAvailable && content.querySelector('h1, h2, h3') && hasReportBody) return false;
+  return isResponseMatch(content, pattern, 1000);
 }
 
 export function isQuotaResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
