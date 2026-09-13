@@ -1,10 +1,11 @@
 import type { ProviderAdapter } from './adapters';
 import { normalizeUrl } from './citations';
-import { findAll } from './selectors';
+import { cloneVisibleContent, findAll, isEffectivelyHidden } from './selectors';
 import type { DomCitation } from './types';
 
 const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
 const DOM_ONLY_COMPLETION_MIN_MS = 30_000;
+const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea';
 
 export function normalizeVisibleText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
@@ -67,30 +68,52 @@ export function shouldOpenSourceToggle(toggle: HTMLElement): boolean {
   return sourceToggleState(toggle) !== 'expanded';
 }
 
-function isResponseMatch(root: HTMLElement | null, pattern?: RegExp, maximumLength?: number): boolean {
-  if (!root || !pattern) return false;
-  const text = normalizeVisibleText(root.innerText || root.textContent || '');
-  if (!text || (maximumLength !== undefined && text.length > maximumLength)) return false;
+export function cloneResponseContent(root: HTMLElement): HTMLElement {
+  return cloneVisibleContent(root, RESPONSE_CONTENT_EXCLUSIONS);
+}
+
+export interface ResponseSnapshot {
+  root: HTMLElement;
+  content: HTMLElement;
+  text: string;
+}
+
+export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
+  const content = cloneResponseContent(root);
+  return { root, content, text: normalizeVisibleText(content.textContent ?? '') };
+}
+
+function isTextMatch(text: string, pattern?: RegExp, maximumLength?: number): boolean {
+  if (!pattern || !text || (maximumLength !== undefined && text.length > maximumLength)) return false;
   pattern.lastIndex = 0;
   return pattern.test(text);
 }
 
-export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
-  return isResponseMatch(root, pattern, 5000);
+function isResponseMatch(root: HTMLElement | null, pattern?: RegExp, maximumLength?: number, snapshot?: ResponseSnapshot): boolean {
+  if (!root || !pattern) return false;
+  const text = snapshot?.root === root ? snapshot.text : createResponseSnapshot(root).text;
+  return isTextMatch(text, pattern, maximumLength);
 }
 
-export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, copyAvailable = false): boolean {
+export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp, snapshot?: ResponseSnapshot): boolean {
+  return isResponseMatch(root, pattern, 5000, snapshot);
+}
+
+export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, copyAvailable = false, snapshot?: ResponseSnapshot): boolean {
   if (!root) return false;
-  const content = root.cloneNode(true) as HTMLElement;
-  content.querySelectorAll('button, svg, [aria-hidden="true"]').forEach((element) => element.remove());
+  const response = snapshot?.root === root ? snapshot : createResponseSnapshot(root);
+  const { content, text } = response;
   const hasReportBody = Array.from(content.querySelectorAll('p, li, table'))
     .some((element) => normalizeVisibleText(element.textContent ?? '').length >= 80);
   if (copyAvailable && content.querySelector('h1, h2, h3') && hasReportBody) return false;
-  return isResponseMatch(content, pattern, 1000);
+  if (isTextMatch(text, pattern, 1000)) return true;
+  return Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+    .filter((button) => !isEffectivelyHidden(button))
+    .some((button) => isTextMatch(normalizeVisibleText(button.innerText || button.textContent || ''), pattern, 1000));
 }
 
-export function isQuotaResponse(root: HTMLElement | null, pattern?: RegExp): boolean {
-  return isResponseMatch(root, pattern, 2000);
+export function isQuotaResponse(root: HTMLElement | null, pattern?: RegExp, snapshot?: ResponseSnapshot): boolean {
+  return isResponseMatch(root, pattern, 2000, snapshot);
 }
 
 export interface FinalResponseBaseline {

@@ -43,7 +43,7 @@ const commonLogin: SelectorChain = [
   { kind: 'text', value: /log in to continue|sign in to continue/i },
 ];
 
-const commonProgressResponse = /^(?:i(?:['’]ll| will| am going to| am|['’]m) (?:start(?:ing)?|begin(?:ning)?|research(?:ing)?|search(?:ing)?|work(?:ing)?)\b|(?:starting|beginning|conducting|continuing)\s+(?:(?:the|your)\s+)?(?:deep\s+)?research\b|(?:researching|searching)(?:\s+(?:the web|sources))?\s*[.…]*$)/i;
+const commonProgressResponse = /^(?:i(?:['’]ll| will| am going to| am|['’]m)\s+(?:(?:start(?:ing)?|begin(?:ning)?)\s+(?:(?:the|your)\s+)?(?:deep\s+)?(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b|(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b)|(?:starting|beginning|conducting|continuing)\s+(?:(?:the|your)\s+)?(?:deep\s+)?research\b|(?:researching|searching)\b)(?:\s+[^.!?…]{0,200})?\s*[.!?…]*$/i;
 const commonQuotaResponse = /^(?:(?:sorry|unfortunately)[,.!]?\s*)?(?:(?:you(?:'ve| have)?|your account has)\s+)?(?:reached|hit|exceeded)\s+(?:your\s+)?(?:(?:deepsearch|deep research|research|usage)\s+)?limit\b|^(?:your\s+)?(?:deepsearch|deep research|research|usage)\s+limit\s+(?:has been\s+)?(?:reached|exceeded)\b|^(?:deepsearch|deep research|research)\s+(?:is\s+)?unavailable\b|^upgrade\b.{0,80}\b(?:deepsearch|deep research|research)\b/i;
 
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {

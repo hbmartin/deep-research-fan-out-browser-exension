@@ -18,6 +18,7 @@ const knownRunTabIds = new Set<number>();
 const expectedTabActivations = new Map<number, number>();
 const finalizingRunIds = new Set<string>();
 const runMutationTails = new Map<string, Promise<void>>();
+const captureMutationTails = new Map<string, Promise<void>>();
 let browserSessionIdPromise: Promise<string> | undefined;
 let fallbackBrowserSessionId: string | undefined;
 
@@ -70,6 +71,21 @@ async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Pro
   } finally {
     release();
     if (runMutationTails.get(runId) === tail) runMutationTails.delete(runId);
+  }
+}
+
+async function serializeCapture<T>(id: string, operation: () => Promise<T>): Promise<T> {
+  const previous = captureMutationTails.get(id)?.catch(() => undefined) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  captureMutationTails.set(id, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (captureMutationTails.get(id) === tail) captureMutationTails.delete(id);
   }
 }
 
@@ -131,25 +147,26 @@ async function updateBadge(runs: Run[]): Promise<void> {
 async function startContent(run: Run, provider: ProviderId, resumeOnly = false): Promise<void> {
   const providerRun = run.providerRuns[provider];
   if (!providerRun || isTerminalProviderStatus(providerRun.status)) return;
-  const settings = await loadSettings();
-  const id = captureId(run.id, provider);
-  const captureAccepted = Boolean(await getJob(id) || await getCapture(id));
-  const event = {
-    type: 'content:start',
-    runId: run.id,
-    provider,
-    query: run.query,
-    appendString: providerRun.appendString,
-    geminiAutoApprove: settings.geminiAutoApprove,
-    completionDebounceMs: settings.providers[provider].completionDebounceMs,
-    resumeOnly,
-    status: providerRun.status,
-    captureAccepted,
-  } as const;
   try {
-    await sendTabEvent(providerRun.tabId, event);
-  } catch {
+    const settings = await loadSettings();
+    const id = captureId(run.id, provider);
+    const captureAccepted = Boolean(await getJob(id) || await getCapture(id));
+    const event = {
+      type: 'content:start',
+      runId: run.id,
+      provider,
+      query: run.query,
+      appendString: providerRun.appendString,
+      geminiAutoApprove: settings.geminiAutoApprove,
+      completionDebounceMs: settings.providers[provider].completionDebounceMs,
+      resumeOnly,
+      status: providerRun.status,
+      captureAccepted,
+    } as const;
     try {
+      await sendTabEvent(providerRun.tabId, event);
+      return;
+    } catch {
       const extensionBrowser = browser as typeof browser & {
         scripting?: { executeScript(options: { target: { tabId: number }; files: string[] }): Promise<unknown> };
       };
@@ -157,9 +174,9 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       else await browser.tabs.executeScript(providerRun.tabId, { file: '/content-scripts/providers.js' });
       await new Promise((resolve) => setTimeout(resolve, 100));
       await sendTabEvent(providerRun.tabId, event);
-    } catch {
-      // The alarm sweep retries. A valid provider tab is kept open for manual use.
     }
+  } catch {
+    // The alarm sweep retries both storage reads and content-script startup.
   }
 }
 
@@ -296,7 +313,10 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
       observed = await platform.readClipboard();
       const resemblesDomReport = hasVerifiableDom
         && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
-      if (observed === sentinel || observed.trim().length < 40 || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
+      if (observed === sentinel
+        || (!hasVerifiableDom && observed === original)
+        || observed.trim().length < 40
+        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
         throw new Error('Provider copy did not produce a new report.');
       }
       let restored = false;
@@ -526,22 +546,25 @@ async function processCaptureQueue(): Promise<void> {
 }
 
 async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<void> {
-  const run = await getRun(request.runId);
-  const providerRun = run?.providerRuns[request.provider];
-  if (!run || !providerRun) throw new Error('Run not found for capture.');
-  if (isTerminalProviderStatus(providerRun.status)) {
-    throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
-  }
-  // A retry after a lost acknowledgement must not replace a leased payload.
-  if (await getJob(captureId(run.id, request.provider))) {
-    void processCaptureQueue();
-    return;
-  }
-  if (providerRun.status !== 'capturing') await mutateProvider(run.id, request.provider, 'capturing');
-  await putJob({
-    id: captureId(run.id, request.provider), runId: run.id, provider: request.provider,
-    tabId: providerRun.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
-    domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
+  const id = captureId(request.runId, request.provider);
+  await serializeCapture(id, async () => {
+    const run = await getRun(request.runId);
+    const providerRun = run?.providerRuns[request.provider];
+    if (!run || !providerRun) throw new Error('Run not found for capture.');
+    if (isTerminalProviderStatus(providerRun.status)) {
+      throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
+    }
+    // A retry after a lost acknowledgement must not replace a queued or leased payload.
+    if (await getJob(id)) {
+      await mutateProvider(run.id, request.provider, 'capturing');
+      return;
+    }
+    await mutateProvider(run.id, request.provider, 'capturing');
+    await putJob({
+      id, runId: run.id, provider: request.provider,
+      tabId: providerRun.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
+      domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
+    });
   });
   void processCaptureQueue();
 }
@@ -857,6 +880,7 @@ export const coordinatorTestHooks = {
   clipboardCapture,
   getBrowserSessionId,
   handleRequest,
+  serializeCapture,
   mutateStoredRun,
   maybeFinalize,
   recordReconcileCheck,
@@ -873,6 +897,7 @@ export const coordinatorTestHooks = {
   resetBrowserSession: () => {
     browserSessionIdPromise = undefined;
     fallbackBrowserSessionId = undefined;
+    captureMutationTails.clear();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };

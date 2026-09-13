@@ -129,6 +129,31 @@ describe('Grok Sources sidebar capture', () => {
     expect(trail.complete).toBe(true);
   });
 
+  it('reopens a production-style toggle without ownership ARIA after the prior sidebar closes visually', async () => {
+    document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside><div>Sources</div><button aria-label="Close"></button>${searchGroup('web', 'old query', [1], 1)}</aside>`;
+    const priorSidebar = document.querySelector<HTMLElement>('aside')!;
+    document.querySelector<HTMLButtonElement>('aside button')!.addEventListener('click', () => { priorSidebar.style.opacity = '0'; });
+    const toggle = document.querySelector<HTMLElement>('#target')!;
+    toggle.addEventListener('click', () => {
+      document.body.insertAdjacentHTML('beforeend', `<aside><div>Sources</div>${searchGroup('web', 'current query', [2], 2)}</aside>`);
+    });
+
+    const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, toggle, 50), []);
+    expect(trail.searches.map((search) => search.query)).toEqual(['current query']);
+    expect(trail.sources.map((source) => source.url)).toEqual(['https://web.example/source-2']);
+  });
+
+  it.each(['collapse', 'hidden'] as const)('ignores a stale sidebar with visibility: %s', async (visibility) => {
+    document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside style="visibility:${visibility}"><div>Sources</div>${searchGroup('web', 'stale query', [1], 1)}</aside>`;
+    const toggle = document.querySelector<HTMLElement>('#target')!;
+    toggle.addEventListener('click', () => {
+      document.body.insertAdjacentHTML('beforeend', `<aside><div>Sources</div>${searchGroup('web', 'current query', [2], 2)}</aside>`);
+    });
+
+    const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, toggle, 50), []);
+    expect(trail.searches.map((search) => search.query)).toEqual(['current query']);
+  });
+
   it('warns instead of exporting sources when sidebar ownership cannot be established', async () => {
     document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside><div>Sources</div>${searchGroup('web', 'old query', [1], 1)}</aside>`;
     const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, document.querySelector<HTMLElement>('#target'), 50), []);

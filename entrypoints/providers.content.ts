@@ -1,6 +1,6 @@
 import TurndownService from 'turndown';
-import { ADAPTERS, providerFromLocation, type ProviderAdapter } from '@/src/adapters';
-import { createFinalResponseBaseline, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
+import { ADAPTERS, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
+import { cloneResponseContent, createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent } from '@/src/messages';
@@ -122,11 +122,32 @@ async function automate(): Promise<void> {
 }
 
 function domToMarkdown(root: HTMLElement): string {
-  const clone = root.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll('button, script, style, svg, [aria-hidden="true"]').forEach((element) => element.remove());
+  const clone = cloneResponseContent(root);
   const turndown = new TurndownService({ headingStyle: 'atx', bulletListMarker: '-', codeBlockStyle: 'fenced' });
   turndown.addRule('removeUnsafe', { filter: ['form', 'input', 'textarea'], replacement: () => '' });
   return turndown.turndown(clone).trim();
+}
+
+export function findResponseControl(
+  root: HTMLElement,
+  responseRoots: readonly HTMLElement[],
+  selectors: SelectorChain,
+  baseline: ReadonlySet<HTMLElement> = new Set(),
+): HTMLElement | null {
+  const scoped = findElement(selectors, root);
+  if (scoped) return scoped;
+  const candidates = findAll(selectors).filter((candidate) => !baseline.has(candidate));
+  for (const candidate of [...candidates].reverse()) {
+    let container = root.parentElement;
+    for (let depth = 0; container && depth < 3; depth += 1, container = container.parentElement) {
+      if (container === document.body || container === document.documentElement) break;
+      if (!container.contains(candidate)) continue;
+      const containedResponses = responseRoots.filter((response) => container!.contains(response));
+      if (containedResponses.length === 1 && containedResponses[0] === root) return candidate;
+      break;
+    }
+  }
+  return null;
 }
 
 async function capture(root: HTMLElement): Promise<void> {
@@ -134,8 +155,12 @@ async function capture(root: HTMLElement): Promise<void> {
   captureInFlight = true;
   const capturingRun = active;
   try {
+    if (capturingRun.status !== 'capturing') await report('capturing');
     const before = domCitationInventory(root, capturingRun.adapter);
-    const toggle = capturingRun.adapter.selectors.sourcesPanelToggle && (findElement(capturingRun.adapter.selectors.sourcesPanelToggle, root) || findElement(capturingRun.adapter.selectors.sourcesPanelToggle));
+    const responseRoots = findAll(capturingRun.adapter.selectors.finalMessageRoot);
+    const toggle = capturingRun.adapter.selectors.sourcesPanelToggle
+      ? findResponseControl(root, responseRoots, capturingRun.adapter.selectors.sourcesPanelToggle)
+      : null;
     let after = before;
     const researchTrail = capturingRun.adapter.id === 'grok'
       ? await captureGrokResearchTrail(document, toggle)
@@ -188,15 +213,16 @@ async function capture(root: HTMLElement): Promise<void> {
 }
 
 function inspectPage(): void {
-  if (!active || active.captureSent || Date.now() < captureRetryAt) return;
+  if (!active || active.captureSent) return;
   const { adapter } = active;
-  const finalRoots = findAll(adapter.selectors.finalMessageRoot);
   if (location.origin !== adapter.origin) {
     void report('interrupted', 'Provider tab navigated away.');
     stopMonitoring();
     return;
   }
-  if (findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
+  if (captureInFlight) return;
+  const finalRoots = findAll(adapter.selectors.finalMessageRoot);
+  if (active.status !== 'capturing' && findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
     void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
     stopMonitoring();
     return;
@@ -205,39 +231,41 @@ function inspectPage(): void {
   const latestResponse = finalRoots.at(-1) ?? null;
   const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
   const streaming = findElement(adapter.selectors.streamingIndicator);
-  if (active.status === 'manual_required' && (newResponse || streaming || plan)) void report('researching');
+  if ((active.status === 'manual_required' || active.status === 'submitting') && (newResponse || streaming || plan)) void report('researching');
   if (plan) {
     if (active.geminiAutoApprove) plan.click();
     else if (active.status !== 'awaiting_user') void report('awaiting_user', 'Approve the Gemini research plan to continue.');
     return;
   }
   const root = newResponse;
-  const scopedCopy = root ? findElement(adapter.selectors.copyButton, root) : null;
-  const globalCopy = root ? findElement(adapter.selectors.copyButton) : null;
-  const copy = scopedCopy || (globalCopy && !active.copyButtonBaseline.has(globalCopy) ? globalCopy : null);
-  if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy))) {
+  if (streaming) {
     active.completionCandidate = undefined;
-    if (active.status !== 'researching') void report('researching');
+    if (active.status === 'awaiting_user') void report('researching');
     return;
   }
-  if (isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern)) {
+  const responseSnapshot = root ? createResponseSnapshot(root) : undefined;
+  if (active.status !== 'capturing' && isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern, responseSnapshot)) {
     active.completionCandidate = undefined;
     if (active.status !== 'awaiting_user') void report('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
-  if (streaming) {
-    active.completionCandidate = undefined;
-    if (active.status === 'awaiting_user' || active.status === 'manual_required') void report('researching');
-    return;
-  }
-  if (isQuotaResponse(newResponse, adapter.quotaResponsePattern)) {
+  if (active.status !== 'capturing' && isQuotaResponse(newResponse, adapter.quotaResponsePattern, responseSnapshot)) {
     void report('quota_exhausted', `${adapter.label} deep research limit reached.`);
     stopMonitoring();
+    return;
+  }
+  const copy = root
+    ? findResponseControl(root, finalRoots, adapter.selectors.copyButton, active.copyButtonBaseline)
+    : null;
+  if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy), responseSnapshot)) {
+    active.completionCandidate = undefined;
+    if (active.status === 'awaiting_user') void report('researching');
     return;
   }
   const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, Date.now(), active.completionDebounceMs);
   active.completionCandidate = completion.candidate;
   if (completion.ready && root) {
+    if (Date.now() < captureRetryAt) return;
     void capture(root).catch((error) => console.error('Could not deliver captured report to the coordinator.', error));
   }
 }
@@ -300,8 +328,17 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     automationStarted: !event.resumeOnly,
   };
   if (event.resumeOnly) {
-    if (event.status === 'submitting' && !active.captureSent) {
-      await report('manual_required', 'Submission could not be confirmed after reload. Check the provider tab before sending again.');
+    if (event.status === 'submitting') {
+      if (active.captureSent) return;
+      const finalRoots = findAll(adapter.selectors.finalMessageRoot);
+      const latestResponse = finalRoots.at(-1) ?? null;
+      const submissionContinues = Boolean(
+        isNewFinalResponse(latestResponse, active.finalResponseBaseline)
+        || findElement(adapter.selectors.streamingIndicator)
+        || (adapter.selectors.planApproval && findElement(adapter.selectors.planApproval)),
+      );
+      if (submissionContinues) await report('researching');
+      else await report('manual_required', 'Submission could not be confirmed after reload. Check the provider tab before sending again.');
     }
     if (!active.captureSent) beginMonitoring();
     return;
@@ -321,8 +358,9 @@ export default defineContentScript({
         return { ok: true };
       }
       if (message.type === 'capture:copy-now' && active) {
-        const root = findElement(active.adapter.selectors.finalMessageRoot);
-        const button = root ? findElement(active.adapter.selectors.copyButton, root) || findElement(active.adapter.selectors.copyButton) : null;
+        const roots = findAll(active.adapter.selectors.finalMessageRoot);
+        const root = roots.at(-1) ?? null;
+        const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton) : null;
         if (!button) throw new Error('Provider copy button is unavailable.');
         button.click();
         return { ok: true };
