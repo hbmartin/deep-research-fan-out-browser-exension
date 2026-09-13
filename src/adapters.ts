@@ -43,8 +43,11 @@ const commonLogin: SelectorChain = [
   { kind: 'text', value: /log in to continue|sign in to continue/i },
 ];
 
-const commonProgressResponse = /^(?:i(?:['’]ll| will| am going to| am|['’]m)\s+(?:(?:start(?:ing)?|begin(?:ning)?)\s+(?:(?:the|your)\s+)?(?:deep\s+)?(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b|(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b)|(?:starting|beginning|conducting|continuing)\s+(?:(?:the|your)\s+)?(?:deep\s+)?research\b|(?:researching|searching)\b)(?:\s+[^.!?…]{0,200})?\s*[.!?…]*$/i;
+const progressOpening = String.raw`(?:i(?:['’]ll| will| am going to| am|['’]m)\s+(?:(?:start(?:ing)?|begin(?:ning)?)\s+(?:(?:the|your)\s+)?(?:deep\s+)?(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b|(?:research(?:ing)?|search(?:ing)?|work(?:ing)?)\b)|(?:starting|beginning|conducting|continuing)\s+(?:(?:the|your)\s+)?(?:deep\s+)?research\b|(?:researching|searching)\b)`;
+const progressFollowup = String.raw`(?:(?:(?:this|that|it|the (?:research|search|process))\s+(?:may|might|can|could|will|should)\s+take\b|i(?:['’]ll| will)\s+(?:let you know|update you|return|be back)\b|please\s+(?:wait|hold on)\b)[^.!?…]{0,160}[.!?…]*)`;
+const commonProgressResponse = new RegExp(`^${progressOpening}(?:\\s+[^.!?…]{0,200})?\\s*[.!?…]*(?:\\s+${progressFollowup})?$`, 'i');
 const commonQuotaResponse = /^(?:(?:sorry|unfortunately)[,.!]?\s*)?(?:(?:you(?:'ve| have)?|your account has)\s+)?(?:reached|hit|exceeded)\s+(?:your\s+)?(?:(?:deepsearch|deep research|research|usage)\s+)?limit\b|^(?:your\s+)?(?:deepsearch|deep research|research|usage)\s+limit\s+(?:has been\s+)?(?:reached|exceeded)\b|^(?:deepsearch|deep research|research)\s+(?:is\s+)?unavailable\b|^upgrade\b.{0,80}\b(?:deepsearch|deep research|research)\b/i;
+const commonCopyButton: SelectorChain = [{ kind: 'aria', role: 'button', name: /^(?:copy|copy response)$/i, pick: 'last' }];
 
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
@@ -61,7 +64,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeConfirmed: [{ kind: 'css', value: '[data-testid="deep-research-pill"]' }, { kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep research" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep research" i]' }],
       streamingIndicator: [{ kind: 'testid', value: 'stop-button' }, { kind: 'aria', role: 'button', name: /stop generating|stop streaming/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-message-author-role="assistant"]', pick: 'last' }],
-      copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
+      copyButton: commonCopyButton,
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
       sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources|citations/i, pick: 'last' }],
       loginWall: commonLogin,
@@ -81,7 +84,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="research" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="research" i]' }, { kind: 'css', value: '[data-testid*="research"][aria-pressed="true"]' }],
       streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-is-streaming="false"]', pick: 'last' }, { kind: 'css', value: 'div[data-testid="assistant-message"]', pick: 'last' }],
-      copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
+      copyButton: commonCopyButton,
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
       loginWall: commonLogin,
       quotaNotice: [{ kind: 'text', value: commonQuotaResponse }],
@@ -99,9 +102,9 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /tools|deep research/i }, { kind: 'text', value: /deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deep research/i }, { kind: 'text', value: /^deep research$/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep research" i]' }, { kind: 'css', value: '[data-test-id="deep-research-chip"]' }, { kind: 'css', value: '[data-state="selected"][aria-label*="deep research" i]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: /researching|working on it/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: /^(?:researching|working on it)\s*(?:…|\.{1,3})?$/i }],
       finalMessageRoot: [{ kind: 'css', value: 'model-response', pick: 'last' }, { kind: 'css', value: '[data-test-id="model-response"]', pick: 'last' }],
-      copyButton: [{ kind: 'aria', role: 'button', name: /copy/i, pick: 'last' }],
+      copyButton: commonCopyButton,
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
       sourcesPanelToggle: [{ kind: 'aria', role: 'button', name: /sources/i, pick: 'last' }],
       loginWall: commonLogin,
@@ -120,7 +123,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /deepsearch|deep research|mode/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deepsearch|deep research/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-testid*="deep"][aria-pressed="true"]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /searching|thinking/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /^(?:searching|thinking)\s*(?:…|\.{1,3})?$/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-testid="assistant-message"]', pick: 'last' }, { kind: 'css', value: 'article', pick: 'last' }],
       copyButton: [{ kind: 'aria', role: 'button', name: /^copy response$/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],

@@ -78,9 +78,36 @@ export interface ResponseSnapshot {
   text: string;
 }
 
+const TEXT_BOUNDARY_ELEMENTS = new Set([
+  'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'BR', 'DD', 'DIV', 'DL', 'DT',
+  'FIGCAPTION', 'FIGURE', 'FOOTER', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HEADER', 'HGROUP', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION',
+  'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL',
+]);
+
+function structurallySeparatedText(root: HTMLElement): string {
+  let output = '';
+  const boundary = () => {
+    if (output && !/\s$/.test(output)) output += ' ';
+  };
+  const visit = (node: Node): void => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      output += node.textContent ?? '';
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    const separatesText = TEXT_BOUNDARY_ELEMENTS.has(node.tagName);
+    if (separatesText) boundary();
+    for (const child of Array.from(node.childNodes)) visit(child);
+    if (separatesText) boundary();
+  };
+  visit(root);
+  return normalizeVisibleText(output);
+}
+
 export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   const content = cloneResponseContent(root);
-  return { root, content, text: normalizeVisibleText(content.textContent ?? '') };
+  return { root, content, text: structurallySeparatedText(content) };
 }
 
 function isTextMatch(text: string, pattern?: RegExp, maximumLength?: number): boolean {
@@ -107,6 +134,7 @@ export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, c
     .some((element) => normalizeVisibleText(element.textContent ?? '').length >= 80);
   if (copyAvailable && content.querySelector('h1, h2, h3') && hasReportBody) return false;
   if (isTextMatch(text, pattern, 1000)) return true;
+  if (text) return false;
   return Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
     .filter((button) => !isEffectivelyHidden(button))
     .some((button) => isTextMatch(normalizeVisibleText(button.innerText || button.textContent || ''), pattern, 1000));

@@ -107,9 +107,13 @@ function searchButtons(sidebar: HTMLElement): HTMLButtonElement[] {
     .filter((button) => renderedLines(button).some((line) => /^Searched\s+(?:web|𝕏|X)$/i.test(line)));
 }
 
-function findSourcesSidebar(document: Document): HTMLElement | undefined {
+function sourceSidebars(document: Document): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>('aside'))
-    .find((aside) => !isEffectivelyHidden(aside) && renderedLines(aside).some((line) => line === 'Sources'));
+    .filter((aside) => renderedLines(aside).some((line) => line === 'Sources'));
+}
+
+function findSourcesSidebar(document: Document): HTMLElement | undefined {
+  return sourceSidebars(document).find((aside) => !isEffectivelyHidden(aside));
 }
 
 function sidebarCloseButton(sidebar: HTMLElement): HTMLButtonElement | undefined {
@@ -173,9 +177,8 @@ export async function captureGrokResearchTrail(
   if (sidebar && !sidebarBelongsToToggle(sidebar, toggle)) {
     const close = sidebarCloseButton(sidebar);
     close?.click();
-    const priorSidebar = sidebar;
     const closed = close && await waitFor(
-      () => !priorSidebar.isConnected || isEffectivelyHidden(priorSidebar) ? true : undefined,
+      () => findSourcesSidebar(document) === undefined ? true : undefined,
       Date.now() + Math.min(timeoutMs, 3000),
     );
     if (!closed) {
@@ -185,8 +188,13 @@ export async function captureGrokResearchTrail(
   }
   const openedByCapture = !sidebar;
   if (!sidebar) {
+    const sidebarsBeforeOpen = new Set(sourceSidebars(document));
     toggle.click();
-    sidebar = await waitFor(() => findSourcesSidebar(document), Date.now() + Math.min(timeoutMs, 3000));
+    sidebar = await waitFor(() => {
+      const candidate = findSourcesSidebar(document);
+      if (!candidate) return undefined;
+      return sidebarBelongsToToggle(candidate, toggle) || !sidebarsBeforeOpen.has(candidate) ? candidate : undefined;
+    }, Date.now() + Math.min(timeoutMs, 3000));
   }
   if (!sidebar) {
     warnings.push('Grok Sources sidebar did not open.');

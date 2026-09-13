@@ -13,7 +13,7 @@ const platform = vi.hoisted(() => ({
   downloadText: vi.fn<(...args: unknown[]) => Promise<number>>(),
   notify: vi.fn(async () => undefined),
   setBadge: vi.fn(async () => undefined),
-  sendTabEvent: vi.fn(async (_tabId: number, _event: unknown) => undefined),
+  sendTabEvent: vi.fn<(_tabId: number, _event: unknown) => Promise<unknown>>(async () => undefined),
 }));
 const tabsGet = vi.hoisted(() => vi.fn<(_tabId: number) => Promise<Browser.tabs.Tab>>());
 
@@ -303,7 +303,10 @@ describe('coordinator run guards', () => {
     let clipboard = privateText;
     platform.readClipboard.mockImplementation(async () => clipboard);
     platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
-    platform.sendTabEvent.mockImplementation(async () => { clipboard = report; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = report;
+      return { ok: true, copyConfirmed: true };
+    });
     const job: CaptureJob = {
       id: 'run:claude', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
       createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
@@ -333,13 +336,36 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(report);
   });
 
-  it('rejects original clipboard text in the unverifiable copy-only fallback', async () => {
+  it('accepts a fresh copy-only report identical to the original clipboard', async () => {
     vi.useFakeTimers();
     const original = 'The original clipboard value is long enough to resemble a provider report.';
     let clipboard = original;
     platform.readClipboard.mockImplementation(async () => clipboard);
     platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
-    platform.sendTabEvent.mockImplementation(async () => { clipboard = original; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = original;
+      return { ok: true, copyConfirmed: true };
+    });
+    const job: CaptureJob = {
+      id: 'review:claude', runId: 'review', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ text: original, restored: true });
+    expect(clipboard).toBe(original);
+  });
+
+  it('rejects stale copy-only clipboard data without provider confirmation', async () => {
+    vi.useFakeTimers();
+    const privateText = 'Previously copied private material that must not become a provider report.';
+    let clipboard = privateText;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = privateText;
+      return { ok: true, copyConfirmed: false };
+    });
     const job: CaptureJob = {
       id: 'review:claude', runId: 'review', provider: 'claude', tabId: 2, state: 'queued',
       createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
@@ -347,7 +373,7 @@ describe('coordinator run guards', () => {
     const pending = coordinatorTestHooks.clipboardCapture(platform, job);
     await vi.runAllTimersAsync();
     await expect(pending).resolves.toBeUndefined();
-    expect(clipboard).toBe(original);
+    expect(clipboard).toBe(privateText);
   });
 
   it.each([false, true])('reports durable capture acceptance as %s when resuming capturing', async (accepted) => {

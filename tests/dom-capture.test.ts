@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { createFinalResponseBaseline, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
 import { findElement } from '../src/selectors';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -108,6 +108,47 @@ describe('provider DOM capture', () => {
     expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(false);
     report.textContent = 'Searching for extraterrestrial intelligence. Radio surveys found no confirmed signal.';
     expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(false);
+  });
+
+  it('recognizes a bounded status follow-up without accepting report prose', () => {
+    const response = visible(document.createElement('article'));
+    response.textContent = "I'll start researching the topic now. This may take 10 to 30 minutes.";
+    expect(isProgressResponse(response, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(true);
+    response.textContent = "I'll start researching the topic now. Here is the finished report.";
+    expect(isProgressResponse(response, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(false);
+  });
+
+  it('does not let a stale progress button override finished response text', () => {
+    const response = visible(document.createElement('article'));
+    response.innerHTML = '<div>A finished report with substantive findings and recommendations.</div><button>Searching 42 sources</button>';
+    document.body.replaceChildren(response);
+    expect(isProgressResponse(response, ADAPTERS.chatgpt.progressResponsePattern, false)).toBe(false);
+  });
+
+  it('preserves block boundaries for quota and clarification matching', () => {
+    const response = visible(document.createElement('article'));
+    response.innerHTML = '<p>Your usage limit</p><p>has been reached.</p>';
+    expect(isQuotaResponse(response, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(true);
+    response.innerHTML = '<p>Before I begin</p><p>What market should I cover?</p>';
+    expect(isClarifyingResponse(response, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
+  });
+
+  it('uses the response as the visibility boundary while pruning hidden descendants', () => {
+    const overlayed = document.createElement('div');
+    overlayed.setAttribute('aria-hidden', 'true');
+    overlayed.style.opacity = '0';
+    const response = document.createElement('article');
+    response.innerHTML = `
+      <p>Visible report body</p>
+      <p style="display:none">Hidden duplicate</p>
+      <section hidden="until-found">Collapsed evidence</section>
+    `;
+    overlayed.append(response);
+    document.body.replaceChildren(overlayed);
+    const snapshot = createResponseSnapshot(response);
+    expect(snapshot.text).toContain('Visible report body');
+    expect(snapshot.text).toContain('Collapsed evidence');
+    expect(snapshot.text).not.toContain('Hidden duplicate');
   });
 
   it('requires an interactive Gemini plan approval control', () => {

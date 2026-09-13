@@ -8,7 +8,7 @@ let listener: (event: BackgroundEvent) => Promise<unknown>;
 let messages: RuntimeRequest[];
 let storedStatus: ProviderRunStatus;
 let invalidTransitions: string[];
-let findResponseControl: (root: HTMLElement, roots: readonly HTMLElement[], selectors: SelectorChain, baseline?: ReadonlySet<HTMLElement>) => HTMLElement | null;
+let findResponseControl: (root: HTMLElement, roots: readonly HTMLElement[], selectors: SelectorChain, baseline?: ReadonlySet<HTMLElement>, allowHoverTransparent?: boolean) => HTMLElement | null;
 const report = 'A completed research report. The available evidence supports the following detailed findings, with limitations and practical recommendations.';
 
 beforeEach(async () => {
@@ -52,9 +52,12 @@ function answer(text = report) {
   document.body.innerHTML = `<div style="position:fixed" data-message-author-role="assistant"><h2>${text}</h2><button style="position:fixed" aria-label="Copy response">Copy</button></div>`;
 }
 
-async function resume(status: 'researching' | 'capturing' | 'submitting', captureAccepted = false) {
+async function resume(status: 'researching' | 'capturing' | 'submitting', captureAccepted = false, submittedAt?: number) {
   storedStatus = status;
-  await listener({ type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '', geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true, status, captureAccepted });
+  await listener({
+    type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '',
+    geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true, status, submittedAt, captureAccepted,
+  });
 }
 
 function captures() { return messages.filter((message) => message.type === 'content:capture'); }
@@ -65,10 +68,8 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     await vi.advanceTimersByTimeAsync(10000);
     expect(captures()).toHaveLength(1);
-    const capturingIndex = messages.findIndex((message) => message.type === 'content:state' && message.status === 'capturing');
-    const captureIndex = messages.findIndex((message) => message.type === 'content:capture');
-    expect(capturingIndex).toBeGreaterThanOrEqual(0);
-    expect(capturingIndex).toBeLessThan(captureIndex);
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'capturing' }));
+    expect(storedStatus).toBe('capturing');
   });
 
   it('does not let quota-like page text discard a finished report during capture backoff', async () => {
@@ -88,7 +89,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     await vi.advanceTimersByTimeAsync(4000);
     expect(captures()).toHaveLength(1);
-    expect(storedStatus).toBe('capturing');
+    expect(storedStatus).toBe('researching');
 
     // The first failed delivery backs off for five seconds.
     await vi.advanceTimersByTimeAsync(2000);
@@ -99,7 +100,7 @@ describe('provider content-script recovery', () => {
     document.body.append(notice);
     await vi.advanceTimersByTimeAsync(2000);
 
-    expect(storedStatus).toBe('capturing');
+    expect(storedStatus).toBe('researching');
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
     expect(captures()).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(10000);
@@ -131,6 +132,30 @@ describe('provider content-script recovery', () => {
     expect(captures()).toHaveLength(1);
   });
 
+  it('retries a rejected state update without committing it locally', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const defaultImplementation = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    let acceptAttention = false;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      const request = message as RuntimeRequest;
+      if (request.type === 'content:state' && request.status === 'awaiting_user' && !acceptAttention) {
+        messages.push(request);
+        return { ok: false, error: 'temporary rejection' };
+      }
+      return defaultImplementation(message);
+    });
+    await resume('researching');
+    answer('Before I begin, could you specify the target market?');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(storedStatus).toBe('researching');
+    expect(messages.some((message) => message.type === 'content:state' && message.status === 'awaiting_user')).toBe(true);
+    acceptAttention = true;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(messages.filter((message) => message.type === 'content:state' && message.status === 'awaiting_user').length).toBeGreaterThanOrEqual(2);
+  });
+
   it('redelivers a report when capturing was persisted without a durable job', async () => {
     answer();
     await resume('capturing');
@@ -147,12 +172,42 @@ describe('provider content-script recovery', () => {
 
   it('recovers an in-flight answer while resuming submitting', async () => {
     answer('An initial partial answer');
+    const stop = document.createElement('button');
+    stop.style.position = 'fixed';
+    stop.setAttribute('aria-label', 'Stop generating');
+    document.body.append(stop);
     await resume('submitting');
     expect(storedStatus).toBe('researching');
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'manual_required' }));
     document.querySelector('h2')!.textContent = report;
+    stop.remove();
     await vi.advanceTimersByTimeAsync(120000);
     expect(captures()).toHaveLength(1);
+  });
+
+  it('does not treat a prior answer as proof that a reloaded submission was sent', async () => {
+    answer('An answer from the previous query');
+    await resume('submitting');
+    expect(storedStatus).toBe('manual_required');
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(captures()).toHaveLength(0);
+  });
+
+  it('times out a researching provider that never reaches a report', async () => {
+    await resume('researching', false, Date.now() - 45 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('manual_required');
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'content:state', status: 'manual_required', detail: expect.stringContaining('45 minutes'),
+    }));
+  });
+
+  it('captures an available final report before applying the research timeout', async () => {
+    answer();
+    await resume('researching', false, Date.now() - 45 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'manual_required' }));
   });
 
   it('requests manual confirmation for an uncertain submission and captures a later answer', async () => {
@@ -215,6 +270,105 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     await vi.advanceTimersByTimeAsync(10000);
     expect(captures()).toHaveLength(1);
+  });
+
+  it('associates a shared turn control with the nearest assistant response', () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant">Progress</div>
+        <div style="position:fixed" data-message-author-role="assistant">Final report</div>
+        <button style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+      </section>
+    `;
+    const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
+    const selector = ADAPTERS.chatgpt.selectors.copyButton;
+    expect(findResponseControl(roots[0]!, roots, selector)).toBeNull();
+    expect(findResponseControl(roots[1]!, roots, selector, new Set(), true)).toBe(document.querySelector('button'));
+  });
+
+  it('rejects hidden and non-interactive decoy Copy controls', () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant">Final report</div>
+        <button id="real-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+        <button style="position:fixed;pointer-events:none" aria-label="Copy response">Copy</button>
+        <div aria-hidden="true"><button style="position:fixed" aria-label="Copy response">Copy</button></div>
+      </section>
+    `;
+    const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
+    expect(findResponseControl(roots[0]!, roots, ADAPTERS.chatgpt.selectors.copyButton, new Set(), true))
+      .toBe(document.querySelector('#real-copy'));
+  });
+
+  it('confirms a Copy action only after observing provider copy feedback', async () => {
+    answer();
+    await resume('researching');
+    const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
+    button.addEventListener('click', () => document.dispatchEvent(new Event('copy')));
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt' }))
+      .resolves.toEqual({ ok: true, copyConfirmed: true });
+  });
+
+  it('prefers the response Copy control over a nested Copy code control', () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant">
+          <pre><button style="position:fixed" aria-label="Copy">Copy code</button></pre>
+        </div>
+        <button style="position:fixed" aria-label="Copy response">Copy</button>
+      </section>
+    `;
+    const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
+    expect(findResponseControl(roots[0]!, roots, ADAPTERS.chatgpt.selectors.copyButton))
+      .toBe(document.querySelector('[aria-label="Copy response"]'));
+  });
+
+  it('captures a response temporarily hidden behind an accessible modal layer', async () => {
+    const longReport = report.repeat(10);
+    document.body.innerHTML = `
+      <main aria-hidden="true" style="opacity:0">
+        <section>
+          <div style="position:fixed" data-message-author-role="assistant"><h2>${longReport}</h2></div>
+          <button style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+        </section>
+      </main>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(40000);
+    expect(captures()).toHaveLength(1);
+    expect(captures()[0]).toMatchObject({ domMarkdown: expect.stringContaining('completed research report') });
+  });
+
+  it('keeps the synchronous response snapshot when React replaces the node during source capture', async () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant"><h2>${report}</h2></div>
+        <button style="position:fixed" aria-label="Copy response">Copy</button>
+        <button style="position:fixed" aria-label="Sources" aria-expanded="false">Sources</button>
+      </section>
+    `;
+    const toggle = document.querySelector<HTMLButtonElement>('[aria-label="Sources"]')!;
+    toggle.addEventListener('click', () => {
+      const replacement = document.createElement('div');
+      replacement.style.position = 'fixed';
+      replacement.setAttribute('data-message-author-role', 'assistant');
+      document.querySelector('[data-message-author-role="assistant"]')!.replaceWith(replacement);
+    }, { once: true });
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(captures()[0]).toMatchObject({ domMarkdown: expect.stringContaining('completed research report') });
+  });
+
+  it('finds a Grok Sources control beyond the former three-ancestor limit', () => {
+    document.body.innerHTML = `
+      <section>
+        <div><div><div><article style="position:fixed">Final report</article></div></div></div>
+        <button style="position:fixed" aria-label="4 sources">Sources</button>
+      </section>
+    `;
+    const root = document.querySelector<HTMLElement>('article')!;
+    expect(findResponseControl(root, [root], ADAPTERS.grok.selectors.sourcesPanelToggle!))
+      .toBe(document.querySelector('button'));
   });
 
   it('does not attribute an earlier answer Sources control to the latest answer', () => {

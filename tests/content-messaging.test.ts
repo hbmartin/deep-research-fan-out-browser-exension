@@ -25,6 +25,21 @@ describe('provider content messaging', () => {
     await expect(sendContentMessage({ type: 'content:hello', provider: 'chatgpt', url: 'https://chatgpt.com/' })).resolves.toBeUndefined();
   });
 
+  it('requires acknowledgement for provider state updates', async () => {
+    const sendMessage = vi.fn()
+      .mockRejectedValueOnce(new Error('worker asleep'))
+      .mockResolvedValueOnce({ ok: false, error: 'invalid transition' });
+    vi.stubGlobal('browser', { runtime: { sendMessage } });
+    const state = {
+      type: 'content:state' as const,
+      runId: 'run',
+      provider: 'chatgpt' as const,
+      status: 'researching' as const,
+    };
+    await expect(sendContentMessage(state)).rejects.toThrow('worker asleep');
+    await expect(sendContentMessage(state)).rejects.toThrow('invalid transition');
+  });
+
   it('does not acknowledge capture delivery when the coordinator returns no response', async () => {
     vi.stubGlobal('browser', { runtime: { sendMessage: vi.fn(async () => undefined) } });
     await expect(sendContentMessage({

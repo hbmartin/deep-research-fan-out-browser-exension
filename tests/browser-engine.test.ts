@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
-import { findElement } from '../src/selectors';
+import { cloneVisibleContent, findElement } from '../src/selectors';
 import { ADAPTERS } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -58,12 +58,56 @@ describe('selector engine', () => {
     expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
   });
 
+  it('discovers a transparent hover control without accepting one under a hidden ancestor', () => {
+    document.body.innerHTML = `
+      <button id="hover-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+      <div aria-hidden="true" style="opacity:0">
+        <button id="hidden-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+      </div>
+    `;
+    expect(findElement(
+      [{ kind: 'aria', role: 'button', name: 'Copy response', pick: 'last' }],
+      document,
+      [],
+      { allowTransparent: true },
+    )).toBe(document.querySelector('#hover-copy'));
+  });
+
+  it('honors a descendant visibility override and keeps until-found content discoverable', () => {
+    document.body.innerHTML = `
+      <div style="visibility:hidden"><button style="position:fixed;visibility:visible" aria-label="Override">Override</button></div>
+      <button hidden="until-found" style="position:fixed" aria-label="Collapsible">Collapsible</button>
+    `;
+    expect(findElement([{ kind: 'aria', role: 'button', name: 'Override' }])).toBe(document.querySelector('[aria-label="Override"]'));
+    expect(findElement([{ kind: 'aria', role: 'button', name: 'Collapsible' }])).toBe(document.querySelector('[aria-label="Collapsible"]'));
+  });
+
   it('targets Grok Copy response rather than nested table and code copy buttons', () => {
     document.body.innerHTML = '<div id="answer"><button aria-label="Copy">Table</button><button aria-label="Copy">Code</button></div><button aria-label="Copy response">Response</button>';
     document.querySelectorAll<HTMLElement>('button').forEach(visible);
     const root = document.querySelector<HTMLElement>('#answer')!;
     expect(findElement(ADAPTERS.grok.selectors.copyButton, root)).toBeNull();
     expect(findElement(ADAPTERS.grok.selectors.copyButton)?.textContent).toBe('Response');
+  });
+
+  it('does not treat ordinary report prose as a loose streaming indicator', () => {
+    document.body.innerHTML = `
+      <p style="position:fixed">The team is researching new battery materials.</p>
+      <span style="position:fixed">Searching…</span>
+    `;
+    expect(findElement(ADAPTERS.gemini.selectors.streamingIndicator)).toBeNull();
+    expect(findElement(ADAPTERS.grok.selectors.streamingIndicator)?.textContent).toBe('Searching…');
+  });
+
+  it('checks each captured descendant style once instead of walking every ancestor', () => {
+    const root = document.createElement('div');
+    root.innerHTML = '<section><article><p><span>Report</span></p></article></section><section><p>More</p></section>';
+    document.body.replaceChildren(root);
+    const descendants = root.querySelectorAll('*').length;
+    const getStyle = vi.spyOn(globalThis, 'getComputedStyle');
+    cloneVisibleContent(root, 'button, script');
+    expect(getStyle).toHaveBeenCalledTimes(descendants);
+    getStyle.mockRestore();
   });
 });
 

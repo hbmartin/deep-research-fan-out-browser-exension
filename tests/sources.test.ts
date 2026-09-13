@@ -143,6 +143,22 @@ describe('Grok Sources sidebar capture', () => {
     expect(trail.sources.map((source) => source.url)).toEqual(['https://web.example/source-2']);
   });
 
+  it('rejects a stale sidebar re-created while the previous one closes', async () => {
+    document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside><div>Sources</div><button aria-label="Close"></button>${searchGroup('web', 'old query', [1], 1)}</aside>`;
+    document.querySelector<HTMLButtonElement>('aside button')!.addEventListener('click', () => {
+      document.querySelector('aside')!.remove();
+      document.body.insertAdjacentHTML('beforeend', `<aside><div>Sources</div>${searchGroup('web', 'stale query', [1], 1)}</aside>`);
+    });
+    const toggle = document.querySelector<HTMLElement>('#target')!;
+    toggle.addEventListener('click', () => {
+      document.body.insertAdjacentHTML('beforeend', `<aside><div>Sources</div>${searchGroup('web', 'current query', [2], 2)}</aside>`);
+    });
+
+    const trail = normalizeResearchTrail(await captureGrokResearchTrail(document, toggle, 50), []);
+    expect(trail.sources).toEqual([]);
+    expect(trail.warnings.join(' ')).toContain('which answer owns');
+  });
+
   it.each(['collapse', 'hidden'] as const)('ignores a stale sidebar with visibility: %s', async (visibility) => {
     document.body.innerHTML = `<button id="target" aria-label="1 sources"></button><aside style="visibility:${visibility}"><div>Sources</div>${searchGroup('web', 'stale query', [1], 1)}</aside>`;
     const toggle = document.querySelector<HTMLElement>('#target')!;

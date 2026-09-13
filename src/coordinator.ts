@@ -161,6 +161,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       completionDebounceMs: settings.providers[provider].completionDebounceMs,
       resumeOnly,
       status: providerRun.status,
+      submittedAt: providerRun.submittedAt,
       captureAccepted,
     } as const;
     try {
@@ -308,15 +309,17 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
     try {
       await platform.writeClipboard(sentinel);
       primed = true;
-      await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
+      if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
+      const clickResult = await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
+      const copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
+        && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
       await new Promise((resolve) => setTimeout(resolve, 250));
       observed = await platform.readClipboard();
       const resemblesDomReport = hasVerifiableDom
         && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
       if (observed === sentinel
-        || (!hasVerifiableDom && observed === original)
         || observed.trim().length < 40
-        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom))) {
+        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom && copyConfirmed))) {
         throw new Error('Provider copy did not produce a new report.');
       }
       let restored = false;
@@ -545,6 +548,24 @@ async function processCaptureQueue(): Promise<void> {
   }
 }
 
+async function ensureProviderCapturing(runId: string, provider: ProviderId): Promise<boolean> {
+  const { value: changed } = await mutateStoredRun(runId, (storedRun) => {
+    const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) throw new Error('Provider is not part of this run.');
+    if (isTerminalProviderStatus(providerRun.status)) {
+      throw new CoordinatorRequestError('Provider run no longer accepts captures.', 'provider_terminal');
+    }
+    if (providerRun.status === 'capturing') return false;
+    assertTransition(providerRun.status, 'capturing');
+    providerRun.status = 'capturing';
+    providerRun.statusDetail = undefined;
+    storedRun.status = deriveRunStatus(storedRun);
+    return true;
+  });
+  if (changed) await broadcastRuns();
+  return changed;
+}
+
 async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<void> {
   const id = captureId(request.runId, request.provider);
   await serializeCapture(id, async () => {
@@ -556,15 +577,20 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
     }
     // A retry after a lost acknowledgement must not replace a queued or leased payload.
     if (await getJob(id)) {
-      await mutateProvider(run.id, request.provider, 'capturing');
+      if (providerRun.status !== 'capturing') await ensureProviderCapturing(run.id, request.provider);
       return;
     }
-    await mutateProvider(run.id, request.provider, 'capturing');
     await putJob({
       id, runId: run.id, provider: request.provider,
       tabId: providerRun.tabId, state: 'queued', createdAt: Date.now(), attempts: 0,
       domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
     });
+    try {
+      await ensureProviderCapturing(run.id, request.provider);
+    } catch (error) {
+      if (error instanceof CoordinatorRequestError && error.code === 'provider_terminal') await deleteJob(id).catch(() => undefined);
+      throw error;
+    }
   });
   void processCaptureQueue();
 }
