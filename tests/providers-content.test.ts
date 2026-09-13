@@ -8,7 +8,7 @@ let listener: (event: BackgroundEvent) => Promise<unknown>;
 let messages: RuntimeRequest[];
 let storedStatus: ProviderRunStatus;
 let invalidTransitions: string[];
-let findResponseControl: (root: HTMLElement, roots: readonly HTMLElement[], selectors: SelectorChain, baseline?: ReadonlySet<HTMLElement>) => HTMLElement | null;
+let findResponseControl: (root: HTMLElement, roots: readonly HTMLElement[], selectors: SelectorChain, baseline?: ReadonlySet<HTMLElement>, allowHoverTransparent?: boolean) => HTMLElement | null;
 const report = 'A completed research report. The available evidence supports the following detailed findings, with limitations and practical recommendations.';
 
 beforeEach(async () => {
@@ -283,7 +283,21 @@ describe('provider content-script recovery', () => {
     const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
     const selector = ADAPTERS.chatgpt.selectors.copyButton;
     expect(findResponseControl(roots[0]!, roots, selector)).toBeNull();
-    expect(findResponseControl(roots[1]!, roots, selector)).toBe(document.querySelector('button'));
+    expect(findResponseControl(roots[1]!, roots, selector, new Set(), true)).toBe(document.querySelector('button'));
+  });
+
+  it('rejects hidden and non-interactive decoy Copy controls', () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant">Final report</div>
+        <button id="real-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+        <button style="position:fixed;pointer-events:none" aria-label="Copy response">Copy</button>
+        <div aria-hidden="true"><button style="position:fixed" aria-label="Copy response">Copy</button></div>
+      </section>
+    `;
+    const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
+    expect(findResponseControl(roots[0]!, roots, ADAPTERS.chatgpt.selectors.copyButton, new Set(), true))
+      .toBe(document.querySelector('#real-copy'));
   });
 
   it('prefers the response Copy control over a nested Copy code control', () => {
@@ -301,16 +315,17 @@ describe('provider content-script recovery', () => {
   });
 
   it('captures a response temporarily hidden behind an accessible modal layer', async () => {
+    const longReport = report.repeat(10);
     document.body.innerHTML = `
       <main aria-hidden="true" style="opacity:0">
         <section>
-          <div style="position:fixed" data-message-author-role="assistant"><h2>${report}</h2></div>
+          <div style="position:fixed" data-message-author-role="assistant"><h2>${longReport}</h2></div>
           <button style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
         </section>
       </main>
     `;
     await resume('researching');
-    await vi.advanceTimersByTimeAsync(10000);
+    await vi.advanceTimersByTimeAsync(40000);
     expect(captures()).toHaveLength(1);
     expect(captures()[0]).toMatchObject({ domMarkdown: expect.stringContaining('completed research report') });
   });

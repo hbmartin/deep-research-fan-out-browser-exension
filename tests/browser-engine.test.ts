@@ -58,14 +58,19 @@ describe('selector engine', () => {
     expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
   });
 
-  it('discovers an intentionally transparent hover control when requested', () => {
-    document.body.innerHTML = '<div aria-hidden="true" style="opacity:0"><button style="position:fixed;opacity:0" aria-label="Copy response">Copy</button></div>';
+  it('discovers a transparent hover control without accepting one under a hidden ancestor', () => {
+    document.body.innerHTML = `
+      <button id="hover-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+      <div aria-hidden="true" style="opacity:0">
+        <button id="hidden-copy" style="position:fixed;opacity:0" aria-label="Copy response">Copy</button>
+      </div>
+    `;
     expect(findElement(
-      [{ kind: 'aria', role: 'button', name: 'Copy response' }],
+      [{ kind: 'aria', role: 'button', name: 'Copy response', pick: 'last' }],
       document,
       [],
-      { allowTransparent: true, ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true },
-    )).toBe(document.querySelector('button'));
+      { allowTransparent: true },
+    )).toBe(document.querySelector('#hover-copy'));
   });
 
   it('honors a descendant visibility override and keeps until-found content discoverable', () => {

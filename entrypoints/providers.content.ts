@@ -33,7 +33,7 @@ let captureRetryAt = 0;
 let pendingReport: { runId: RunId; status: ProviderRunStatus; promise: Promise<void> } | undefined;
 const RESEARCH_TIMEOUT_MS = 45 * 60 * 1000;
 const RESPONSE_VISIBILITY = { ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
-const CONTROL_VISIBILITY = { allowTransparent: true, ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
+const HOVER_COPY_VISIBILITY = { allowTransparent: true } as const;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -225,9 +225,14 @@ export function findResponseControl(
   responseRoots: readonly HTMLElement[],
   selectors: SelectorChain,
   baseline: ReadonlySet<HTMLElement> = new Set(),
+  allowHoverTransparent = false,
 ): HTMLElement | null {
-  const candidates = findAll(selectors, document, CONTROL_VISIBILITY)
-    .filter((candidate) => !baseline.has(candidate) && !candidate.closest('pre, code, table'));
+  const visibility = allowHoverTransparent ? HOVER_COPY_VISIBILITY : undefined;
+  const candidates = findAll(selectors, document, visibility)
+    .filter((candidate) => candidate.isConnected
+      && getComputedStyle(candidate).pointerEvents !== 'none'
+      && !candidate.closest('pre, code, table, [inert]')
+      && !baseline.has(candidate));
   const scoped = candidates.filter((candidate) => root.contains(candidate));
   if (scoped.length) return scoped.at(-1)!;
   for (const candidate of [...candidates].reverse()) {
@@ -350,7 +355,7 @@ function inspectPage(): void {
     return;
   }
   const copy = root
-    ? findResponseControl(root, finalRoots, adapter.selectors.copyButton, active.copyButtonBaseline)
+    ? findResponseControl(root, finalRoots, adapter.selectors.copyButton, active.copyButtonBaseline, true)
     : null;
   if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy), responseSnapshot)) {
     active.completionCandidate = undefined;
@@ -400,7 +405,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     if (event.resumeOnly || active.automationStarted) return;
     stopMonitoring();
     active.finalResponseBaseline = createFinalResponseBaseline(responseRoots(active.adapter));
-    active.copyButtonBaseline = new Set(findAll(active.adapter.selectors.copyButton, document, CONTROL_VISIBILITY));
+    active.copyButtonBaseline = new Set(findAll(active.adapter.selectors.copyButton, document, HOVER_COPY_VISIBILITY));
     active.captureSent = false;
     active.automationStarted = true;
     captureFailureCount = 0;
@@ -423,7 +428,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   const finalResponseBaseline = createFinalResponseBaseline(resumeExistingResponse ? [] : responseRoots(adapter));
   const copyButtonBaseline = new Set(resumeExistingResponse
     ? []
-    : findAll(adapter.selectors.copyButton, document, CONTROL_VISIBILITY));
+    : findAll(adapter.selectors.copyButton, document, HOVER_COPY_VISIBILITY));
   active = {
     id: event.runId,
     adapter,
@@ -463,7 +468,7 @@ export default defineContentScript({
       if (message.type === 'capture:copy-now' && active) {
         const roots = responseRoots(active.adapter);
         const root = roots.at(-1) ?? null;
-        const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton) : null;
+        const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton, new Set(), true) : null;
         if (!button) throw new Error('Provider copy button is unavailable.');
         button.click();
         return { ok: true };

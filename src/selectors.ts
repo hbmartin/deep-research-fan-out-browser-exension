@@ -102,10 +102,11 @@ export function isEffectivelyHidden(element: HTMLElement, options: VisibilityOpt
     const style = current === element ? elementStyle : getComputedStyle(current);
     const opacity = Number.parseFloat(style.opacity);
     const ancestor = current !== element;
+    const transparentTargetAllowed = options.allowTransparent && !ancestor;
     if ((current.hidden && !isUntilFound(current))
       || (!(ancestor && options.ignoreAncestorAriaHidden) && current.getAttribute('aria-hidden')?.toLowerCase() === 'true')
       || style.display === 'none'
-      || (!(ancestor && options.ignoreAncestorOpacity) && !options.allowTransparent && !Number.isNaN(opacity) && opacity <= 0)) return true;
+      || (!(ancestor && options.ignoreAncestorOpacity) && !transparentTargetAllowed && !Number.isNaN(opacity) && opacity <= 0)) return true;
   }
   return false;
 }
