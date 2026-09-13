@@ -68,30 +68,46 @@ describe('provider DOM capture', () => {
     expect(findElement(ADAPTERS.claude.selectors.quotaNotice, document, [report])).toBeNull();
     expect(isQuotaResponse(report, ADAPTERS.claude.quotaResponsePattern)).toBe(false);
 
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Research suggests the available evidence is limited by sample size.' });
+    report.textContent = 'Research suggests the available evidence is limited by sample size.';
     expect(isQuotaResponse(report, ADAPTERS.grok.quotaResponsePattern)).toBe(false);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Before the deep research, is there a budget limit?' });
+    report.textContent = 'Before the deep research, is there a budget limit?';
     expect(isQuotaResponse(report, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(false);
 
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Before I begin, could you specify the target market?' });
+    report.textContent = 'Before I begin, could you specify the target market?';
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Great — before I begin, could you clarify the target market?' });
+    report.textContent = 'Great — before I begin, could you clarify the target market?';
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Thanks! Could you specify the target market?' });
+    report.textContent = 'Thanks! Could you specify the target market?';
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: `Before I begin, ${'long report '.repeat(70)}` });
+    report.textContent = `Before I begin, ${'long report '.repeat(70)}`;
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: `Clarification of GDPR Article 6. ${'report '.repeat(1000)}` });
+    report.textContent = `Clarification of GDPR Article 6. ${'report '.repeat(1000)}`;
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(false);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'The report cites a passage saying before I begin.' });
+    report.textContent = 'The report cites a passage saying before I begin.';
     expect(isClarifyingResponse(report, ADAPTERS.chatgpt.clarifyingPromptPattern)).toBe(false);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: 'Your deep research limit has been reached.' });
+    report.textContent = 'Your deep research limit has been reached.';
     expect(isQuotaResponse(report, ADAPTERS.chatgpt.quotaResponsePattern)).toBe(true);
-    Object.defineProperty(report, 'innerText', { configurable: true, value: "You've reached your usage limit." });
+    report.textContent = "You've reached your usage limit.";
     expect(isQuotaResponse(report, ADAPTERS.claude.quotaResponsePattern)).toBe(true);
-    Reflect.deleteProperty(report, 'innerText');
     report.textContent = 'Starting research across the requested sources…';
     expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern)).toBe(true);
+  });
+
+  it('recognizes only complete progress messages while ignoring hidden and copy-control text', () => {
+    const report = visible(document.createElement('article'));
+    report.innerHTML = `
+      <button>Researching the latest CRISPR trials…</button>
+      <button aria-label="Copy response">Copy</button>
+      <span style="display:none">A hidden final report.</span>
+      <script>A script-generated final report.</script>
+    `;
+    document.body.replaceChildren(report);
+    expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(true);
+
+    report.replaceChildren(document.createTextNode("I'll start researching the topic. Here is the finished report."));
+    expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(false);
+    report.textContent = 'Searching for extraterrestrial intelligence. Radio surveys found no confirmed signal.';
+    expect(isProgressResponse(report, ADAPTERS.chatgpt.progressResponsePattern, true)).toBe(false);
   });
 
   it('requires an interactive Gemini plan approval control', () => {

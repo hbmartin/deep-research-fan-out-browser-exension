@@ -64,6 +64,24 @@ afterEach(() => {
 });
 
 describe('coordinator run guards', () => {
+  it('serializes capture acceptance for the same capture ID', async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const order: string[] = [];
+    const first = coordinatorTestHooks.serializeCapture('same:capture', async () => {
+      order.push('first:start');
+      await firstGate;
+      order.push('first:end');
+    });
+    await vi.waitFor(() => expect(order).toEqual(['first:start']));
+    const second = coordinatorTestHooks.serializeCapture('same:capture', async () => { order.push('second'); });
+    await Promise.resolve();
+    expect(order).toEqual(['first:start']);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(['first:start', 'first:end', 'second']);
+  });
+
   it('serializes independent mutations without losing either provider update', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 1, 'capturing'), claude: provider('claude', 2, 'researching') });
     await putRun(stored);
@@ -315,6 +333,23 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(report);
   });
 
+  it('rejects original clipboard text in the unverifiable copy-only fallback', async () => {
+    vi.useFakeTimers();
+    const original = 'The original clipboard value is long enough to resemble a provider report.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => { clipboard = original; });
+    const job: CaptureJob = {
+      id: 'review:claude', runId: 'review', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(original);
+  });
+
   it.each([false, true])('reports durable capture acceptance as %s when resuming capturing', async (accepted) => {
     const stored = run({ chatgpt: provider('chatgpt', 930, 'capturing') });
     const id = `${stored.id}:chatgpt`;
@@ -350,6 +385,26 @@ describe('coordinator run guards', () => {
     }, {})).resolves.toEqual({ ok: true });
     expect(await getJob(id)).toEqual(job);
     await coordinatorTestHooks.processCaptureQueue();
+    await deleteJob(id);
+    stored.providerRuns.chatgpt!.status = 'complete';
+    stored.status = 'complete';
+    await putRun(stored);
+  });
+
+  it('restores capturing before accepting a duplicate delivery for an existing job', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 932, 'researching') });
+    const id = `${stored.id}:chatgpt`;
+    const job: CaptureJob = {
+      id, runId: stored.id, provider: 'chatgpt', tabId: 932, state: 'leased', leasedAt: Date.now(),
+      createdAt: Date.now(), attempts: 2, domMarkdown: 'The original durable report must not be replaced by a retried delivery.', domCitations: [],
+    };
+    await putRun(stored);
+    await putJob(job);
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
+    }, {})).resolves.toEqual({ ok: true });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('capturing');
+    expect(await getJob(id)).toEqual(job);
     await deleteJob(id);
     stored.providerRuns.chatgpt!.status = 'complete';
     stored.status = 'complete';

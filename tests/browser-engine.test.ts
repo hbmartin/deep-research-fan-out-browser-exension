@@ -50,6 +50,14 @@ describe('selector engine', () => {
     expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
   });
 
+  it.each([
+    ['opacity', '0'],
+    ['visibility', 'collapse'],
+  ])('does not select controls hidden by ancestor %s', (property, value) => {
+    document.body.innerHTML = `<div style="${property}:${value}"><button style="position:fixed" aria-label="Send">Send</button></div>`;
+    expect(findElement([{ kind: 'aria', role: 'button', name: 'Send' }])).toBeNull();
+  });
+
   it('targets Grok Copy response rather than nested table and code copy buttons', () => {
     document.body.innerHTML = '<div id="answer"><button aria-label="Copy">Table</button><button aria-label="Copy">Code</button></div><button aria-label="Copy response">Response</button>';
     document.querySelectorAll<HTMLElement>('button').forEach(visible);

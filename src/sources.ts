@@ -1,4 +1,5 @@
 import { normalizeUrl } from './citations';
+import { isEffectivelyHidden } from './selectors';
 import type {
   CapturedResearchTrail,
   CapturedSearch,
@@ -108,13 +109,7 @@ function searchButtons(sidebar: HTMLElement): HTMLButtonElement[] {
 
 function findSourcesSidebar(document: Document): HTMLElement | undefined {
   return Array.from(document.querySelectorAll<HTMLElement>('aside'))
-    .find((aside) => {
-      for (let element: HTMLElement | null = aside; element; element = element.parentElement) {
-        const style = document.defaultView?.getComputedStyle(element);
-        if (element.hidden || element.getAttribute('aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return false;
-      }
-      return renderedLines(aside).some((line) => line === 'Sources');
-    });
+    .find((aside) => !isEffectivelyHidden(aside) && renderedLines(aside).some((line) => line === 'Sources'));
 }
 
 function sidebarCloseButton(sidebar: HTMLElement): HTMLButtonElement | undefined {
@@ -178,19 +173,23 @@ export async function captureGrokResearchTrail(
   if (sidebar && !sidebarBelongsToToggle(sidebar, toggle)) {
     const close = sidebarCloseButton(sidebar);
     close?.click();
-    const closed = close && await waitFor(() => findSourcesSidebar(document) ? undefined : true, Date.now() + Math.min(timeoutMs, 3000));
+    const priorSidebar = sidebar;
+    const closed = close && await waitFor(
+      () => !priorSidebar.isConnected || isEffectivelyHidden(priorSidebar) ? true : undefined,
+      Date.now() + Math.min(timeoutMs, 3000),
+    );
     if (!closed) {
       return { reportedResultCount: total, searches: [], openedPages: [], warnings: ['Could not verify which answer owns the open Grok Sources sidebar.'] };
     }
     sidebar = undefined;
   }
   const openedByCapture = !sidebar;
-  if (!sidebar && toggle) {
+  if (!sidebar) {
     toggle.click();
     sidebar = await waitFor(() => findSourcesSidebar(document), Date.now() + Math.min(timeoutMs, 3000));
   }
   if (!sidebar) {
-    warnings.push(toggle ? 'Grok Sources sidebar did not open.' : 'Grok Sources control was not found.');
+    warnings.push('Grok Sources sidebar did not open.');
     return { reportedResultCount: total, searches: [], openedPages: [], warnings };
   }
 

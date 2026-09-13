@@ -79,12 +79,36 @@ export function findAll(chain: SelectorChain, root: ParentNode = document): HTML
   return [];
 }
 
+export function isEffectivelyHidden(element: HTMLElement): boolean {
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const style = getComputedStyle(current);
+    const opacity = Number.parseFloat(style.opacity);
+    if (current.hidden
+      || current.getAttribute('aria-hidden')?.toLowerCase() === 'true'
+      || style.display === 'none'
+      || style.visibility === 'hidden'
+      || style.visibility === 'collapse'
+      || (!Number.isNaN(opacity) && opacity <= 0)) return true;
+  }
+  return false;
+}
+
 export function isVisible(element: HTMLElement): boolean {
   const style = getComputedStyle(element);
   const rect = element.getBoundingClientRect();
-  return style.display !== 'none'
-    && style.visibility !== 'hidden'
+  return !isEffectivelyHidden(element)
     && !element.hasAttribute('disabled')
     && element.getAttribute('aria-disabled')?.toLowerCase() !== 'true'
     && (rect.width > 0 || rect.height > 0 || style.position === 'fixed');
+}
+
+export function cloneVisibleContent(root: HTMLElement, excludedSelector: string): HTMLElement {
+  const clone = root.cloneNode(true) as HTMLElement;
+  const originals = [root, ...root.querySelectorAll<HTMLElement>('*')];
+  const copies = [clone, ...clone.querySelectorAll<HTMLElement>('*')];
+  for (let index = 1; index < originals.length; index += 1) {
+    const original = originals[index]!;
+    if (original.matches(excludedSelector) || isEffectivelyHidden(original)) copies[index]?.remove();
+  }
+  return clone;
 }
