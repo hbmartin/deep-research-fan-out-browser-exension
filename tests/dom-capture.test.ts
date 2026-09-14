@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
 import { findElement } from '../src/selectors';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -160,6 +160,8 @@ describe('provider DOM capture', () => {
       <div role="progressbar">Survey completion was 87 percent.</div>
       <span>Elapsed 00:30</span>
       <span aria-label="Elapsed time">00:31</span>
+      <span aria-label="Elapsed time"><strong>00:32</strong></span>
+      <span aria-label="Elapsed company history">The company was founded in 1982.</span>
     `;
     const snapshot = createResponseSnapshot(response);
     expect(snapshot.text).toContain('12:34');
@@ -168,6 +170,17 @@ describe('provider DOM capture', () => {
     expect(snapshot.text).toContain('Survey completion was 87 percent.');
     expect(snapshot.text).not.toContain('Elapsed 00:30');
     expect(snapshot.text).not.toContain('00:31');
+    expect(snapshot.text).not.toContain('00:32');
+    expect(snapshot.text).toContain('The company was founded in 1982.');
+  });
+
+  it('uses timer-stripped text for response activity fingerprints', () => {
+    const response = document.createElement('article');
+    response.id = 'response';
+    response.innerHTML = '<p>Researching the requested topic.</p><span aria-label="Elapsed time">00:31</span>';
+    const first = finalResponseFingerprint(response);
+    response.querySelector('span')!.textContent = '00:32';
+    expect(finalResponseFingerprint(response)).toBe(first);
   });
 
   it('requires an interactive Gemini plan approval control', () => {

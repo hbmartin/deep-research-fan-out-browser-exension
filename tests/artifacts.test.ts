@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildArtifact } from '../src/artifacts';
+import { buildArtifact, buildCurrentResponseCopy } from '../src/artifacts';
 import type { Capture, ProviderRun, Run } from '../src/types';
 
 const providerRun: ProviderRun = {
@@ -44,6 +44,13 @@ describe('Markdown artifacts', () => {
     expect(artifact).toContain('[1] Example — https://example.com');
   });
 
+  it('copies only the normalized current body and non-empty references', () => {
+    const current = buildCurrentResponseCopy('Current report [1].', capture.citations);
+    expect(current).toBe('Current report [1].\n\n## References\n\n[1] Example — https://example.com\n');
+    expect(buildCurrentResponseCopy('Current report.', [])).toBe('Current report.\n');
+    expect(current).not.toContain('run_id:');
+  });
+
   it('emits a useful status file without a capture', () => {
     const failed = { ...providerRun, status: 'failed' as const, statusDetail: 'Capture failed.' };
     const artifact = buildArtifact({ ...run, providerRuns: { gemini: failed } }, failed);
@@ -70,4 +77,5 @@ describe('Markdown artifacts', () => {
     expect(artifact).not.toContain('A useful source snippet.');
     expect(artifact).not.toContain('https://example.com/outbound');
   });
+
 });

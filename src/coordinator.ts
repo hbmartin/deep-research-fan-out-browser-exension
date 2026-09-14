@@ -1,8 +1,8 @@
-import { ADAPTERS } from './adapters';
-import { buildArtifact } from './artifacts';
+import { ADAPTERS, providerFromUrl } from './adapters';
+import { buildArtifact, buildCurrentResponseCopy } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
 import { acceptCaptureJob, captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
-import type { ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
+import type { CurrentResponseSnapshot, ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
 import { normalizeResearchTrail } from './sources';
@@ -10,6 +10,8 @@ import { canTransition, assertTransition, createDownloadFolder, deriveRunStatus,
 import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
 
 const ALARM_NAME = 'reconcile-runs';
+const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
+let contextMenuRegistrationTail = Promise.resolve();
 const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
 let captureWorkerRunning = false;
 let reconcileWorkerRunning = false;
@@ -157,6 +159,21 @@ async function updateBadge(runs: Run[]): Promise<void> {
   await platform.setBadge(unread ? String(unread) : '', '#475467');
 }
 
+async function ensureContentReceiver(tabId: number, provider: ProviderId): Promise<void> {
+  try {
+    await sendTabEvent(tabId, { type: 'content:ping', provider });
+  } catch (error) {
+    // A rejected application request is not evidence that the receiver is missing.
+    if (!/receiving end does not exist|could not establish connection|no receiver/i.test(String(error))) throw error;
+    const extensionBrowser = browser as typeof browser & {
+      scripting?: { executeScript(options: { target: { tabId: number }; files: string[] }): Promise<unknown> };
+    };
+    if (extensionBrowser.scripting) await extensionBrowser.scripting.executeScript({ target: { tabId }, files: ['/content-scripts/providers.js'] });
+    else await browser.tabs.executeScript(tabId, { file: '/content-scripts/providers.js' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 async function startContent(run: Run, provider: ProviderId, resumeOnly = false): Promise<void> {
   const providerRun = run.providerRuns[provider];
   if (!providerRun || isTerminalProviderStatus(providerRun.status)) return;
@@ -178,18 +195,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       researchTimedOutAt: providerRun.researchTimedOutAt,
       captureAccepted,
     } as const;
-    try {
-      await sendTabEvent(providerRun.tabId, { type: 'content:ping', provider });
-    } catch (error) {
-      // A rejected application request is not evidence that the receiver is missing.
-      if (!/receiving end does not exist|could not establish connection|no receiver/i.test(String(error))) throw error;
-      const extensionBrowser = browser as typeof browser & {
-        scripting?: { executeScript(options: { target: { tabId: number }; files: string[] }): Promise<unknown> };
-      };
-      if (extensionBrowser.scripting) await extensionBrowser.scripting.executeScript({ target: { tabId: providerRun.tabId }, files: ['/content-scripts/providers.js'] });
-      else await browser.tabs.executeScript(providerRun.tabId, { file: '/content-scripts/providers.js' });
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await ensureContentReceiver(providerRun.tabId, provider);
     await sendTabEvent(providerRun.tabId, event);
   } catch {
     // The alarm sweep retries both storage reads and content-script startup.
@@ -268,9 +274,11 @@ async function mutateProvider(runId: string, provider: ProviderId, status: Provi
     const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
     const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
     const enteredResearch = status === 'researching' && providerRun.status !== 'researching';
+    const refreshedResearchInterval = status === 'researching' && submittedAt !== undefined
+      && (providerRun.submittedAt === undefined || submittedAt > providerRun.submittedAt);
     providerRun.status = status;
     providerRun.statusDetail = detail;
-    if (enteredResearch) {
+    if (enteredResearch || refreshedResearchInterval) {
       providerRun.submittedAt = submittedAt ?? Date.now();
       providerRun.researchTimedOutAt = undefined;
     } else {
@@ -279,7 +287,7 @@ async function mutateProvider(runId: string, provider: ProviderId, status: Provi
     if (firstTimeout) providerRun.researchTimedOutAt = Date.now();
     if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
-    return timeout ? firstTimeout : changed;
+    return timeout ? firstTimeout : changed || refreshedResearchInterval;
   });
   // The state is durable. UI side effects must not invalidate its acknowledgement.
   try {
@@ -325,6 +333,67 @@ async function resolveCitationUrls(provider: ProviderId, citations: DomCitation[
   return { citations: output, resolved, unresolved };
 }
 
+function validateCurrentResponseSnapshot(value: unknown): CurrentResponseSnapshot {
+  if (!value || typeof value !== 'object') throw new Error('Provider did not return a response snapshot.');
+  const candidate = value as Partial<CurrentResponseSnapshot>;
+  if (typeof candidate.domMarkdown !== 'string' || !candidate.domMarkdown.trim() || !Array.isArray(candidate.domCitations)) {
+    throw new Error('Provider returned an invalid response snapshot.');
+  }
+  const optionalString = (value: unknown) => value === undefined || typeof value === 'string';
+  const validCitations = candidate.domCitations.every((citation) => {
+    if (!citation || typeof citation !== 'object'
+      || typeof citation.url !== 'string'
+      || !Number.isSafeInteger(citation.domOrder) || citation.domOrder < 0
+      || typeof citation.contextBefore !== 'string'
+      || typeof citation.contextAfter !== 'string'
+      || !optionalString(citation.originalUrl)
+      || !optionalString(citation.title)
+      || !optionalString(citation.markerText)) return false;
+    try { return ['http:', 'https:'].includes(new URL(citation.url).protocol); }
+    catch { return false; }
+  });
+  if (!validCitations) throw new Error('Provider returned invalid citation data.');
+  return { domMarkdown: candidate.domMarkdown, domCitations: candidate.domCitations };
+}
+
+async function copyCurrentResponse(tabId: number, provider: ProviderId): Promise<void> {
+  await ensureContentReceiver(tabId, provider);
+  const snapshot = validateCurrentResponseSnapshot(await sendTabEvent(tabId, { type: 'capture:dom-current', provider }));
+  const resolved = await resolveCitationUrls(provider, snapshot.domCitations);
+  const reconciled = reconcileCitations(snapshot.domMarkdown, resolved.citations, ADAPTERS[provider].citationMarkerStyle);
+  await createPlatform().writeClipboard(buildCurrentResponseCopy(reconciled.markdown, reconciled.citations));
+}
+
+async function registerCopyCurrentContextMenu(): Promise<void> {
+  const registration = contextMenuRegistrationTail.catch(() => undefined).then(async () => {
+    await browser.contextMenus.remove(COPY_CURRENT_MENU_ID).catch(() => undefined);
+    browser.contextMenus.create({
+      id: COPY_CURRENT_MENU_ID,
+      title: 'Copy current response',
+      contexts: ['page'],
+      documentUrlPatterns: Object.values(ADAPTERS).map((adapter) => `${adapter.origin}/*`),
+    });
+  });
+  contextMenuRegistrationTail = registration;
+  await registration;
+}
+
+async function handleCopyCurrentContextMenu(info: Browser.contextMenus.OnClickData, tab?: Browser.tabs.Tab): Promise<void> {
+  if (info.menuItemId !== COPY_CURRENT_MENU_ID) return;
+  const provider = tab?.url ? providerFromUrl(tab.url) : undefined;
+  try {
+    if (tab?.id === undefined || !provider) throw new Error('Open a supported provider response before copying.');
+    await copyCurrentResponse(tab.id, provider);
+    await createPlatform().notify(`copy-current:${tab.id}`, `${ADAPTERS[provider].label} response copied`, 'The current normalized response is on your clipboard.');
+  } catch (error) {
+    await createPlatform().notify(
+      `copy-current:${tab?.id ?? 'unavailable'}`,
+      'Could not copy current response',
+      error instanceof Error ? error.message : String(error),
+    ).catch(() => undefined);
+  }
+}
+
 async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Promise<{ text: string; restored: boolean } | undefined> {
   const settings = await loadSettings();
   const domMarkdown = job.domMarkdown.trim();
@@ -334,19 +403,22 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
     const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
     let primed = false;
     let observed: string | undefined;
+    let copyConfirmed = false;
     try {
       await platform.writeClipboard(sentinel);
       primed = true;
       if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
       const clickResult = await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
-      const copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
+      copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
         && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
       await new Promise((resolve) => setTimeout(resolve, 250));
       observed = await platform.readClipboard();
       const resemblesDomReport = hasVerifiableDom
         && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
+      const confirmedShortCopy = copyConfirmed && (resemblesDomReport || (allowCopyOnly && !hasVerifiableDom));
       if (observed === sentinel
-        || observed.trim().length < 40
+        || !observed.trim()
+        || (observed.trim().length < 40 && !confirmedShortCopy)
         || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom && copyConfirmed))) {
         throw new Error('Provider copy did not produce a new report.');
       }
@@ -362,7 +434,7 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
     } catch (error) {
       if (primed) {
         const current = await platform.readClipboard().catch(() => undefined);
-        if (current === sentinel) {
+        if (current === sentinel || (copyConfirmed && observed !== undefined && current === observed)) {
           await platform.writeClipboard(original).catch(() => undefined);
         }
       }
@@ -884,6 +956,13 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         });
         await broadcastRuns(); return { ok: true };
       }
+      case 'provider:copy-current': {
+        const run = await getRun(message.runId);
+        const providerRun = run?.providerRuns[message.provider];
+        if (!run || !providerRun) throw new Error('Provider run not found.');
+        await copyCurrentResponse(providerRun.tabId, message.provider);
+        return { ok: true };
+      }
       case 'provider:download': {
         const run = await getRun(message.runId);
         if (!run) throw new Error('Run not found.');
@@ -922,6 +1001,8 @@ export function startCoordinator(): void {
   const platform = createPlatform();
   const action = (browser.action ?? (browser as unknown as { browserAction: typeof browser.action }).browserAction);
   void platform.configurePanelAction();
+  void registerCopyCurrentContextMenu();
+  browser.runtime.onInstalled.addListener(() => { void registerCopyCurrentContextMenu(); });
   browser.runtime.onStartup.addListener(() => { void reconcileRuns(); });
   browser.alarms.onAlarm.addListener((alarm) => { if (alarm.name === ALARM_NAME) void reconcileRuns(); });
   browser.runtime.onMessage.addListener((message: RuntimeRequest, sender) => handleRequest(message, sender));
@@ -931,6 +1012,7 @@ export function startCoordinator(): void {
     void createRun(query).catch(() => undefined);
   });
   action.onClicked.addListener((tab) => { void platform.openPanel(tab.windowId); });
+  browser.contextMenus.onClicked.addListener((info, tab) => { void handleCopyCurrentContextMenu(info, tab); });
   browser.notifications.onClicked.addListener((id) => {
     const parts = id.split(':');
     if ((parts[0] === 'attention' || parts[0] === 'complete') && parts.length === 3) {
@@ -955,6 +1037,9 @@ export const coordinatorTestHooks = {
   recordReconcileCheck,
   interruptRemovedTab,
   resolveCitationUrls,
+  copyCurrentResponse,
+  registerCopyCurrentContextMenu,
+  handleCopyCurrentContextMenu,
   isProviderUrl,
   isProviderAuthenticationUrl,
   markExpectedTabActivation,
@@ -967,6 +1052,7 @@ export const coordinatorTestHooks = {
     browserSessionIdPromise = undefined;
     fallbackBrowserSessionId = undefined;
     captureMutationTails.clear();
+    contextMenuRegistrationTail = Promise.resolve();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
 import { cloneVisibleContent, findElement } from '../src/selectors';
-import { ADAPTERS } from '../src/adapters';
+import { ADAPTERS, providerFromUrl } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
   element.style.position = 'fixed';
@@ -9,6 +9,12 @@ function visible(element: HTMLElement): HTMLElement {
 }
 
 describe('selector engine', () => {
+  it('maps supported provider URLs without requiring a Location object', () => {
+    expect(providerFromUrl('https://gemini.google.com/app/123')).toBe('gemini');
+    expect(providerFromUrl('https://example.com/')).toBeUndefined();
+    expect(providerFromUrl('not a URL')).toBeUndefined();
+  });
+
   it('uses ordered fallbacks and supports selecting the last result', () => {
     document.body.innerHTML = '<button aria-label="Copy">First</button><button aria-label="Copy">Second</button>';
     document.querySelectorAll('button').forEach((item) => visible(item));

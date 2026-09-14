@@ -9,6 +9,7 @@
 - `storage` and `unlimitedStorage`: retain settings plus the newest 20 potentially large research runs and their captures.
 - `alarms`: reconcile long-running work after a background context sleeps.
 - `notifications`: identify completed providers and providers requiring user input.
+- `contextMenus`: offer an explicit “Copy current response” action on the four supported provider sites.
 - `downloads`: save one Markdown status/report artifact per enabled provider.
 - `clipboardRead` and `clipboardWrite`: read provider copy-button output and safely restore the prior clipboard value.
 - `offscreen` (Chrome): provide the DOM context needed for clipboard and Blob URL operations from an MV3 service worker.

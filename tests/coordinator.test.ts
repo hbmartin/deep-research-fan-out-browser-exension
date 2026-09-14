@@ -54,6 +54,10 @@ beforeEach(() => {
     },
     tabs: { update: vi.fn(async () => undefined), get: tabsGet, query: vi.fn(async () => []) },
     tabGroups: { update: vi.fn(async () => undefined) },
+    contextMenus: {
+      remove: vi.fn(async () => undefined),
+      create: vi.fn(),
+    },
   });
   coordinatorTestHooks.resetBrowserSession();
 });
@@ -331,9 +335,10 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(privateText);
   });
 
-  it('rejects short copy-only clipboard data even when provider feedback confirms the click', async () => {
+  it('accepts confirmed short copy-only clipboard data and restores the original clipboard', async () => {
     vi.useFakeTimers();
-    let clipboard = 'Original clipboard material that should not be mistaken for a report.';
+    const original = 'Original clipboard material that should not be mistaken for a report.';
+    let clipboard = original;
     platform.readClipboard.mockImplementation(async () => clipboard);
     platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
     platform.sendTabEvent.mockImplementation(async () => {
@@ -346,7 +351,50 @@ describe('coordinator run guards', () => {
     };
     const pending = coordinatorTestHooks.clipboardCapture(platform, job);
     await vi.runAllTimersAsync();
+    await expect(pending).resolves.toEqual({ text: 'Too short', restored: true });
+    expect(clipboard).toBe(original);
+  });
+
+  it('rejects unconfirmed short clipboard data without overwriting the changed clipboard', async () => {
+    vi.useFakeTimers();
+    const original = 'Original clipboard material that should be restored after a rejected copy.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = 'Too short';
+      return { ok: true, copyConfirmed: false };
+    });
+    const job: CaptureJob = {
+      id: 'run:claude-short-rejected', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
     await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe('Too short');
+  });
+
+  it('restores a confirmed provider value when validation rejects it', async () => {
+    vi.useFakeTimers();
+    const original = 'Original clipboard material that should be restored after a rejected copy.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = 'A different provider response that does not match the visible report.';
+      return { ok: true, copyConfirmed: true };
+    });
+    const job: CaptureJob = {
+      id: 'run:claude-mismatch', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0,
+      domMarkdown: 'The visible provider report has unrelated content and must be used for validation.',
+      domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(original);
   });
 
   it('accepts a fresh provider copy identical to the original clipboard', async () => {
@@ -405,6 +453,87 @@ describe('coordinator run guards', () => {
     await vi.runAllTimersAsync();
     await expect(pending).resolves.toBeUndefined();
     expect(clipboard).toBe(privateText);
+  });
+
+  it('copies a normalized current response without changing provider state', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 44, 'researching') });
+    stored.providerRuns.chatgpt!.submittedAt = 1234;
+    await putRun(stored);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return {
+        domMarkdown: 'Current report with [Evidence](https://example.com/source).',
+        domCitations: [{
+          url: 'https://example.com/source', markerText: 'Evidence', domOrder: 0,
+          contextBefore: 'Current report with ', contextAfter: '.',
+        }],
+      };
+    });
+
+    await expect(coordinatorTestHooks.handleRequest(
+      { type: 'provider:copy-current', runId: stored.id, provider: 'chatgpt' },
+      {} as Browser.runtime.MessageSender,
+    )).resolves.toEqual({ ok: true });
+
+    expect(platform.writeClipboard).toHaveBeenCalledWith(expect.stringContaining('Current report with'));
+    expect(platform.writeClipboard).toHaveBeenCalledWith(expect.stringContaining('## References'));
+    expect(platform.writeClipboard).toHaveBeenCalledWith(expect.not.stringContaining('run_id:'));
+    expect(await getRun(stored.id)).toEqual(stored);
+  });
+
+  it('registers and handles the provider-page Copy current context menu', async () => {
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return { domMarkdown: 'Current Gemini response.', domCitations: [] };
+    });
+
+    await coordinatorTestHooks.registerCopyCurrentContextMenu();
+    expect(browser.contextMenus.create).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'copy-current-research-response',
+      contexts: ['page'],
+      documentUrlPatterns: expect.arrayContaining(['https://gemini.google.com/*']),
+    }));
+
+    await coordinatorTestHooks.handleCopyCurrentContextMenu(
+      { menuItemId: 'copy-current-research-response' } as Browser.contextMenus.OnClickData,
+      { id: 55, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab,
+    );
+    expect(platform.writeClipboard).toHaveBeenCalledWith('Current Gemini response.\n');
+    expect(platform.notify).toHaveBeenCalledWith(
+      'copy-current:55', 'Gemini response copied', 'The current normalized response is on your clipboard.',
+    );
+  });
+
+  it('serializes repeated context-menu registration so no duplicate remains', async () => {
+    const calls: string[] = [];
+    let releaseFirst!: () => void;
+    const firstRemoval = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    vi.mocked(browser.contextMenus.remove)
+      .mockImplementationOnce(async () => { calls.push('remove:first'); await firstRemoval; })
+      .mockImplementationOnce(async () => { calls.push('remove:second'); });
+    vi.mocked(browser.contextMenus.create).mockImplementation(() => { calls.push('create'); return 1; });
+
+    const first = coordinatorTestHooks.registerCopyCurrentContextMenu();
+    const second = coordinatorTestHooks.registerCopyCurrentContextMenu();
+    await vi.waitFor(() => expect(calls).toEqual(['remove:first']));
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(calls).toEqual(['remove:first', 'create', 'remove:second', 'create']);
+  });
+
+  it('notifies when a context-menu current-response copy fails', async () => {
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      throw new Error('No Gemini response is available to copy.');
+    });
+
+    await coordinatorTestHooks.handleCopyCurrentContextMenu(
+      { menuItemId: 'copy-current-research-response' } as Browser.contextMenus.OnClickData,
+      { id: 56, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab,
+    );
+    expect(platform.notify).toHaveBeenCalledWith(
+      'copy-current:56', 'Could not copy current response', 'No Gemini response is available to copy.',
+    );
   });
 
   it.each([false, true])('reports durable capture acceptance as %s when resuming capturing', async (accepted) => {
@@ -754,6 +883,20 @@ describe('durable acceptance and state recovery regressions', () => {
     const nextTimeout = await coordinatorTestHooks.handleRequest({...request,submittedAt:resumedAt},{});
     expect(nextTimeout).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt:resumedAt,researchTimedOutAt:expect.any(Number)}});
     expect(platform.notify).toHaveBeenCalledTimes(2);
+  });
+  it('accepts an explicitly fresh research interval while the stored status still says researching', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    const priorSubmittedAt = Date.now() - 60_000;
+    const resumedAt = Date.now();
+    stored.providerRuns.chatgpt!.submittedAt = priorSubmittedAt;
+    stored.providerRuns.chatgpt!.researchTimedOutAt = Date.now() - 1000;
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',submittedAt:resumedAt,
+    },{})).resolves.toEqual({
+      ok:true,providerState:{status:'researching',submittedAt:resumedAt,researchTimedOutAt:undefined},
+    });
   });
   it('acknowledges a stored state even if notification delivery fails', async () => {
     vi.spyOn(console,'error').mockImplementation(() => undefined);

@@ -86,6 +86,17 @@ export interface ResponseSnapshot {
   text: string;
 }
 
+const BARE_DURATION = /^\d{1,3}:\d{2}(?::\d{2})?$/;
+const EXPLICIT_ELAPSED_DURATION = /^(?:elapsed(?: time)?[:\s]+\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i;
+
+function isElapsedTimerElement(element: Element): boolean {
+  const text = normalizeVisibleText(element.textContent ?? '');
+  if (EXPLICIT_ELAPSED_DURATION.test(text)) return true;
+  if (!BARE_DURATION.test(text)) return false;
+  return [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid')]
+    .some((value) => value !== null && /\belapsed(?:[\s_-]+(?:time|timer))?\b/i.test(value));
+}
+
 const TEXT_BOUNDARY_ELEMENTS = new Set([
   'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'BR', 'DD', 'DIV', 'DL', 'DT',
   'FIGCAPTION', 'FIGURE', 'FOOTER', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
@@ -116,13 +127,7 @@ function structurallySeparatedText(root: HTMLElement): string {
 export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   const content = cloneResponseContent(root);
   for (const element of Array.from(content.querySelectorAll('*'))) {
-    if (element.children.length) continue;
-    const text = normalizeVisibleText(element.textContent ?? '');
-    const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid')]
-      .filter(Boolean).join(' ');
-    const explicitlyElapsed = /\belapsed(?:\s+time)?\b/i.test(label)
-      || /^(?:elapsed(?: time)?[:\s]+\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i.test(text);
-    if (explicitlyElapsed) element.remove();
+    if (isElapsedTimerElement(element)) element.remove();
   }
   return { root, content, text: structurallySeparatedText(content) };
 }
@@ -171,9 +176,9 @@ function finalResponseSignature(root: HTMLElement): string {
   return stableId ? `id:${stableId}` : `text:${normalizeVisibleText(root.innerText || root.textContent || '')}`;
 }
 
-export function finalResponseFingerprint(root: HTMLElement): string {
+export function finalResponseFingerprint(root: HTMLElement, snapshot?: ResponseSnapshot): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
-  const text = normalizeVisibleText(root.innerText || root.textContent || '');
+  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
   return `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${text}`;
 }
 

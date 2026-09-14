@@ -1,9 +1,9 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
-import type { BackgroundEvent, ProviderSnapshot } from '@/src/messages';
+import type { BackgroundEvent, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
 import { captureGrokResearchTrail } from '@/src/sources';
 import { isSetupProviderStatus } from '@/src/state';
@@ -34,9 +34,15 @@ interface ActiveRun {
   automationInFlight: boolean;
   submissionAttempted: boolean;
   manualSetupRequired: boolean;
-  timeoutActivityFingerprint?: string;
-  timeoutObservedInactive: boolean;
+  timeoutActivity: TimeoutActivity;
+  timeoutPlanObserved: boolean;
+  autoApprovedPlans: WeakSet<HTMLElement>;
 }
+
+type TimeoutActivity =
+  | { phase: 'uninitialized' }
+  | { phase: 'quiet_candidate'; fingerprint: string; since: number }
+  | { phase: 'armed'; fingerprint: string };
 
 let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
@@ -56,16 +62,13 @@ function assertCurrent(run: ActiveRun): void {
 
 function applyProviderState(run: ActiveRun, snapshot: ProviderSnapshot): void {
   if (active !== run || run.stopped || run.captureSent) return;
-  const priorStatus = run.status;
   run.status = snapshot.status;
-  if (snapshot.submittedAt !== undefined) run.submittedAt = snapshot.submittedAt;
-  if (snapshot.status === 'researching' && priorStatus !== 'researching') {
-    run.researchTimedOutAt = undefined;
-    run.timeoutActivityFingerprint = undefined;
-    run.timeoutObservedInactive = false;
+  run.submittedAt = snapshot.submittedAt;
+  run.researchTimedOutAt = snapshot.researchTimedOutAt;
+  if (snapshot.researchTimedOutAt === undefined) {
+    run.timeoutActivity = { phase: 'uninitialized' };
+    run.timeoutPlanObserved = false;
     run.timeoutGraceUntil = undefined;
-  } else if (snapshot.researchTimedOutAt !== undefined) {
-    run.researchTimedOutAt = snapshot.researchTimedOutAt;
   }
   if (isTerminalProviderStatus(snapshot.status)) stopRun(run);
 }
@@ -74,20 +77,14 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
   if (!active) return;
   const run = active;
   assertCurrent(run);
-  if (status === 'researching') {
-    if (run.status !== 'researching') {
-      run.submittedAt = submittedAt ?? Date.now();
-      run.researchTimedOutAt = undefined;
-      run.timeoutActivityFingerprint = undefined;
-      run.timeoutObservedInactive = false;
-      run.timeoutGraceUntil = undefined;
-    } else {
-      run.submittedAt ??= submittedAt ?? Date.now();
-    }
-  }
+  const reportSubmittedAt = status === 'researching'
+    ? submittedAt ?? (run.status !== 'researching' || run.researchTimedOutAt !== undefined
+      ? Date.now()
+      : run.submittedAt ?? Date.now())
+    : run.submittedAt;
   await run.reporter.report({
     type: 'content:state', runId: run.id, provider: run.adapter.id,
-    status, detail, submittedAt: run.submittedAt, reason,
+    status, detail, submittedAt: reportSubmittedAt, reason,
   });
   if (!isTerminalProviderStatus(status)) assertCurrent(run);
 }
@@ -102,9 +99,8 @@ function reportEventually(status: ProviderRunStatus, detail?: string, submittedA
 function reportTimeout(): void {
   if (!active || active.researchTimedOutAt !== undefined) return;
   active.researchTimedOutAt = Date.now();
-  const latestResponse = responseRoots(active.adapter).at(-1) ?? null;
-  active.timeoutActivityFingerprint = latestResponse ? finalResponseFingerprint(latestResponse) : undefined;
-  active.timeoutObservedInactive = !findStreamingIndicator(active.adapter, latestResponse);
+  active.timeoutActivity = { phase: 'uninitialized' };
+  active.timeoutPlanObserved = false;
   reportEventually('manual_required', `${active.adapter.label} has not completed after 45 minutes. Check the provider tab.`, undefined, 'research_timeout');
 }
 
@@ -195,9 +191,9 @@ async function automate(): Promise<void> {
   }
   const submitted = await waitFor(() => {
     const text = composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? '';
-    const streaming = findElement(adapter.selectors.streamingIndicator);
-    const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
     const latestResponse = responseRoots(adapter).at(-1) ?? null;
+    const streaming = findStreamingIndicator(adapter, latestResponse);
+    const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
     const responseStarted = isNewFinalResponse(latestResponse, submissionBaseline);
     return !text.trim() && (isInteractiveProgressIndicator(streaming) || plan || responseStarted) ? composer : null;
   }, 5000);
@@ -218,6 +214,18 @@ function contentToMarkdown(content: HTMLElement): string {
 
 function responseRoots(adapter: ProviderAdapter): HTMLElement[] {
   return findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY);
+}
+
+function currentResponseSnapshot(adapter: ProviderAdapter): CurrentResponseSnapshot {
+  const root = responseRoots(adapter).at(-1);
+  if (!root) throw new Error(`No ${adapter.label} response is available to copy.`);
+  const snapshot = createResponseSnapshot(root);
+  const domMarkdown = contentToMarkdown(snapshot.content);
+  if (!snapshot.text || !domMarkdown) throw new Error(`The current ${adapter.label} response is empty.`);
+  return {
+    domMarkdown,
+    domCitations: domCitationInventory(root, adapter, snapshot),
+  };
 }
 
 function obscuringAncestors(element: HTMLElement): Set<HTMLElement> {
@@ -250,6 +258,35 @@ function isInteractiveProgressIndicator(element: HTMLElement | null): boolean {
   return Boolean(element && (element instanceof HTMLButtonElement
     || element.getAttribute('role') === 'button'
     || (element instanceof HTMLInputElement && ['button', 'submit'].includes(element.type))));
+}
+
+function observeTimeoutQuiescence(
+  run: ActiveRun,
+  root: HTMLElement | null,
+  snapshot: ResponseSnapshot | undefined,
+  blocked: boolean,
+  now: number,
+): void {
+  if (run.researchTimedOutAt === undefined || run.timeoutActivity.phase === 'armed') return;
+  if (!root || !snapshot || blocked) {
+    run.timeoutActivity = { phase: 'uninitialized' };
+    return;
+  }
+  const fingerprint = finalResponseFingerprint(root, snapshot);
+  if (run.timeoutActivity.phase !== 'quiet_candidate' || run.timeoutActivity.fingerprint !== fingerprint) {
+    run.timeoutActivity = { phase: 'quiet_candidate', fingerprint, since: now };
+    return;
+  }
+  if (now - run.timeoutActivity.since >= run.completionDebounceMs) {
+    run.timeoutActivity = { phase: 'armed', fingerprint };
+  }
+}
+
+function timedOutActivityResumed(run: ActiveRun, fingerprint: string | undefined, interactive: boolean): boolean {
+  if (run.researchTimedOutAt === undefined) return false;
+  if (run.timeoutPlanObserved) return interactive || fingerprint !== undefined;
+  return run.timeoutActivity.phase === 'armed'
+    && (interactive || (fingerprint !== undefined && fingerprint !== run.timeoutActivity.fingerprint));
 }
 
 function copyControlFields(button: HTMLElement): string[] {
@@ -354,7 +391,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
     try {
       await capturingRun.reporter.idle();
       assertCurrent(capturingRun);
-      await sendContentMessage({
+      const response = await sendContentMessage({
         type: 'content:capture',
         runId: capturingRun.id,
         provider: capturingRun.adapter.id,
@@ -363,6 +400,11 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
         researchTrail,
         title,
         copyControlObserved,
+      });
+      applyProviderState(capturingRun, response?.providerState ?? {
+        status: 'capturing',
+        submittedAt: capturingRun.submittedAt,
+        researchTimedOutAt: capturingRun.researchTimedOutAt,
       });
     } catch (error) {
       if (error instanceof ContentMessageError && error.providerState) applyProviderState(capturingRun, error.providerState);
@@ -374,7 +416,6 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
       throw error;
     }
     if (active === capturingRun && !capturingRun.stopped) {
-      active.status = 'capturing';
       active.captureSent = true;
       capturingRun.captureFailureCount = 0;
       capturingRun.captureRetryAt = 0;
@@ -402,8 +443,10 @@ function inspectPage(): void {
     return;
   }
   if (active.captureInFlight || active.automationInFlight || isSetupProviderStatus(active.status)) return;
-  const researchTimedOut = active.status === 'researching' && active.submittedAt !== undefined
-    && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS;
+  const now = Date.now();
+  const researchTimeoutDue = active.researchTimedOutAt === undefined
+    && active.status === 'researching' && active.submittedAt !== undefined
+    && now - active.submittedAt >= RESEARCH_TIMEOUT_MS;
   const finalRoots = responseRoots(adapter);
   if (active.status !== 'capturing' && active.captureFailureCount === 0
     && findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
@@ -414,36 +457,27 @@ function inspectPage(): void {
   const latestResponse = finalRoots.at(-1) ?? null;
   const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
   const root = newResponse;
-  const streaming = findStreamingIndicator(adapter, root);
-  const responseActivityResumed = active.researchTimedOutAt === undefined;
-  const streamingActivityResumed = responseActivityResumed || active.timeoutObservedInactive;
-  const progressActivityResumed = responseActivityResumed || (active.timeoutObservedInactive && Boolean(root
-    && finalResponseFingerprint(root) !== active.timeoutActivityFingerprint));
+  const streaming = findStreamingIndicator(adapter, latestResponse);
+  const interactiveStreaming = isInteractiveProgressIndicator(streaming);
   if (plan) {
     active.completionCandidate = undefined;
-    if (active.geminiAutoApprove) {
+    if (researchTimeoutDue) reportTimeout();
+    if (active.researchTimedOutAt !== undefined) active.timeoutPlanObserved = true;
+    if (active.geminiAutoApprove && !active.autoApprovedPlans.has(plan)) {
+      active.autoApprovedPlans.add(plan);
       plan.click();
-      if (active.status === 'awaiting_user' || active.researchTimedOutAt !== undefined) {
-        reportEventually('researching', undefined, Date.now());
-      }
     }
-    else if (active.status !== 'awaiting_user') reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
-    return;
-  }
-  if ((active.status === 'manual_required' || active.status === 'submitting') && root && responseActivityResumed) {
-    reportEventually('researching', undefined, Date.now());
-    return;
-  }
-  if (streaming) {
-    active.completionCandidate = undefined;
-    if (researchTimedOut) reportTimeout();
-    else if (active.status === 'awaiting_user'
-      || ((active.status === 'manual_required' || active.status === 'submitting') && streamingActivityResumed)) {
-      reportEventually('researching', undefined, Date.now());
+    else if (!active.geminiAutoApprove && active.researchTimedOutAt === undefined && active.status !== 'awaiting_user') {
+      reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
     }
     return;
   }
-  const responseSnapshot = root ? createResponseSnapshot(root) : undefined;
+  const latestSnapshot = latestResponse ? createResponseSnapshot(latestResponse) : undefined;
+  const responseSnapshot = root && latestSnapshot?.root === root ? latestSnapshot : undefined;
+  const activityFingerprint = latestResponse && latestSnapshot
+    ? finalResponseFingerprint(latestResponse, latestSnapshot)
+    : undefined;
+  observeTimeoutQuiescence(active, latestResponse, latestSnapshot, Boolean(streaming), now);
   if (active.status !== 'capturing' && isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern, responseSnapshot)) {
     active.completionCandidate = undefined;
     if (active.status !== 'awaiting_user') reportEventually('awaiting_user', `${adapter.label} is asking a clarifying question.`);
@@ -459,33 +493,46 @@ function inspectPage(): void {
     : null;
   if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy), responseSnapshot)) {
     active.completionCandidate = undefined;
-    if (researchTimedOut) reportTimeout();
-    else if (active.status === 'awaiting_user'
-      || ((active.status === 'manual_required' || active.status === 'submitting') && progressActivityResumed)) {
+    if (researchTimeoutDue) reportTimeout();
+    else if (timedOutActivityResumed(active, activityFingerprint, false)
+      || (active.researchTimedOutAt === undefined
+        && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
       reportEventually('researching', undefined, Date.now());
-    } else if (active.researchTimedOutAt !== undefined && active.status === 'manual_required') {
-      // A timed-out streaming interval has now gone quiet. A later change to
-      // this progress response is new activity and receives a fresh budget.
-      active.timeoutObservedInactive = true;
     }
     return;
   }
-  if (active.researchTimedOutAt !== undefined && active.status === 'manual_required') active.timeoutObservedInactive = true;
-  const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, Date.now(), active.completionDebounceMs, responseSnapshot);
+  if (streaming) {
+    active.completionCandidate = undefined;
+    if (researchTimeoutDue) reportTimeout();
+    else if (timedOutActivityResumed(active, activityFingerprint, interactiveStreaming)
+      || (interactiveStreaming && active.researchTimedOutAt === undefined
+        && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
+      reportEventually('researching', undefined, Date.now());
+    }
+    return;
+  }
+  if (active.researchTimedOutAt === undefined
+    && (active.status === 'manual_required' || active.status === 'submitting') && root) {
+    reportEventually('researching', undefined, Date.now());
+    return;
+  }
+  // Copy-backed short responses are deliberately considered only after plan,
+  // clarification, quota, progress, and streaming classifiers have all failed.
+  const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, now, active.completionDebounceMs, responseSnapshot);
   active.completionCandidate = completion.candidate;
-  if (researchTimedOut && !completion.ready) {
-    active.timeoutGraceUntil ??= Date.now() + (copy ? active.completionDebounceMs : Math.max(30_000, active.completionDebounceMs * 3));
-    if (!completion.candidate || Date.now() >= active.timeoutGraceUntil) reportTimeout();
+  if (researchTimeoutDue && !completion.ready) {
+    active.timeoutGraceUntil ??= now + (copy ? active.completionDebounceMs : Math.max(30_000, active.completionDebounceMs * 3));
+    if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout();
   }
   if (completion.ready && root) {
-    if (Date.now() < active.captureRetryAt) return;
+    if (now < active.captureRetryAt) return;
     const sourceSelectors = adapter.selectors.sourcesPanelToggle;
     if (sourceSelectors) {
       const possibleToggle = controls.find(root, sourceSelectors, new Set(), true, true);
       if (possibleToggle?.isConnected
         && !isResponseControlActionable(possibleToggle, true, root)
         && isModalBlockedControl(possibleToggle, root)) {
-        if (researchTimedOut) reportTimeout();
+        if (researchTimeoutDue) reportTimeout();
         return;
       }
     }
@@ -551,13 +598,6 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
-    if (active.researchTimedOutAt === undefined && event.researchTimedOutAt !== undefined) {
-      active.researchTimedOutAt = event.researchTimedOutAt;
-      const latestResponse = responseRoots(active.adapter).at(-1) ?? null;
-      active.timeoutActivityFingerprint = latestResponse ? finalResponseFingerprint(latestResponse) : undefined;
-      active.timeoutObservedInactive = !findStreamingIndicator(active.adapter, latestResponse);
-    }
-    active.submittedAt ??= event.submittedAt;
     beginMonitoring();
     if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
     await runAutomation(active);
@@ -566,7 +606,8 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   if (active) stopRun(active);
   const adapter = ADAPTERS[event.provider];
   const existingRoots = responseRoots(adapter);
-  const streaming = findElement(adapter.selectors.streamingIndicator);
+  const latestExistingResponse = existingRoots.at(-1) ?? null;
+  const streaming = findStreamingIndicator(adapter, latestExistingResponse);
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const setup = isSetupProviderStatus(event.status);
   const resumedSubmissionConfirmed = !setup && event.status === 'submitting'
@@ -587,12 +628,15 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     automationInFlight: false,
     submissionAttempted: !setup,
     manualSetupRequired: false,
-    timeoutActivityFingerprint: event.researchTimedOutAt === undefined || !existingRoots.at(-1)
-      ? undefined
-      : finalResponseFingerprint(existingRoots.at(-1)!),
-    timeoutObservedInactive: event.researchTimedOutAt !== undefined && !findStreamingIndicator(adapter, existingRoots.at(-1)),
+    timeoutActivity: { phase: 'uninitialized' },
+    timeoutPlanObserved: false,
+    autoApprovedPlans: new WeakSet(),
     reporter: new ProviderReporter((request, response) => {
-      applyProviderState(run, response?.providerState ?? { status: request.status, submittedAt: request.submittedAt });
+      applyProviderState(run, response?.providerState ?? {
+        status: request.status,
+        submittedAt: request.submittedAt,
+        researchTimedOutAt: request.status === 'researching' ? undefined : run.researchTimedOutAt,
+      });
     }, (error) => {
       if (active !== run) return;
       if (error.providerState) applyProviderState(run, error.providerState);
@@ -625,6 +669,9 @@ export default defineContentScript({
         // wait for the same worker's state-report retries to finish.
         void start(message).catch((error) => console.error('Provider startup could not finish.', error));
         return { ok: true };
+      }
+      if (message.type === 'capture:dom-current' && message.provider === provider) {
+        return currentResponseSnapshot(ADAPTERS[provider]);
       }
       if (message.type === 'capture:copy-now' && active) {
         const roots = responseRoots(active.adapter);

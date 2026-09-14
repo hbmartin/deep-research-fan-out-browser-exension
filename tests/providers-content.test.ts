@@ -64,6 +64,22 @@ async function resume(status: 'researching' | 'capturing' | 'submitting', captur
 function captures() { return messages.filter((message) => message.type === 'content:capture'); }
 
 describe('provider content-script recovery', () => {
+  it('returns the latest normalized DOM snapshot without an active run', async () => {
+    answer('Current response with supporting evidence.');
+    document.querySelector('h2')!.insertAdjacentHTML('beforeend', ' <a style="position:fixed" href="https://example.com/source">Source</a>');
+    const result = await listener({ type: 'capture:dom-current', provider: 'chatgpt' });
+    expect(result).toMatchObject({
+      domMarkdown: expect.stringContaining('Current response with supporting evidence.'),
+      domCitations: [expect.objectContaining({ url: 'https://example.com/source' })],
+    });
+    expect(captures()).toHaveLength(0);
+  });
+
+  it('reports a useful error when no current response exists', async () => {
+    await expect(listener({ type: 'capture:dom-current', provider: 'chatgpt' }))
+      .rejects.toThrow('No ChatGPT response is available to copy.');
+  });
+
   it('control: resuming researching captures an already rendered report', async () => {
     answer();
     await resume('researching');
@@ -542,6 +558,113 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(10000);
     expect(captures()).toHaveLength(1);
   });
+  it('does not arm timeout recovery from empty pre-hydration DOM', async () => {
+    storedStatus = 'manual_required';
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+    await vi.advanceTimersByTimeAsync(10000);
+    document.body.innerHTML = `
+      <div style="position:fixed" data-message-author-role="assistant"><p>Researching the requested topic now…</p></div>
+      <button style="position:fixed" aria-label="Stop generating"></button>
+    `;
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(messages).not.toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
+
+    document.querySelector('button')!.remove();
+    await vi.advanceTimersByTimeAsync(6000);
+    document.querySelector('p')!.textContent = 'Searching the requested topic now…';
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(messages).toContainEqual(expect.objectContaining({type:'content:state',status:'researching',submittedAt:expect.any(Number)}));
+  });
+  it('ignores ticking elapsed counters and modal-only mutations after a quiet timeout checkpoint', async () => {
+    document.body.innerHTML = `
+      <main><div style="position:fixed" data-message-author-role="assistant">
+        <p>Researching the requested topic now…</p>
+        <span aria-label="Elapsed time">00:30</span>
+      </div></main>
+    `;
+    storedStatus = 'manual_required';
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+    await vi.advanceTimersByTimeAsync(4000);
+    for (let second = 31; second <= 36; second++) {
+      document.querySelector('[aria-label="Elapsed time"]')!.textContent = `00:${second}`;
+      document.querySelector('main')!.toggleAttribute('aria-hidden');
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(messages).not.toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
+
+    const resumedAt = Date.now();
+    document.querySelector('p')!.textContent = 'Searching the requested topic now…';
+    await vi.advanceTimersByTimeAsync(2000);
+    const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
+    expect(resumed).toMatchObject({submittedAt:expect.any(Number)});
+    expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
+  });
+  it('lets a text-only streaming selector block capture without promoting timeout state', async () => {
+    const activeAdapters = (await import('../src/adapters')).ADAPTERS;
+    const selectors = activeAdapters.chatgpt.selectors.streamingIndicator;
+    activeAdapters.chatgpt.selectors.streamingIndicator = [{kind:'text',value:/^working on it…$/i}];
+    try {
+      document.body.innerHTML = `
+        <div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p></div>
+        <span style="position:fixed">Working on it…</span>
+      `;
+      storedStatus = 'manual_required';
+      await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+      await vi.advanceTimersByTimeAsync(40000);
+      expect(messages).not.toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
+      expect(captures()).toHaveLength(0);
+    } finally {
+      activeAdapters.chatgpt.selectors.streamingIndicator = selectors;
+    }
+  });
+  it('serializes a delayed timeout acknowledgement before verified resumed research', async () => {
+    const firstInterval = Date.now() - 45 * 60 * 1000;
+    document.body.innerHTML = '<div style="position:fixed" data-message-author-role="assistant"><p>Researching the requested topic now…</p></div>';
+    let releaseTimeout!: () => void;
+    let releaseResume!: () => void;
+    const timeoutGate = new Promise<void>((resolve) => { releaseTimeout = resolve; });
+    const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      const request = message as RuntimeRequest;
+      if (request.type === 'content:state' && request.reason === 'research_timeout') {
+        messages.push(request);
+        await timeoutGate;
+        storedStatus = 'manual_required';
+        return {ok:true,providerState:{status:'manual_required',submittedAt:firstInterval,researchTimedOutAt:Date.now()}};
+      }
+      if (request.type === 'content:state' && request.status === 'researching') {
+        messages.push(request);
+        await resumeGate;
+        storedStatus = 'researching';
+        return {ok:true,providerState:{status:'researching',submittedAt:request.submittedAt,researchTimedOutAt:undefined}};
+      }
+      return original(message);
+    });
+
+    await resume('researching', false, firstInterval);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(messages.some((message) => message.type === 'content:state' && message.reason === 'research_timeout')).toBe(true));
+    await vi.advanceTimersByTimeAsync(10_000);
+    const resumedAt = Date.now();
+    document.querySelector('p')!.textContent = 'Searching the requested topic now…';
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(messages.filter((message) => message.type === 'content:state' && message.status === 'researching')).toHaveLength(0);
+
+    releaseTimeout();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(messages.some((message) => message.type === 'content:state' && message.status === 'researching')).toBe(true));
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:firstInterval, researchTimedOutAt:Date.now()-1000});
+    releaseResume();
+    await vi.advanceTimersByTimeAsync(0);
+    const resumed = messages.filter((message) => message.type === 'content:state' && message.status === 'researching').at(-1)!;
+    expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
+    await vi.advanceTimersByTimeAsync(44 * 60 * 1000);
+    expect(storedStatus).toBe('researching');
+    await vi.advanceTimersByTimeAsync(65 * 1000);
+    expect(storedStatus).toBe('manual_required');
+  });
   it('pauses timeout during clarification and grants a fresh interval when research resumes', async () => {
     answer('Before I begin, could you specify the target market?');
     const firstInterval = Date.now() - 45 * 60 * 1000;
@@ -602,6 +725,24 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(40000);
     expect(captures()).toHaveLength(1);
   });
+  it('does not baseline a stable-id response when same-layer hidden streaming confirms a resumed submission', async () => {
+    document.body.innerHTML = `
+      <main aria-hidden="true">
+        <section>
+          <div data-message-id="stable-answer" style="position:fixed" data-message-author-role="assistant"><p>Initial partial answer</p></div>
+          <button style="position:fixed" aria-label="Stop generating"></button>
+          <button style="position:fixed" aria-label="Copy response">Copy</button>
+        </section>
+      </main>
+    `;
+    await resume('submitting');
+    expect(storedStatus).toBe('researching');
+    document.querySelector('[aria-label="Stop generating"]')!.remove();
+    document.querySelector('main')!.removeAttribute('aria-hidden');
+    document.querySelector('p')!.textContent = report;
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+  });
   it('ignores an ancestor-hidden historical streaming indicator in another response layer', async () => {
     document.body.innerHTML = `
       <section aria-hidden="true">
@@ -630,7 +771,7 @@ describe('provider reliability regressions', () => {
     expect(click).toHaveBeenCalledTimes(2);
     expect(captures()).toHaveLength(1);
   });
-  it('releases the capture guard when synchronous snapshot setup throws', async () => {
+  it('retries after synchronous inspection snapshot setup throws', async () => {
     vi.spyOn(console,'error').mockImplementation(() => undefined);
     answer();
     const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
@@ -712,15 +853,20 @@ describe('capture cancellation and setup exceptions', () => {
     expect(captures()).toHaveLength(1);
     expect(reads).toBeGreaterThan(1);
   });
-  it('releases the guard after Sources-control setup throws', async () => {
+  it('releases the capture guard after synchronous Sources-control setup throws', async () => {
     vi.spyOn(console,'error').mockImplementation(() => undefined);
     const {ResponseControlIndex}=await import('../src/response-controls');
     const find=ResponseControlIndex.prototype.find;
+    const copySelectors=(await import('../src/adapters')).ADAPTERS.chatgpt.selectors.copyButton;
     const sourceSelectors=(await import('../src/adapters')).ADAPTERS.chatgpt.selectors.sourcesPanelToggle;
     let failed=false;
-    let sourceLookups=0;
+    let inspectionIndex: InstanceType<typeof ResponseControlIndex> | undefined;
     vi.spyOn(ResponseControlIndex.prototype,'find').mockImplementation(function(this: InstanceType<typeof ResponseControlIndex>,root,selectors,baseline,hover,includeBlocked){
-      if (selectors===sourceSelectors && ++sourceLookups===2) { failed=true; throw new Error('source control failed'); }
+      if (selectors===copySelectors) inspectionIndex=this;
+      if (!failed && selectors===sourceSelectors && inspectionIndex && this!==inspectionIndex) {
+        failed=true;
+        throw new Error('source control failed');
+      }
       return find.call(this,root,selectors,baseline,hover,includeBlocked);
     });
     answer();

@@ -11,6 +11,8 @@ Both targets provide the address-bar keyword `dr`, side panel/sidebar dashboard,
 
 Grok captures the complete Sources sidebar into a search index and globally deduplicated source catalog. Source titles and URLs are always included; snippets and outbound links are enabled by default and can be disabled in Options. If Grok reports more results than the extension can capture, the available sources are still saved with an explicit warning and degraded status.
 
+While a provider is still running, use **Copy current** in its side-panel row or **Copy current response** in the provider page’s context menu. This copies normalized Markdown and visible references without saving a capture or changing the run state.
+
 ## Development
 
 Requirements: Node.js 22 and pnpm 11.
