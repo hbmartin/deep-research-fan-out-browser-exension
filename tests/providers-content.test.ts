@@ -347,7 +347,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => document.dispatchEvent(new Event('copy')));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
@@ -356,7 +356,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => button.setAttribute('title', 'Response copied to the clipboard successfully'));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
@@ -596,7 +596,8 @@ describe('provider reliability regressions', () => {
     document.body.innerHTML = `
       <main><div style="position:fixed" data-message-author-role="assistant">
         <p>Researching the requested topic now…</p>
-        <span aria-label="Elapsed time">00:30</span>
+        <p><span aria-label="Elapsed time">00:30</span></p>
+        <li id="inline-timer">Progress details — elapsed time: 1m 30s</li>
       </div></main>
     `;
     storedStatus = 'manual_required';
@@ -604,6 +605,7 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(4000);
     for (let second = 31; second <= 36; second++) {
       document.querySelector('[aria-label="Elapsed time"]')!.textContent = `00:${second}`;
+      document.querySelector('#inline-timer')!.textContent = `Progress details — elapsed time: 1m ${second}s`;
       document.querySelector('main')!.toggleAttribute('aria-hidden');
       await vi.advanceTimersByTimeAsync(1000);
     }
@@ -615,6 +617,25 @@ describe('provider reliability regressions', () => {
     const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
     expect(resumed).toMatchObject({submittedAt:expect.any(Number)});
     expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
+  });
+  it('keeps a timeout checkpoint through a missing root and an identical restoration', async () => {
+    answer('Researching the requested topic now…');
+    document.body.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Stop generating" aria-valuenow="10"></button>');
+    storedStatus = 'manual_required';
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+    await vi.advanceTimersByTimeAsync(3000);
+
+    const originalHtml = document.body.innerHTML;
+    document.body.replaceChildren();
+    await vi.advanceTimersByTimeAsync(3000);
+    document.body.innerHTML = originalHtml;
+    document.querySelector('[aria-label="Stop generating"]')!.setAttribute('aria-valuenow', '11');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(messages).not.toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
+
+    document.querySelector('h2')!.textContent = 'Searching the requested topic now…';
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(messages).toContainEqual(expect.objectContaining({type:'content:state',status:'researching'}));
   });
   it('lets a text-only streaming selector block capture without promoting timeout state', async () => {
     const activeAdapters = (await import('../src/adapters')).ADAPTERS;
@@ -945,16 +966,19 @@ describe('capture cancellation and setup exceptions', () => {
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
   });
-  it('does not extend the timeout grace period when a partial response keeps changing', async () => {
-    answer();
+  it('starts a fresh interval only after a timed-out response genuinely changes', async () => {
+    answer('A short partial response that is not yet complete.');
+    document.querySelector('button')!.remove();
     await resume('researching',false,Date.now()-3600000);
-    for(let i=0;i<10;i++) {
-      document.querySelector('h2')!.textContent=`${report} Progress update ${i}.`;
-      await vi.advanceTimersByTimeAsync(1000);
-    }
+    await vi.advanceTimersByTimeAsync(35_000);
     expect(storedStatus).toBe('manual_required');
     expect(captures()).toHaveLength(0);
-    await vi.advanceTimersByTimeAsync(10000);
-    expect(captures()).toHaveLength(1);
+
+    const resumedAt = Date.now();
+    document.querySelector('h2')!.textContent = 'A genuinely changed partial response with a new research result.';
+    await vi.advanceTimersByTimeAsync(2000);
+    const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
+    expect(resumed).toMatchObject({submittedAt:expect.any(Number)});
+    expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
   });
 });

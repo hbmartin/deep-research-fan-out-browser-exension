@@ -36,6 +36,14 @@ describe('bounded response ownership', () => {
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
   });
+  it('collapses nested response selector matches before applying the single-root fallback', () => {
+    document.body.innerHTML = `<section><article id="outer"><article id="inner">Report</article></article>${copy}</section>`;
+    const outer = document.querySelector<HTMLElement>('#outer')!;
+    const inner = document.querySelector<HTMLElement>('#inner')!;
+    const controls = new ResponseControlIndex([outer, inner]);
+    expect(controls.find(outer, selectors, new Set(), true)).toBe(document.querySelector('button'));
+    expect(controls.find(inner, selectors, new Set(), true)).toBeNull();
+  });
   it('does not assign a shared plain-container control to the nearest preceding response', () => {
     document.body.innerHTML = `<div><article>Earlier</article><article>Latest</article>${copy}</div>`;
     const { roots, controls } = index();

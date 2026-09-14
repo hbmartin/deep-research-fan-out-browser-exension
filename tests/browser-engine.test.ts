@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
 import { cloneVisibleContent, findElement } from '../src/selectors';
-import { ADAPTERS, conversationKeyFromUrl, providerFromUrl } from '../src/adapters';
+import { ADAPTERS, classifyProviderPage, conversationKeyFromUrl, conversationKeysMatch, normalizeConversationKey, providerFromUrl } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
   element.style.position = 'fixed';
@@ -19,9 +19,43 @@ describe('selector engine', () => {
     expect(conversationKeyFromUrl(
       'https://chatgpt.com/c/123/?utm_source=test&model=research#sources',
       'chatgpt',
-    )).toBe('https://chatgpt.com/c/123?model=research');
+    )).toBe('https://chatgpt.com/c/123');
     expect(conversationKeyFromUrl('https://claude.ai/new?utm_source=test&model=opus', 'claude')).toBeUndefined();
     expect(conversationKeyFromUrl('https://example.com/c/123', 'chatgpt')).toBeUndefined();
+  });
+
+  it.each([
+    ['chatgpt', 'https://chatgpt.com/c/123/?model=research#sources', 'https://chatgpt.com/c/123'],
+    ['claude', 'https://claude.ai/chat/123/?model=opus#last', 'https://claude.ai/chat/123'],
+    ['gemini', 'https://gemini.google.com/app/123/?hl=en#sources', 'https://gemini.google.com/app/123'],
+    ['grok', 'https://grok.com/c/123/?ref=sidebar#answer', 'https://grok.com/c/123'],
+  ] as const)('classifies canonical %s conversation routes', (provider, url, key) => {
+    expect(classifyProviderPage(url, provider)).toEqual({ kind: 'conversation', key });
+  });
+
+  it.each([
+    ['chatgpt', 'https://chatgpt.com/?model=research'],
+    ['claude', 'https://claude.ai/new/#composer'],
+    ['gemini', 'https://gemini.google.com/app/?hl=en'],
+    ['grok', 'https://grok.com/#composer'],
+  ] as const)('classifies the %s entry route without inventing a key', (provider, url) => {
+    expect(classifyProviderPage(url, provider)).toEqual({ kind: 'entry' });
+  });
+
+  it.each([
+    ['chatgpt', 'https://chatgpt.com/c/123/shared'],
+    ['claude', 'https://claude.ai/project/123'],
+    ['gemini', 'https://gemini.google.com/app/download'],
+    ['grok', 'https://grok.com/share/123'],
+  ] as const)('defers unsupported %s paths', (provider, url) => {
+    expect(classifyProviderPage(url, provider)).toEqual({ kind: 'unsupported' });
+  });
+
+  it('normalizes compatible legacy keys before comparing them', () => {
+    const legacy = 'https://chatgpt.com/c/123/?model=research&utm_source=old#sources';
+    expect(normalizeConversationKey(legacy, 'chatgpt')).toBe('https://chatgpt.com/c/123');
+    expect(conversationKeysMatch(legacy, 'https://chatgpt.com/c/123?model=fast', 'chatgpt')).toBe(true);
+    expect(conversationKeysMatch(legacy, 'https://chatgpt.com/c/other', 'chatgpt')).toBe(false);
   });
 
   it('uses ordered fallbacks and supports selecting the last result', () => {
@@ -112,6 +146,16 @@ describe('selector engine', () => {
     `;
     expect(findElement(ADAPTERS.gemini.selectors.streamingIndicator)).toBeNull();
     expect(findElement(ADAPTERS.grok.selectors.streamingIndicator)?.textContent).toBe('Searching…');
+  });
+
+  it('rejects heading, sidebar, and error text that merely starts with a status phrase', () => {
+    document.body.innerHTML = `
+      <h2 style="position:fixed">Researching — quarterly report</h2>
+      <span style="position:fixed">Working on it - sidebar</span>
+      <span style="position:fixed">Searching · request failed</span>
+    `;
+    expect(findElement(ADAPTERS.gemini.selectors.streamingIndicator)).toBeNull();
+    expect(findElement(ADAPTERS.grok.selectors.streamingIndicator)).toBeNull();
   });
 
   it.each([

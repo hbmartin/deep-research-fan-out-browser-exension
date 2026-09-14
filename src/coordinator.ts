@@ -1,4 +1,4 @@
-import { ADAPTERS, conversationKeyFromUrl, isProviderUrl, providerFromUrl } from './adapters';
+import { ADAPTERS, classifyProviderPage, conversationKeysMatch, isProviderUrl, normalizeConversationKey, providerFromUrl, type ProviderPageIdentity } from './adapters';
 import { buildArtifact, buildCurrentResponseCopy } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
 import { acceptCaptureJob, captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
@@ -12,7 +12,7 @@ import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type 
 const ALARM_NAME = 'reconcile-runs';
 const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
 let contextMenuRegistrationTail = Promise.resolve();
-let clipboardOperationTail = Promise.resolve();
+const clipboardMutationTails = new Map<string, Promise<void>>();
 const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
 let captureWorkerRunning = false;
 let reconcileWorkerRunning = false;
@@ -77,17 +77,8 @@ function withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> 
   return serializeByKey(runMutationTails, runId, operation);
 }
 
-async function withClipboardLock<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = clipboardOperationTail.catch(() => undefined);
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  clipboardOperationTail = previous.then(() => gate);
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-  }
+function withClipboardLock<T>(operation: () => Promise<T>): Promise<T> {
+  return serializeByKey(clipboardMutationTails, 'clipboard', operation);
 }
 
 async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
@@ -105,8 +96,41 @@ function providerSnapshot(provider: ProviderRun): ProviderSnapshot {
     status: provider.status,
     submittedAt: provider.submittedAt,
     researchTimedOutAt: provider.researchTimedOutAt,
-    conversationKey: provider.conversationKey,
+    conversationKey: normalizeConversationKey(provider.conversationKey, provider.provider),
   };
+}
+
+interface VerifiedContentPage {
+  kind: 'entry' | 'conversation';
+  conversationKey?: string;
+}
+
+function verifyContentPage(
+  providerRun: ProviderRun,
+  sender: Browser.runtime.MessageSender,
+  reportedConversationKey?: string,
+): VerifiedContentPage {
+  if (sender.tab?.id !== providerRun.tabId) {
+    throw new CoordinatorRequestError('Provider message came from a different or unavailable tab.', 'conversation_mismatch', providerSnapshot(providerRun));
+  }
+  const senderUrl = sender.url ?? sender.tab.url;
+  const page = senderUrl ? classifyProviderPage(senderUrl, providerRun.provider) : { kind: 'unsupported' } as const;
+  if (page.kind === 'unsupported') {
+    throw new CoordinatorRequestError('Provider tab is not showing a supported conversation or entry page.', 'conversation_mismatch', providerSnapshot(providerRun));
+  }
+  const storedConversationKey = normalizeConversationKey(providerRun.conversationKey, providerRun.provider);
+  const reportedKey = normalizeConversationKey(reportedConversationKey, providerRun.provider);
+  if (page.kind === 'entry') {
+    if (providerRun.conversationKey !== undefined || reportedConversationKey !== undefined) {
+      throw new CoordinatorRequestError('Provider tab left its verified conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
+    }
+    return { kind: 'entry' };
+  }
+  if (!conversationKeysMatch(page.key, reportedKey, providerRun.provider)
+    || (storedConversationKey && !conversationKeysMatch(storedConversationKey, page.key, providerRun.provider))) {
+    throw new CoordinatorRequestError('Provider tab is showing a different or unverified conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
+  }
+  return { kind: 'conversation', conversationKey: page.key };
 }
 
 function validateProviderTransition(provider: ProviderRun | undefined, status: ProviderRunStatus): asserts provider is ProviderRun {
@@ -212,7 +236,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       status: providerRun.status,
       submittedAt: providerRun.submittedAt,
       researchTimedOutAt: providerRun.researchTimedOutAt,
-      conversationKey: providerRun.conversationKey,
+      conversationKey: normalizeConversationKey(providerRun.conversationKey, provider),
       captureAccepted,
     } as const;
     await ensureContentReceiver(providerRun.tabId, provider);
@@ -294,15 +318,16 @@ async function mutateProvider(
   submittedAt?: number,
   reason?: 'research_timeout',
   conversationKey?: string,
+  sender?: Browser.runtime.MessageSender,
 ): Promise<Run> {
   const { run, value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
+    if (!providerRun) throw new CoordinatorRequestError('Provider run not found.', 'run_not_found');
+    const verifiedPage = verifyContentPage(providerRun, sender ?? {}, conversationKey);
     validateProviderTransition(providerRun, status);
-    if (providerRun.conversationKey && providerRun.conversationKey !== conversationKey) {
-      throw new CoordinatorRequestError('Provider tab is showing a different conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
-    }
-    const conversationBound = !providerRun.conversationKey && conversationKey !== undefined;
-    providerRun.conversationKey ??= conversationKey;
+    const previousConversationKey = normalizeConversationKey(providerRun.conversationKey, provider);
+    const conversationBound = previousConversationKey === undefined && verifiedPage.conversationKey !== undefined;
+    providerRun.conversationKey = verifiedPage.conversationKey ?? previousConversationKey;
     const timeout = reason === 'research_timeout' && status === 'manual_required';
     const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
     const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
@@ -403,51 +428,73 @@ function validateCurrentResponseSnapshot(value: unknown): CurrentResponseSnapsho
 
 interface ExpectedCurrentResponse {
   runId: string;
-  conversationKey: string;
+  conversationKey?: string;
+}
+
+type SupportedProviderPage = Exclude<ProviderPageIdentity, { kind: 'unsupported' }>;
+
+function requireSupportedProviderPage(value: string | undefined, provider: ProviderId): SupportedProviderPage {
+  const page = value ? classifyProviderPage(value, provider) : { kind: 'unsupported' } as const;
+  if (page.kind === 'unsupported') {
+    throw new CoordinatorRequestError(
+      'Provider tab is not showing a supported conversation or entry page.',
+      'conversation_mismatch',
+    );
+  }
+  return page;
+}
+
+function providerPagesMatch(left: SupportedProviderPage, right: SupportedProviderPage, provider: ProviderId): boolean {
+  if (left.kind !== right.kind) return false;
+  return left.kind === 'entry'
+    || (right.kind === 'conversation' && conversationKeysMatch(left.key, right.key, provider));
 }
 
 function assertCurrentResponseIdentity(
   snapshot: CurrentResponseSnapshot,
   provider: ProviderId,
+  operationPage: SupportedProviderPage,
   expected?: ExpectedCurrentResponse,
 ): void {
   if (snapshot.provider !== provider || !isProviderUrl(snapshot.pageUrl, provider)) {
     throw new CoordinatorRequestError('Provider response identity did not match the requested provider.', 'conversation_mismatch');
   }
-  if (expected && (snapshot.activeRunId !== expected.runId
-    || snapshot.conversationKey !== expected.conversationKey
-    || conversationKeyFromUrl(snapshot.pageUrl, provider) !== expected.conversationKey)) {
+  const snapshotPage = requireSupportedProviderPage(snapshot.pageUrl, provider);
+  const snapshotConversationKey = normalizeConversationKey(snapshot.conversationKey, provider);
+  const conflictingRun = expected && snapshot.activeRunId !== undefined && snapshot.activeRunId !== expected.runId;
+  const pageMismatch = !providerPagesMatch(snapshotPage, operationPage, provider);
+  const conversationMismatch = operationPage.kind === 'conversation'
+    ? !conversationKeysMatch(snapshotConversationKey, operationPage.key, provider)
+    : snapshotConversationKey !== undefined;
+  if (conflictingRun || pageMismatch || conversationMismatch) {
     throw new CoordinatorRequestError('Provider tab is showing a different or unverified conversation.', 'conversation_mismatch');
   }
 }
 
 async function copyCurrentResponse(tabId: number, provider: ProviderId, expected?: ExpectedCurrentResponse): Promise<void> {
   const tab = await browser.tabs.get(tabId);
-  if (!isProviderUrl(tab.url, provider)
-    || (expected && conversationKeyFromUrl(tab.url!, provider) !== expected.conversationKey)) {
-    throw new CoordinatorRequestError('Provider tab is no longer on the expected provider.', 'conversation_mismatch');
+  const operationPage = requireSupportedProviderPage(tab.url, provider);
+  const expectedConversationKey = normalizeConversationKey(expected?.conversationKey, provider);
+  if (expectedConversationKey) {
+    if (operationPage.kind !== 'conversation'
+      || !conversationKeysMatch(expectedConversationKey, operationPage.key, provider)) {
+      throw new CoordinatorRequestError('Provider tab is no longer on the expected conversation.', 'conversation_mismatch');
+    }
+  } else if (expected && operationPage.kind !== 'entry') {
+    throw new CoordinatorRequestError('Provider tab is showing an unverified conversation.', 'conversation_mismatch');
   }
   await ensureContentReceiver(tabId, provider);
-  let snapshot: CurrentResponseSnapshot;
-  try {
-    snapshot = validateCurrentResponseSnapshot(await sendTabEvent(tabId, {
-      type: 'capture:dom-current', provider, runId: expected?.runId, conversationKey: expected?.conversationKey,
-    }));
-  } catch (error) {
-    if (!expected || error instanceof CoordinatorRequestError) throw error;
-    throw new CoordinatorRequestError(
-      'The provider tab could not verify the active run and conversation. Reopen the run or use the provider-page context menu.',
-      'conversation_mismatch',
-    );
-  }
-  assertCurrentResponseIdentity(snapshot, provider, expected);
+  const operationConversationKey = operationPage.kind === 'conversation' ? operationPage.key : undefined;
+  const snapshot = validateCurrentResponseSnapshot(await sendTabEvent(tabId, {
+    type: 'capture:dom-current', provider, runId: expected?.runId, conversationKey: operationConversationKey,
+  }));
+  assertCurrentResponseIdentity(snapshot, provider, operationPage, expected);
   const resolved = await resolveCitationUrls(provider, snapshot.domCitations);
   const reconciled = reconcileCitations(snapshot.domMarkdown, resolved.citations, ADAPTERS[provider].citationMarkerStyle);
   await withClipboardLock(async () => {
-    assertCurrentResponseIdentity(snapshot, provider, expected);
     const currentTab = await browser.tabs.get(tabId);
-    if (!isProviderUrl(currentTab.url, provider)
-      || (expected && conversationKeyFromUrl(currentTab.url!, provider) !== expected.conversationKey)) {
+    const currentPage = requireSupportedProviderPage(currentTab.url, provider);
+    if (!providerPagesMatch(currentPage, operationPage, provider)) {
       throw new CoordinatorRequestError('Provider tab changed before the response could be copied.', 'conversation_mismatch');
     }
     await createPlatform().writeClipboard(buildCurrentResponseCopy(reconciled.markdown, reconciled.citations));
@@ -774,32 +821,48 @@ async function ensureProviderCapturing(runId: string, provider: ProviderId): Pro
   return changed;
 }
 
-async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<Run> {
+async function queueCapture(
+  request: Extract<RuntimeRequest, { type: 'content:capture' }>,
+  sender: Browser.runtime.MessageSender = {},
+): Promise<Run> {
   const id = captureId(request.runId, request.provider);
   const run = await serializeCapture(id, () => withRunLock(request.runId, async () => {
     const existingJob = await getJob(id);
-    // The DB validator fills the tab ID from the same run version it commits.
     const job: CaptureJob = {
-      id, runId: request.runId, provider: request.provider, conversationKey: request.conversationKey, tabId: 0,
-      state: 'queued', createdAt: Date.now(), attempts: 0,
-      domMarkdown: request.domMarkdown, domCitations: request.domCitations, copyControlObserved: request.copyControlObserved,
-      researchTrail: request.researchTrail, title: request.title,
+      id,
+      runId: request.runId,
+      provider: request.provider,
+      conversationKey: request.conversationKey,
+      tabId: 0,
+      state: 'queued',
+      createdAt: Date.now(),
+      attempts: 0,
+      domMarkdown: request.domMarkdown,
+      domCitations: request.domCitations,
+      researchTrail: request.researchTrail,
+      title: request.title,
+      copyControlObserved: request.copyControlObserved,
     };
+    // The DB validator fills the tab ID from the same run version it commits.
     return acceptCaptureJob(job, (storedRun) => {
       if (!storedRun) throw new CoordinatorRequestError('Run not found for capture.', 'run_not_found');
       const provider = storedRun.providerRuns[request.provider];
+      if (!provider) throw new CoordinatorRequestError('Provider run not found for capture.', 'run_not_found');
+      const verifiedPage = verifyContentPage(provider, sender, request.conversationKey);
       validateProviderTransition(provider, 'capturing');
-      const verifiedConversationKey = request.conversationKey ?? existingJob?.conversationKey;
-      if ((!existingJob && !verifiedConversationKey)
-        || (provider.conversationKey && provider.conversationKey !== verifiedConversationKey)) {
+      const existingConversationKey = normalizeConversationKey(existingJob?.conversationKey, request.provider);
+      if (existingConversationKey && (!verifiedPage.conversationKey
+        || !conversationKeysMatch(existingConversationKey, verifiedPage.conversationKey, request.provider))) {
         throw new CoordinatorRequestError(
-          'Capture rejected because the provider conversation could not be verified.',
+          'Capture rejected because the queued job belongs to a different conversation.',
           'conversation_mismatch',
           providerSnapshot(provider),
         );
       }
-      provider.conversationKey ??= verifiedConversationKey;
+      const verifiedConversationKey = verifiedPage.conversationKey ?? existingConversationKey;
+      provider.conversationKey = verifiedConversationKey;
       job.tabId = provider.tabId;
+      job.conversationKey = verifiedConversationKey;
       provider.status = 'capturing';
       provider.statusDetail = undefined;
       storedRun.status = deriveRunStatus(storedRun);
@@ -1065,16 +1128,17 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const run = await getRun(message.runId);
         const providerRun = run?.providerRuns[message.provider];
         if (!run || !providerRun) throw new Error('Provider run not found.');
-        if (!providerRun.conversationKey) {
+        const conversationKey = normalizeConversationKey(providerRun.conversationKey, message.provider);
+        if (providerRun.conversationKey !== undefined && conversationKey === undefined) {
           throw new CoordinatorRequestError(
-            'This run has no verified provider conversation. Use the provider-page context menu instead.',
+            'This run has an unrecognized legacy conversation identity.',
             'conversation_mismatch',
             providerSnapshot(providerRun),
           );
         }
         await copyCurrentResponse(providerRun.tabId, message.provider, {
           runId: run.id,
-          conversationKey: providerRun.conversationKey,
+          conversationKey,
         });
         return { ok: true };
       }
@@ -1098,12 +1162,12 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
       case 'content:state': {
         const run = await mutateProvider(
           message.runId, message.provider, message.status, message.detail,
-          message.submittedAt, message.reason, message.conversationKey,
+          message.submittedAt, message.reason, message.conversationKey, sender,
         );
         return { ok: true, providerState: providerSnapshot(run.providerRuns[message.provider]!) };
       }
       case 'content:capture': {
-        const run = await queueCapture(message);
+        const run = await queueCapture(message, sender);
         return { ok: true, providerState: providerSnapshot(run.providerRuns[message.provider]!) };
       }
       case 'capture:clipboard-read':
@@ -1171,8 +1235,8 @@ export const coordinatorTestHooks = {
     browserSessionIdPromise = undefined;
     fallbackBrowserSessionId = undefined;
     captureMutationTails.clear();
+    clipboardMutationTails.clear();
     contextMenuRegistrationTail = Promise.resolve();
-    clipboardOperationTail = Promise.resolve();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };
