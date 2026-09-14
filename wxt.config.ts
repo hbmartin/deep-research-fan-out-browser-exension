@@ -22,6 +22,7 @@ export default defineConfig({
       'downloads',
       'clipboardRead',
       'clipboardWrite',
+      'contextMenus',
       'unlimitedStorage',
       ...(browser === 'chrome' ? ['offscreen', 'sidePanel', 'scripting'] : []),
     ],

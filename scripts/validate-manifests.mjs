@@ -42,7 +42,7 @@ assert(chrome.manifest_version === 3, 'Chrome must use Manifest V3.');
 assert(chrome.minimum_chrome_version === '145', 'Chrome minimum version must be 145.');
 assert(chrome.background?.service_worker === 'background.js', 'Chrome background must be a service worker.');
 assert(chrome.side_panel?.default_path === 'sidepanel.html', 'Chrome side panel is missing.');
-for (const permission of ['offscreen', 'sidePanel', 'scripting', 'tabGroups', 'unlimitedStorage']) {
+for (const permission of ['contextMenus', 'offscreen', 'sidePanel', 'scripting', 'tabGroups', 'unlimitedStorage']) {
   assert(chrome.permissions.includes(permission), `Chrome permission missing: ${permission}`);
 }
 assertExactOrigins(chrome.host_permissions, origins, 'Chrome host permissions');
@@ -54,6 +54,7 @@ assert(firefox.browser_specific_settings?.gecko?.strict_min_version === '142.0',
 assert(firefox.browser_specific_settings?.gecko?.data_collection_permissions?.required?.includes('none'), 'Firefox no-data-collection declaration is missing.');
 assert(!firefox.permissions.includes('offscreen') && !firefox.permissions.includes('sidePanel'), 'Firefox contains Chrome-only permissions.');
 assert(firefox.permissions.includes('tabGroups'), 'Firefox tabGroups permission is missing.');
+assert(firefox.permissions.includes('contextMenus'), 'Firefox contextMenus permission is missing.');
 assertExactOrigins(firefox.permissions.filter((permission) => /^https?:\/\//.test(permission)), origins, 'Firefox host permissions');
 
 for (const manifest of [chrome, firefox]) {

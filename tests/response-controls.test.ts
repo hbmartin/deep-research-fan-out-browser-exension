@@ -26,16 +26,16 @@ describe('bounded response ownership', () => {
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
   });
-  it('assigns a shared plain-container control to the nearest preceding response', () => {
+  it('does not assign a shared plain-container control to the nearest preceding response', () => {
     document.body.innerHTML = `<div><article>Earlier</article><article>Latest</article>${copy}</div>`;
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
-    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
   });
-  it('assigns a control between responses to the preceding response', () => {
+  it('does not assign a control between responses in a plain wrapper', () => {
     document.body.innerHTML = `<div><article>Earlier</article>${copy}<article>Later</article></div>`;
     const { roots, controls } = index();
-    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
     expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
   });
   it('does not assign a control across a page-level boundary', () => {
@@ -43,13 +43,35 @@ describe('bounded response ownership', () => {
     const { roots, controls } = index();
     expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
   });
-  it('does not let aria-controls bypass a page-level boundary', () => {
+  it('accepts explicit aria-controls within the same page boundary', () => {
     document.body.innerHTML = `<main><article id="answer">Report</article><button style="position:fixed" aria-controls="answer" aria-label="Copy response">Copy</button></main>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+  });
+  it('does not let aria-controls cross a page-level boundary', () => {
+    document.body.innerHTML = `<main><article id="answer">Report</article></main><dialog open><button style="position:fixed" aria-controls="answer" aria-label="Copy response">Copy</button></dialog>`;
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
   });
-  it('does not reject an owned control merely because its container also has a separate form', () => {
+  it('rejects ambiguous aria-controls targets', () => {
+    document.body.innerHTML = `<main><section><article id="answer">First</article><article id="answer">Second</article>${copy.replace('aria-label', 'aria-controls="answer" aria-label')}</section></main>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('rejects aria-controls spanning multiple responses', () => {
+    document.body.innerHTML = `<main><article id="first">First</article><article id="second">Second</article><button style="position:fixed" aria-controls="first second" aria-label="Copy response">Copy</button></main>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('rejects a fallback container that also holds a form', () => {
     document.body.innerHTML = `<section><form><textarea></textarea></form><article>Report</article>${copy}</section>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('accepts a recognized turn control when response and control share a dialog', () => {
+    document.body.innerHTML = `<dialog open><section><article>Report</article>${copy}</section></dialog>`;
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
   });

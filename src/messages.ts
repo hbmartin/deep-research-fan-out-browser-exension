@@ -1,5 +1,10 @@
 import type { CaptureJob, CapturedResearchTrail, DomCitation, ProviderId, ProviderRunStatus, Run, RunId } from './types';
 
+export interface CurrentResponseSnapshot {
+  domMarkdown: string;
+  domCitations: DomCitation[];
+}
+
 export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found';
 
 export interface ProviderSnapshot {
@@ -16,6 +21,7 @@ export type RuntimeRequest =
   | { type: 'provider:end'; runId: RunId; provider: ProviderId }
   | { type: 'provider:focus'; runId: RunId; provider: ProviderId }
   | { type: 'provider:copy'; runId: RunId; provider: ProviderId }
+  | { type: 'provider:copy-current'; runId: RunId; provider: ProviderId }
   | { type: 'provider:download'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
   | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout' }
@@ -44,6 +50,7 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   researchTimedOutAt?: number;
   captureAccepted?: boolean;
 } | { type: 'content:ping'; provider: ProviderId }
+  | { type: 'capture:dom-current'; provider: ProviderId }
   | { type: 'capture:copy-now'; jobId: string }
   | { type: 'content:stop'; runId: RunId };
 

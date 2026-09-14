@@ -139,6 +139,15 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   },
 };
 
+export function providerFromUrl(value: string | URL): ProviderId | undefined {
+  try {
+    const origin = value instanceof URL ? value.origin : new URL(value).origin;
+    return Object.values(ADAPTERS).find((adapter) => origin === adapter.origin)?.id;
+  } catch {
+    return undefined;
+  }
+}
+
 export function providerFromLocation(location: Location): ProviderId | undefined {
-  return Object.values(ADAPTERS).find((adapter) => location.origin === adapter.origin)?.id;
+  return providerFromUrl(location.href);
 }

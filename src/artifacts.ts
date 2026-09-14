@@ -1,5 +1,5 @@
 import { ADAPTERS } from './adapters';
-import type { Capture, ProviderRun, Run } from './types';
+import type { Capture, Citation, ProviderRun, Run } from './types';
 
 export interface ArtifactOptions {
   includeSourceSnippets?: boolean;
@@ -98,6 +98,16 @@ function researchTrailMarkdown(capture: Capture, options: ArtifactOptions): stri
   return `\n\n## Searches\n${warnings}\n${searches}\n\n## Sources\n\n${sources}`;
 }
 
+export function formatReferences(citations: readonly Citation[]): string {
+  return citations.map((citation) => `[${citation.index}] ${citation.title ? `${citation.title} — ` : ''}${citation.url}${citation.placement === 'unplaced' ? ' <!-- unplaced -->' : ''}`).join('\n');
+}
+
+export function buildCurrentResponseCopy(markdown: string, citations: readonly Citation[]): string {
+  const body = markdown.trim();
+  const references = formatReferences(citations);
+  return `${body}${references ? `\n\n## References\n\n${references}` : ''}\n`;
+}
+
 export function buildArtifact(run: Run, providerRun: ProviderRun, capture?: Capture, options: ArtifactOptions = {}): string {
   const header = frontMatter(run, providerRun, capture, options);
   if (!capture) {
@@ -105,7 +115,7 @@ export function buildArtifact(run: Run, providerRun: ProviderRun, capture?: Capt
   }
   const title = capture.title?.trim() || run.query;
   const references = capture.citations.length
-    ? capture.citations.map((citation) => `[${citation.index}] ${citation.title ? `${citation.title} — ` : ''}${citation.url}${citation.placement === 'unplaced' ? ' <!-- unplaced -->' : ''}`).join('\n')
+    ? formatReferences(capture.citations)
     : '_No citations captured._';
   const researchTrail = researchTrailMarkdown(capture, options);
   return `${header}\n\n# ${title}\n\n${capture.normalizedMarkdown.trim()}\n\n## References\n\n${references}${researchTrail}\n`;

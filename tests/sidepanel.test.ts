@@ -39,7 +39,12 @@ describe('side-panel rendering', () => {
     textarea.focus();
     textarea.setSelectionRange(2, 7);
     const update: Run = {
-      id: 'run', query: 'existing', createdAt: 1, windowId: 1, providerRuns: {}, status: 'active', slug: 'run', downloadFolder: 'deep-research/run',
+      id: 'run', query: 'existing', createdAt: 1, windowId: 1, providerRuns: {
+        chatgpt: {
+          provider: 'chatgpt', tabId: 1, status: 'researching', submittedQuery: 'existing', appendString: '',
+          startedAt: 1, attempts: 0, degraded: false, adapterVersion: 'test',
+        },
+      }, status: 'active', slug: 'run', downloadFolder: 'deep-research/run',
     };
     runtimeListener?.({ type: 'runs:changed', runs: [update] });
     storedSettings = {
@@ -55,5 +60,13 @@ describe('side-panel rendering', () => {
     expect(textarea.value).toBe('draft query');
     expect(document.activeElement).toBe(textarea);
     expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 7]);
+
+    const copyCurrent = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Copy current');
+    expect(copyCurrent).toBeInstanceOf(HTMLButtonElement);
+    copyCurrent!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:copy-current', runId: 'run', provider: 'chatgpt',
+    }));
+    await vi.waitFor(() => expect(document.querySelector('.notice')?.textContent).toBe('ChatGPT current response copied.'));
   });
 });
