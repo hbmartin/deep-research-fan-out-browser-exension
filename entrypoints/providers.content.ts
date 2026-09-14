@@ -1,6 +1,6 @@
 import TurndownService from 'turndown';
-import { ADAPTERS, conversationKeyFromUrl, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
+import { ADAPTERS, classifyProviderPage, conversationKeysMatch, normalizeConversationKey, providerFromLocation, type ProviderAdapter, type ProviderPageIdentity, type SelectorChain } from '@/src/adapters';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
@@ -36,8 +36,14 @@ interface ActiveRun {
   submissionAttempted: boolean;
   manualSetupRequired: boolean;
   timeoutActivity: TimeoutActivity;
-  planApprovalAttempts: number;
-  lastPlanApprovalAt: number;
+  planApprovals: WeakMap<HTMLElement, PlanApprovalState>;
+  pendingPlanApproval?: PlanApprovalState;
+}
+
+interface PlanApprovalState {
+  attempts: number;
+  lastAttemptAt: number;
+  confirmed: boolean;
 }
 
 interface ActivitySignature {
@@ -47,12 +53,7 @@ interface ActivitySignature {
 
 type TimeoutActivity =
   | { phase: 'hydrating' }
-  | {
-    phase: 'baseline';
-    signature: ActivitySignature;
-    responseArmed: boolean;
-    responseStableSince?: number;
-  };
+  | { phase: 'baseline'; signature: ActivitySignature };
 
 let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
@@ -77,9 +78,9 @@ function applyProviderState(run: ActiveRun, snapshot: ProviderSnapshot): void {
   run.status = snapshot.status;
   run.submittedAt = snapshot.submittedAt;
   run.researchTimedOutAt = snapshot.researchTimedOutAt;
-  run.conversationKey = snapshot.conversationKey ?? run.conversationKey;
+  run.conversationKey = normalizeConversationKey(snapshot.conversationKey, run.adapter.id) ?? run.conversationKey;
   if (snapshot.researchTimedOutAt === undefined) {
-    run.timeoutActivity = { phase: 'baseline', signature: {}, responseArmed: true };
+    run.timeoutActivity = { phase: 'hydrating' };
     run.timeoutGraceUntil = undefined;
   }
   if (isTerminalProviderStatus(snapshot.status)) stopRun(run);
@@ -110,12 +111,9 @@ function reportEventually(status: ProviderRunStatus, detail?: string, submittedA
 function reportTimeout(signature: ActivitySignature = {}): void {
   if (!active || active.researchTimedOutAt !== undefined) return;
   active.researchTimedOutAt = Date.now();
-  active.timeoutActivity = {
-    phase: 'baseline',
-    signature,
-    responseArmed: signature.response === undefined,
-    responseStableSince: signature.response === undefined ? undefined : Date.now(),
-  };
+  active.timeoutActivity = signature.response === undefined && signature.progress === undefined
+    ? { phase: 'hydrating' }
+    : { phase: 'baseline', signature };
   reportEventually('manual_required', `${active.adapter.label} has not completed after 45 minutes. Check the provider tab.`, undefined, 'research_timeout');
 }
 
@@ -168,7 +166,7 @@ async function automate(): Promise<void> {
   let composer: HTMLElement | null = null;
   for (let attempt = 0; attempt < 2 && !composer; attempt += 1) {
     if (findElement(adapter.selectors.loginWall)) return report('unauthenticated', `Not signed in to ${adapter.label}.`);
-    if (findElement(adapter.selectors.quotaNotice, document, responseRoots(adapter))) {
+    if (findElement(adapter.selectors.quotaNotice, document, candidateResponseRoots(adapter))) {
       return report('quota_exhausted', `${adapter.label} deep research limit reached.`);
     }
     composer = await waitFor(() => findElement(adapter.selectors.composer), 15_000);
@@ -206,7 +204,7 @@ async function automate(): Promise<void> {
   }
   const submitted = await waitFor(() => {
     const text = composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? '';
-    const latestResponse = responseRoots(adapter).at(-1) ?? null;
+    const latestResponse = candidateResponseRoots(adapter).at(-1) ?? null;
     const streaming = findStreamingIndicator(adapter, latestResponse);
     const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
     const responseStarted = isNewFinalResponse(latestResponse, submissionBaseline);
@@ -228,12 +226,23 @@ function contentToMarkdown(content: HTMLElement): string {
   return turndown.turndown(content).trim();
 }
 
-function responseRoots(adapter: ProviderAdapter): HTMLElement[] {
-  const roots = adapter.selectors.finalMessageRoot.flatMap((selector) => findAll([selector], document, RESPONSE_VISIBILITY));
-  return Array.from(new Set(roots)).sort((left, right) => {
+function normalizeResponseRoots(roots: readonly HTMLElement[]): HTMLElement[] {
+  const unique = Array.from(new Set(roots));
+  const outermost = unique.filter((candidate) => !unique.some((other) => other !== candidate && other.contains(candidate)));
+  return outermost.sort((left, right) => {
     if (left === right) return 0;
     return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
   });
+}
+
+function candidateResponseRoots(adapter: ProviderAdapter): HTMLElement[] {
+  return normalizeResponseRoots(
+    adapter.selectors.finalMessageRoot.flatMap((selector) => findAll([selector], document, RESPONSE_VISIBILITY)),
+  );
+}
+
+function completedResponseRoots(adapter: ProviderAdapter): HTMLElement[] {
+  return normalizeResponseRoots(findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY));
 }
 
 function currentResponseSnapshot(
@@ -241,15 +250,22 @@ function currentResponseSnapshot(
   expectedRunId?: RunId,
   expectedConversationKey?: string,
 ): CurrentResponseSnapshot {
-  const currentConversationKey = conversationKeyFromUrl(location.href, adapter.id);
+  const pageIdentity = classifyProviderPage(location.href, adapter.id);
+  if (pageIdentity.kind === 'unsupported') {
+    throw new Error(`The current ${adapter.label} page is not a conversation or entry page.`);
+  }
+  const currentConversationKey = pageIdentity.kind === 'conversation' ? pageIdentity.key : undefined;
   if (expectedRunId !== undefined) {
-    if (!active || active.id !== expectedRunId) throw new Error('The provider tab is no longer attached to this run.');
-    if (!expectedConversationKey || !active.conversationKey || !currentConversationKey
-      || expectedConversationKey !== active.conversationKey || expectedConversationKey !== currentConversationKey) {
+    if (active && active.id !== expectedRunId) throw new Error('The provider tab is attached to a different run.');
+    if (expectedConversationKey && (!conversationKeysMatch(expectedConversationKey, currentConversationKey, adapter.id)
+      || (active?.conversationKey && !conversationKeysMatch(expectedConversationKey, active.conversationKey, adapter.id)))) {
       throw new Error('The provider tab is showing a different or unverified conversation.');
     }
+    if (!expectedConversationKey && (pageIdentity.kind !== 'entry' || active?.conversationKey !== undefined)) {
+      throw new Error('The provider tab could not verify the expected entry-page run.');
+    }
   }
-  const root = responseRoots(adapter).at(-1);
+  const root = candidateResponseRoots(adapter).at(-1);
   if (!root) throw new Error(`No ${adapter.label} response is available to copy.`);
   const snapshot = createResponseSnapshot(root);
   const domMarkdown = contentToMarkdown(snapshot.content);
@@ -264,10 +280,10 @@ function currentResponseSnapshot(
   };
 }
 
-function observeConversation(run: ActiveRun): string | undefined {
-  const current = conversationKeyFromUrl(location.href, run.adapter.id);
-  if (!run.conversationKey && current) run.conversationKey = current;
-  return current;
+function observeConversation(run: ActiveRun): ProviderPageIdentity {
+  const identity = classifyProviderPage(location.href, run.adapter.id);
+  if (!run.conversationKey && identity.kind === 'conversation') run.conversationKey = identity.key;
+  return identity;
 }
 
 function obscuringAncestors(element: HTMLElement): Set<HTMLElement> {
@@ -305,8 +321,8 @@ function isInteractiveProgressIndicator(element: HTMLElement | null): boolean {
 function progressActivitySignature(element: HTMLElement | null): string | undefined {
   if (!element) return undefined;
   return [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-state'),
-    element.getAttribute('aria-valuenow'), element.textContent]
-    .map((value) => (value ?? '').replace(/\s+/g, ' ').trim())
+    element.textContent]
+    .map((value) => normalizeActivityText(value ?? ''))
     .join('\u0000');
 }
 
@@ -323,37 +339,24 @@ function activitySignature(
 
 function timedOutActivityResumed(run: ActiveRun, signature: ActivitySignature): boolean {
   if (run.researchTimedOutAt === undefined) return false;
-  const now = Date.now();
   if (run.timeoutActivity.phase === 'hydrating') {
     if (signature.response !== undefined || signature.progress !== undefined) {
-      run.timeoutActivity = {
-        phase: 'baseline',
-        signature,
-        responseArmed: signature.response === undefined,
-        responseStableSince: signature.response === undefined ? undefined : now,
-      };
+      run.timeoutActivity = { phase: 'baseline', signature };
     }
     return false;
   }
   const checkpoint = run.timeoutActivity;
-  if (signature.progress !== undefined && signature.progress !== checkpoint.signature.progress) return true;
-
-  if (signature.response !== checkpoint.signature.response) {
-    if (signature.response !== undefined && checkpoint.responseArmed) return true;
-    run.timeoutActivity = {
-      phase: 'baseline',
-      signature,
-      responseArmed: signature.response === undefined,
-      responseStableSince: signature.response === undefined ? undefined : now,
-    };
-    return false;
-  }
-
-  const responseArmed = checkpoint.responseArmed
-    || (signature.response !== undefined
-      && checkpoint.responseStableSince !== undefined
-      && now - checkpoint.responseStableSince >= run.completionDebounceMs);
-  run.timeoutActivity = { ...checkpoint, signature, responseArmed };
+  if (signature.progress !== undefined && checkpoint.signature.progress !== undefined
+    && signature.progress !== checkpoint.signature.progress) return true;
+  if (signature.response !== undefined && checkpoint.signature.response !== undefined
+    && signature.response !== checkpoint.signature.response) return true;
+  run.timeoutActivity = {
+    phase: 'baseline',
+    signature: {
+      response: signature.response ?? checkpoint.signature.response,
+      progress: signature.progress ?? checkpoint.signature.progress,
+    },
+  };
   return false;
 }
 
@@ -412,8 +415,11 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
   const capturingRun = active;
   capturingRun.captureInFlight = true;
   try {
-    const currentConversationKey = observeConversation(capturingRun);
-    if (!capturingRun.conversationKey || currentConversationKey !== capturingRun.conversationKey) {
+    const pageIdentity = observeConversation(capturingRun);
+    if (pageIdentity.kind === 'unsupported'
+      || (capturingRun.conversationKey
+        && (pageIdentity.kind !== 'conversation'
+          || !conversationKeysMatch(capturingRun.conversationKey, pageIdentity.key, capturingRun.adapter.id)))) {
       throw new Error('Cannot capture an unverified or different provider conversation.');
     }
     const initialSnapshot = createResponseSnapshot(root);
@@ -424,7 +430,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
     let toggle: HTMLElement | null = null;
     const sourceSelectors = capturingRun.adapter.selectors.sourcesPanelToggle;
     if (root.isConnected && sourceSelectors) {
-      const refreshedRoots = responseRoots(capturingRun.adapter);
+      const refreshedRoots = completedResponseRoots(capturingRun.adapter);
       const refreshedControls = new ResponseControlIndex(refreshedRoots);
       const possibleToggle = refreshedControls.find(root, sourceSelectors, new Set(), true, true);
       if (possibleToggle?.isConnected) {
@@ -516,27 +522,47 @@ function inspectPage(): void {
     reportEventually('interrupted', 'Provider tab navigated away.');
     return;
   }
-  const currentConversationKey = conversationKeyFromUrl(location.href, adapter.id);
-  if (active.conversationKey && currentConversationKey !== active.conversationKey) {
-    reportEventually('interrupted', 'Provider tab navigated to a different conversation.');
-    return;
-  }
   if (active.captureInFlight || active.automationInFlight || isSetupProviderStatus(active.status)) return;
   const now = Date.now();
   const researchTimeoutDue = active.researchTimedOutAt === undefined
     && active.status === 'researching' && active.submittedAt !== undefined
     && now - active.submittedAt >= RESEARCH_TIMEOUT_MS;
+  const pageIdentity = classifyProviderPage(location.href, adapter.id);
+  const conversationWasBound = active.conversationKey !== undefined;
+  if (active.conversationKey) {
+    if (pageIdentity.kind === 'entry'
+      || (pageIdentity.kind === 'conversation'
+        && !conversationKeysMatch(active.conversationKey, pageIdentity.key, adapter.id))) {
+      reportEventually('interrupted', 'Provider tab navigated to a different conversation.');
+      return;
+    }
+  } else if (pageIdentity.kind === 'conversation') {
+    active.conversationKey = pageIdentity.key;
+  }
+  if (pageIdentity.kind === 'unsupported') {
+    if (researchTimeoutDue) reportTimeout();
+    return;
+  }
+
+  const candidateRoots = candidateResponseRoots(adapter);
+  const finalRoots = completedResponseRoots(adapter);
+  const latestResponse = candidateRoots.at(-1) ?? null;
+  const latestFinalResponse = latestResponse && finalRoots.includes(latestResponse) ? latestResponse : null;
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
-  const finalRoots = responseRoots(adapter);
-  const latestResponse = finalRoots.at(-1) ?? null;
-  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
-  const root = newResponse;
+
+  // Page-level terminal notices are authoritative even while a response or plan
+  // control is still mounted. Response-local partial text remains streaming-gated.
+  if (active.status !== 'capturing' && active.captureFailureCount === 0
+    && findElement(adapter.selectors.quotaNotice, document, candidateRoots)) {
+    reportEventually('quota_exhausted', `${adapter.label} deep research limit reached.`);
+    return;
+  }
+
   const streaming = findStreamingIndicator(adapter, latestResponse);
   if (streaming) {
-    const conversationWasBound = active.conversationKey !== undefined;
-    const approvedPlan = active.planApprovalAttempts > 0;
-    observeConversation(active);
-    active.planApprovalAttempts = 0;
+    const pendingApproval = active.pendingPlanApproval;
+    const approvedPlan = Boolean(pendingApproval && pendingApproval.attempts > 0 && !pendingApproval.confirmed);
+    if (pendingApproval) pendingApproval.confirmed = true;
     const latestSnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
       ? (latestResponse ? createResponseSnapshot(latestResponse) : undefined)
       : undefined;
@@ -551,48 +577,46 @@ function inspectPage(): void {
     }
     return;
   }
-  if (plan) {
+
+  let planState = plan ? active.planApprovals.get(plan) : undefined;
+  if (plan && !planState?.confirmed) {
     active.completionCandidate = undefined;
-    const conversationWasBound = active.conversationKey !== undefined;
-    observeConversation(active);
-    const signature = activitySignature(null, undefined, plan);
+    if (!planState) {
+      planState = { attempts: 0, lastAttemptAt: 0, confirmed: false };
+      active.planApprovals.set(plan, planState);
+    }
+    active.pendingPlanApproval = planState;
+    const latestSnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
+      ? (latestResponse ? createResponseSnapshot(latestResponse) : undefined)
+      : undefined;
+    const signature = activitySignature(latestResponse, latestSnapshot, plan);
     if (researchTimeoutDue) reportTimeout(signature);
     else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature);
     else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
       reportEventually('researching', undefined, active.submittedAt);
     }
-    const approvalExhausted = active.planApprovalAttempts >= 3;
-    if (active.geminiAutoApprove && active.planApprovalAttempts < 3
-      && now - active.lastPlanApprovalAt >= 1000) {
-      active.planApprovalAttempts += 1;
-      active.lastPlanApprovalAt = now;
+    if (active.geminiAutoApprove && planState.attempts < 3
+      && now - planState.lastAttemptAt >= 1000) {
+      planState.attempts += 1;
+      planState.lastAttemptAt = now;
       plan.click();
     }
-    if ((!active.geminiAutoApprove || approvalExhausted) && active.status !== 'awaiting_user') {
+    if ((!active.geminiAutoApprove || planState.attempts >= 3) && active.status !== 'awaiting_user') {
       reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
     }
     return;
   }
-  if (active.planApprovalAttempts > 0) {
-    active.planApprovalAttempts = 0;
-    active.completionCandidate = undefined;
-    observeConversation(active);
-    reportEventually('researching', undefined, Date.now());
-    return;
-  }
+
+  const newResponse = isNewFinalResponse(latestFinalResponse, active.finalResponseBaseline) ? latestFinalResponse : null;
+  const root = newResponse;
   const latestSnapshot = latestResponse ? createResponseSnapshot(latestResponse) : undefined;
-  const responseSnapshot = root && latestSnapshot?.root === root ? latestSnapshot : undefined;
+  const responseSnapshot = root
+    ? (latestSnapshot?.root === root ? latestSnapshot : createResponseSnapshot(root))
+    : undefined;
   const signature = activitySignature(latestResponse, latestSnapshot, null);
-  const conversationWasBound = active.conversationKey !== undefined;
-  if (newResponse) observeConversation(active);
   if (!conversationWasBound && active.conversationKey && active.status === 'researching'
     && !researchTimeoutDue && active.researchTimedOutAt === undefined) {
     reportEventually('researching', undefined, active.submittedAt);
-  }
-  if (active.status !== 'capturing' && active.captureFailureCount === 0
-    && findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
-    reportEventually('quota_exhausted', `${adapter.label} deep research limit reached.`);
-    return;
   }
   if (active.status !== 'capturing' && isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern, responseSnapshot)) {
     active.completionCandidate = undefined;
@@ -716,7 +740,7 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
-    active.conversationKey ??= event.conversationKey;
+    active.conversationKey ??= normalizeConversationKey(event.conversationKey, active.adapter.id);
     beginMonitoring();
     if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
     await runAutomation(active);
@@ -724,14 +748,15 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   }
   if (active) stopRun(active);
   const adapter = ADAPTERS[event.provider];
-  const existingRoots = responseRoots(adapter);
-  const latestExistingResponse = existingRoots.at(-1) ?? null;
+  const existingRoots = completedResponseRoots(adapter);
+  const latestExistingResponse = candidateResponseRoots(adapter).at(-1) ?? null;
   const streaming = findStreamingIndicator(adapter, latestExistingResponse);
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const setup = isSetupProviderStatus(event.status);
   const resumedSubmissionConfirmed = !setup && event.status === 'submitting'
     && (Boolean(streaming) || Boolean(plan));
   const resumeExistingResponse = (!setup && event.status !== 'submitting') || resumedSubmissionConfirmed;
+  const latestExistingIsCompleted = latestExistingResponse !== null && existingRoots.includes(latestExistingResponse);
   const run: ActiveRun = {
     id: event.runId, adapter,
     submittedQuery: event.appendString.trim() ? `${event.query}\n${event.appendString}` : event.query,
@@ -740,19 +765,18 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     status: event.status,
     submittedAt: event.submittedAt ?? (event.status === 'researching' ? Date.now() : undefined),
     researchTimedOutAt: event.researchTimedOutAt,
-    conversationKey: event.conversationKey,
+    conversationKey: normalizeConversationKey(event.conversationKey, adapter.id),
     captureSent: event.captureAccepted === true,
     stopped: false, abort: new AbortController(), captureInFlight: false, captureFailureCount: 0, captureRetryAt: 0,
-    finalResponseBaseline: createFinalResponseBaseline(resumeExistingResponse ? [] : existingRoots),
+    finalResponseBaseline: createFinalResponseBaseline(
+      resumeExistingResponse && latestExistingIsCompleted ? [] : existingRoots,
+    ),
     copyButtonBaseline: new Set(resumeExistingResponse ? [] : findAll(adapter.selectors.copyButton, document, HOVER_COPY_VISIBILITY)),
     automationInFlight: false,
     submissionAttempted: !setup,
     manualSetupRequired: false,
-    timeoutActivity: event.researchTimedOutAt === undefined
-      ? { phase: 'baseline', signature: {}, responseArmed: true }
-      : { phase: 'hydrating' },
-    planApprovalAttempts: 0,
-    lastPlanApprovalAt: 0,
+    timeoutActivity: { phase: 'hydrating' },
+    planApprovals: new WeakMap(),
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? {
         status: request.status,
@@ -797,13 +821,17 @@ export default defineContentScript({
         return currentResponseSnapshot(ADAPTERS[provider], message.runId, message.conversationKey);
       }
       if (message.type === 'capture:copy-now' && active) {
-        const currentConversationKey = conversationKeyFromUrl(location.href, active.adapter.id);
-        if (!message.conversationKey || !active.conversationKey
-          || message.conversationKey !== active.conversationKey
-          || message.conversationKey !== currentConversationKey) {
+        const pageIdentity = observeConversation(active);
+        const expectedJobId = `${active.id}:${active.adapter.id}`;
+        const entryFallback = pageIdentity.kind === 'entry'
+          && !active.conversationKey && !message.conversationKey;
+        const conversationVerified = pageIdentity.kind === 'conversation'
+          && conversationKeysMatch(message.conversationKey, pageIdentity.key, active.adapter.id)
+          && conversationKeysMatch(active.conversationKey, pageIdentity.key, active.adapter.id);
+        if (message.jobId !== expectedJobId || (!entryFallback && !conversationVerified)) {
           throw new Error('Provider copy rejected because the conversation changed.');
         }
-        const roots = responseRoots(active.adapter);
+        const roots = completedResponseRoots(active.adapter);
         const root = roots.at(-1) ?? null;
         const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton, new Set(), true) : null;
         if (!button || !isResponseControlActionable(button, true, root ?? undefined)) {

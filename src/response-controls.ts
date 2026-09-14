@@ -20,8 +20,12 @@ export class ResponseControlIndex {
   ancestorVisits = 0;
 
   constructor(roots: readonly HTMLElement[]) {
-    this.roots = new Set(roots);
-    for (const root of roots) {
+    const uniqueRoots = Array.from(new Set(roots));
+    const normalizedRoots = uniqueRoots.filter((candidate) => !uniqueRoots.some(
+      (other) => other !== candidate && other.contains(candidate),
+    ));
+    this.roots = new Set(normalizedRoots);
+    for (const root of normalizedRoots) {
       for (let node: HTMLElement | null = root; node; node = node.parentElement) {
         this.ancestorVisits++;
         const info = this.containers.get(node) ?? { roots: [] };

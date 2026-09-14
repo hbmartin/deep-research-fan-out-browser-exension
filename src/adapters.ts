@@ -14,6 +14,7 @@ export interface ProviderAdapter {
   origin: string;
   authenticationOrigins?: readonly string[];
   entryUrl: string;
+  conversationPathPattern: RegExp;
   composerKind: 'contenteditable' | 'textarea';
   submitStrategy: 'button' | 'enter';
   citationMarkerStyle: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
@@ -55,7 +56,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
     // Success markers verified in tests/fixtures/chatgpt-copy-feedback.json.
     copySuccessSelector: '[data-copy-state="copied"], svg use[href="#lightweight-conversation-check"]',
-    id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.2.0', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
+    id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.2.1', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
+    conversationPathPattern: /^\/c\/[^/]+$/,
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     clarifyingPromptPattern: /^(?:(?:great|thanks|thank you|sure|certainly|absolutely|of course|i can help with that)[^.!?]{0,120}[.!?—,:-]\s*)?(?:before i begin\b|could you (?:please )?(?:clarify|specify)\b)/i,
     progressResponsePattern: commonProgressResponse,
@@ -76,7 +78,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
     },
   },
   claude: {
-    id: 'claude', label: 'Claude', version: 'claude@0.1.0', origin: 'https://claude.ai', entryUrl: 'https://claude.ai/new',
+    id: 'claude', label: 'Claude', version: 'claude@0.1.1', origin: 'https://claude.ai', entryUrl: 'https://claude.ai/new',
+    conversationPathPattern: /^\/chat\/[^/]+$/,
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     progressResponsePattern: commonProgressResponse,
     quotaResponsePattern: commonQuotaResponse,
@@ -95,7 +98,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
     },
   },
   gemini: {
-    id: 'gemini', label: 'Gemini', version: 'gemini@0.1.1', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
+    id: 'gemini', label: 'Gemini', version: 'gemini@0.1.2', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
+    conversationPathPattern: /^\/app\/(?!download$)[^/]+$/,
     authenticationOrigins: ['https://accounts.google.com'],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'superscript', urlResolution: 'follow_redirect',
     progressResponsePattern: commonProgressResponse,
@@ -106,7 +110,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /tools|deep research/i }, { kind: 'text', value: /deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deep research/i }, { kind: 'text', value: /^deep research$/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep research" i]' }, { kind: 'css', value: '[data-test-id="deep-research-chip"]' }, { kind: 'css', value: '[data-state="selected"][aria-label*="deep research" i]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: /^(?:researching|working on it)(?:\s*(?:…|\.{1,3})|\s*[·•—-]\s*.+|\s+\d+\s+sources?)?$/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: /^(?:researching|working on it)(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?\d+\s+sources?)?$/i }],
       finalMessageRoot: [{ kind: 'css', value: 'model-response', pick: 'last' }, { kind: 'css', value: '[data-test-id="model-response"]', pick: 'last' }],
       copyButton: commonCopyButton,
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
@@ -117,7 +121,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
     },
   },
   grok: {
-    id: 'grok', label: 'Grok', version: 'grok@0.2.1', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
+    id: 'grok', label: 'Grok', version: 'grok@0.2.2', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
+    conversationPathPattern: /^\/c\/[^/]+$/,
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     progressResponsePattern: commonProgressResponse,
     quotaResponsePattern: commonQuotaResponse,
@@ -127,7 +132,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /deepsearch|deep research|mode/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deepsearch|deep research/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-testid*="deep"][aria-pressed="true"]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /^(?:searching|thinking|researching)(?:\s*(?:…|\.{1,3})|\s*[·•—-]\s*.+|\s+\d+\s+sources?)?$/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /^(?:searching|thinking|researching)(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?\d+\s+sources?)?$/i }],
       finalMessageRoot: [{ kind: 'css', value: '[data-testid="assistant-message"]', pick: 'last' }, { kind: 'css', value: 'article', pick: 'last' }],
       copyButton: [{ kind: 'aria', role: 'button', name: /^copy response$/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
@@ -155,28 +160,42 @@ export function isProviderUrl(value: string | URL | undefined, provider: Provide
   return value !== undefined && providerFromUrl(value) === provider;
 }
 
-const TRACKING_PARAMETER = /^(?:utm_.+|ref(?:errer)?|source|gclid|dclid|fbclid|msclkid|mc_.+|_ga)$/i;
+export type ProviderPageIdentity =
+  | { kind: 'entry' }
+  | { kind: 'conversation'; key: string }
+  | { kind: 'unsupported' };
 
-function canonicalConversationUrl(value: string | URL): string {
-  const url = value instanceof URL ? new URL(value.href) : new URL(value);
-  url.hash = '';
-  for (const key of Array.from(url.searchParams.keys())) {
-    if (TRACKING_PARAMETER.test(key)) url.searchParams.delete(key);
+function canonicalPath(pathname: string): string {
+  return pathname.replace(/\/+$/, '') || '/';
+}
+
+export function classifyProviderPage(value: string | URL, provider: ProviderId): ProviderPageIdentity {
+  try {
+    const url = value instanceof URL ? new URL(value.href) : new URL(value);
+    const adapter = ADAPTERS[provider];
+    if (url.origin !== adapter.origin) return { kind: 'unsupported' };
+    const pathname = canonicalPath(url.pathname);
+    if (pathname === canonicalPath(new URL(adapter.entryUrl).pathname)) return { kind: 'entry' };
+    adapter.conversationPathPattern.lastIndex = 0;
+    return adapter.conversationPathPattern.test(pathname)
+      ? { kind: 'conversation', key: `${adapter.origin}${pathname}` }
+      : { kind: 'unsupported' };
+  } catch {
+    return { kind: 'unsupported' };
   }
-  url.searchParams.sort();
-  url.pathname = url.pathname.replace(/\/+$/, '') || '/';
-  return url.href;
 }
 
 export function conversationKeyFromUrl(value: string | URL, provider: ProviderId): string | undefined {
-  try {
-    if (!isProviderUrl(value, provider)) return undefined;
-    const candidate = canonicalConversationUrl(value);
-    const entry = canonicalConversationUrl(ADAPTERS[provider].entryUrl);
-    const candidateUrl = new URL(candidate);
-    const entryUrl = new URL(entry);
-    return candidateUrl.pathname === entryUrl.pathname ? undefined : candidate;
-  } catch {
-    return undefined;
-  }
+  const identity = classifyProviderPage(value, provider);
+  return identity.kind === 'conversation' ? identity.key : undefined;
+}
+
+/** Normalize persisted pre-classifier URL keys without requiring a database migration. */
+export function normalizeConversationKey(value: string | undefined, provider: ProviderId): string | undefined {
+  return value === undefined ? undefined : conversationKeyFromUrl(value, provider);
+}
+
+export function conversationKeysMatch(left: string | undefined, right: string | undefined, provider: ProviderId): boolean {
+  const normalizedLeft = normalizeConversationKey(left, provider);
+  return normalizedLeft !== undefined && normalizedLeft === normalizeConversationKey(right, provider);
 }

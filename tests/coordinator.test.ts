@@ -34,6 +34,10 @@ function run(providerRuns: Run['providerRuns'], status: Run['status'] = 'active'
   return { id, browserSessionId: 'current-session', query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: id, downloadFolder: `deep-research/${id}` };
 }
 
+function contentSender(tabId = 1, url = 'https://chatgpt.com/'): Browser.runtime.MessageSender {
+  return { tab: { id: tabId, url } as Browser.tabs.Tab, url };
+}
+
 beforeEach(() => {
   let downloadId = 100;
   platform.downloadText.mockReset().mockImplementation(async () => downloadId++);
@@ -576,13 +580,25 @@ describe('coordinator run guards', () => {
     expect(clipboard).toContain('Current report with');
   });
 
-  it('fails closed for legacy or mismatched side-panel Copy current requests', async () => {
+  it('copies from the run-owned entry tab without a stored key or live content run', async () => {
     const legacy = run({ chatgpt: provider('chatgpt', 45, 'researching') });
     await putRun(legacy);
+    tabsGet.mockResolvedValue({ id: 45, url: 'https://chatgpt.com/' } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return {
+        provider: 'chatgpt', pageUrl: 'https://chatgpt.com/',
+        domMarkdown: 'Current entry-page response.', domCitations: [],
+      };
+    });
     await expect(coordinatorTestHooks.handleRequest(
       { type: 'provider:copy-current', runId: legacy.id, provider: 'chatgpt' }, {},
-    )).resolves.toMatchObject({ ok: false, code: 'conversation_mismatch' });
+    )).resolves.toEqual({ ok: true });
+    expect(platform.writeClipboard).toHaveBeenCalledWith('Current entry-page response.\n');
+  });
 
+  it('fails closed for a mismatched side-panel Copy current request', async () => {
+    const legacy = run({ chatgpt: provider('chatgpt', 45, 'researching') });
     legacy.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/expected';
     await putRun(legacy);
     tabsGet.mockResolvedValue({ id: 45, url: 'https://chatgpt.com/c/other' } as Browser.tabs.Tab);
@@ -605,6 +621,30 @@ describe('coordinator run guards', () => {
       runId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
     })).rejects.toMatchObject({ code: 'conversation_mismatch' });
     expect(platform.writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it('preserves current-response transport and snapshot diagnostics', async () => {
+    tabsGet.mockResolvedValue({ id: 48, url: 'https://chatgpt.com/c/expected' } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      throw new Error('No ChatGPT response is available to copy.');
+    });
+    await expect(coordinatorTestHooks.copyCurrentResponse(48, 'chatgpt', {
+      runId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+    })).rejects.toThrow('No ChatGPT response is available to copy.');
+
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return {
+        provider: 'chatgpt', pageUrl: 'https://chatgpt.com/c/expected',
+        activeRunId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+        domMarkdown: 'Current response.',
+        domCitations: [{ url: 'not a URL', domOrder: 0, contextBefore: '', contextAfter: '' }],
+      };
+    });
+    await expect(coordinatorTestHooks.copyCurrentResponse(48, 'chatgpt', {
+      runId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+    })).rejects.toThrow('Provider returned invalid citation data.');
   });
 
   it('rechecks the tab conversation after snapshot processing and before clipboard write', async () => {
@@ -734,7 +774,7 @@ describe('coordinator run guards', () => {
     await putJob(job);
     await expect(coordinatorTestHooks.handleRequest({
       type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
-    }, {})).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
+    }, contentSender(931))).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
     expect(await getJob(id)).toEqual(job);
     await coordinatorTestHooks.processCaptureQueue();
     await deleteJob(id);
@@ -754,7 +794,7 @@ describe('coordinator run guards', () => {
     await putJob(job);
     await expect(coordinatorTestHooks.handleRequest({
       type: 'content:capture', runId: stored.id, provider: 'chatgpt', domMarkdown: 'Changed page', domCitations: [],
-    }, {})).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
+    }, contentSender(932))).resolves.toMatchObject({ ok: true, providerState: { status: 'capturing' } });
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('capturing');
     expect(await getJob(id)).toEqual(job);
     await deleteJob(id);
@@ -974,7 +1014,7 @@ describe('coordinator run guards', () => {
     await expect(coordinatorTestHooks.handleRequest({
       type: 'content:capture', runId: stored.id, provider: 'chatgpt',
       domMarkdown: 'A report that arrived after the provider was ended.', domCitations: [],
-    }, {} as Browser.runtime.MessageSender)).resolves.toMatchObject({
+    }, contentSender(918))).resolves.toMatchObject({
       ok: false, code: 'provider_terminal',
     });
   });
@@ -987,23 +1027,56 @@ describe('durable acceptance and state recovery regressions', () => {
   function jobFor(stored: Run): CaptureJob {
     return {...captureRequest(stored),id:`${stored.id}:chatgpt`,tabId:1,state:'queued',createdAt:Date.now(),attempts:0,domCitations:[]};
   }
+  it('accepts automatic capture from the exact run-owned entry tab without a conversation key', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest(
+      {...captureRequest(stored), domCitations: []}, contentSender(),
+    )).resolves.toMatchObject({ok:true,providerState:{status:'capturing',conversationKey:undefined}});
+    await vi.waitFor(async () => expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined());
+  });
+  it.each([
+    ['wrong tab', contentSender(2)],
+    ['wrong origin', contentSender(1, 'https://example.com/')],
+    ['unsupported provider path', contentSender(1, 'https://chatgpt.com/share/123')],
+  ])('rejects content state from the %s', async (_label, sender) => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+    },sender)).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey).toBeUndefined();
+  });
+  it('lazily normalizes compatible stored and reported legacy conversation keys', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound/?model=research#sources';
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+      conversationKey:'https://chatgpt.com/c/bound?model=fast#answer',
+    },contentSender(1, 'https://chatgpt.com/c/bound/?temporary=1'))).resolves.toMatchObject({
+      ok:true,providerState:{conversationKey:'https://chatgpt.com/c/bound'},
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey)
+      .toBe('https://chatgpt.com/c/bound');
+  });
   it('persists the first conversation key and rejects later unavailable or different keys', async () => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});
     await putRun(stored);
     const bound = await coordinatorTestHooks.handleRequest({
       type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
       conversationKey:'https://chatgpt.com/c/bound',
-    },{});
+    },contentSender(1, 'https://chatgpt.com/c/bound'));
     expect(bound).toMatchObject({ok:true,providerState:{conversationKey:'https://chatgpt.com/c/bound'}});
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey).toBe('https://chatgpt.com/c/bound');
 
     await expect(coordinatorTestHooks.handleRequest({
       type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
-    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    },contentSender(1, 'https://chatgpt.com/c/bound'))).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
     await expect(coordinatorTestHooks.handleRequest({
       type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
       conversationKey:'https://chatgpt.com/c/other',
-    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    },contentSender(1, 'https://chatgpt.com/c/bound'))).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
   });
   it.each([undefined, 'https://chatgpt.com/c/other'])('rejects automatic capture with mismatched conversation key %s', async (conversationKey) => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});
@@ -1011,14 +1084,16 @@ describe('durable acceptance and state recovery regressions', () => {
     await putRun(stored);
     await expect(coordinatorTestHooks.handleRequest({
       ...captureRequest(stored), conversationKey, domCitations: [],
-    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    },contentSender(1, 'https://chatgpt.com/c/bound'))).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
     expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('researching');
   });
   it.each(['setting_mode','submitting','opening'] as const)('rejects capture in %s without leaving a job', async (status) => {
     const stored = run({chatgpt:provider('chatgpt',1,status)});
     await putRun(stored);
-    await expect(coordinatorTestHooks.handleRequest({...captureRequest(stored),domCitations:[]},{})).resolves.toMatchObject({ok:false,code:'invalid_transition',providerState:{status}});
+    await expect(coordinatorTestHooks.handleRequest(
+      {...captureRequest(stored),domCitations:[]}, contentSender(),
+    )).resolves.toMatchObject({ok:false,code:'invalid_transition',providerState:{status}});
     expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
     expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe(status);
   });
@@ -1064,17 +1139,17 @@ describe('durable acceptance and state recovery regressions', () => {
     stored.providerRuns.chatgpt!.submittedAt=submittedAt;
     await putRun(stored);
     const request = {type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required',reason:'research_timeout',detail:'Timed out',submittedAt:Date.now()} as const;
-    const first = await coordinatorTestHooks.handleRequest(request,{});
-    const second = await coordinatorTestHooks.handleRequest(request,{});
+    const first = await coordinatorTestHooks.handleRequest(request,contentSender());
+    const second = await coordinatorTestHooks.handleRequest(request,contentSender());
     expect(first).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt,researchTimedOutAt:expect.any(Number)}});
     expect(second).toEqual(first);
     expect(platform.notify).toHaveBeenCalledTimes(1);
     await coordinatorTestHooks.startContent((await getRun(stored.id))!,'chatgpt',true);
     expect(platform.sendTabEvent).toHaveBeenCalledWith(1,expect.objectContaining({type:'content:start',submittedAt,researchTimedOutAt:expect.any(Number)}));
     const resumedAt=Date.now();
-    await expect(coordinatorTestHooks.handleRequest({...request,status:'researching',submittedAt:resumedAt,reason:undefined},{}))
+    await expect(coordinatorTestHooks.handleRequest({...request,status:'researching',submittedAt:resumedAt,reason:undefined},contentSender()))
       .resolves.toEqual({ok:true,providerState:{status:'researching',submittedAt:resumedAt,researchTimedOutAt:undefined}});
-    const nextTimeout = await coordinatorTestHooks.handleRequest({...request,submittedAt:resumedAt},{});
+    const nextTimeout = await coordinatorTestHooks.handleRequest({...request,submittedAt:resumedAt},contentSender());
     expect(nextTimeout).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt:resumedAt,researchTimedOutAt:expect.any(Number)}});
     expect(platform.notify).toHaveBeenCalledTimes(2);
   });
@@ -1088,7 +1163,7 @@ describe('durable acceptance and state recovery regressions', () => {
 
     await expect(coordinatorTestHooks.handleRequest({
       type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',submittedAt:resumedAt,
-    },{})).resolves.toEqual({
+    },contentSender())).resolves.toEqual({
       ok:true,providerState:{status:'researching',submittedAt:resumedAt,researchTimedOutAt:undefined},
     });
   });
@@ -1097,13 +1172,17 @@ describe('durable acceptance and state recovery regressions', () => {
     const stored=run({chatgpt:provider('chatgpt',1,'researching')});
     await putRun(stored);
     platform.notify.mockRejectedValue(new Error('notifications unavailable'));
-    await expect(coordinatorTestHooks.handleRequest({type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required'},{})).resolves.toMatchObject({ok:true,providerState:{status:'manual_required'}});
+    await expect(coordinatorTestHooks.handleRequest(
+      {type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required'},contentSender(),
+    )).resolves.toMatchObject({ok:true,providerState:{status:'manual_required'}});
     vi.restoreAllMocks();
   });
   it('returns a terminal snapshot for stale state reports', async () => {
     const stored=run({chatgpt:provider('chatgpt',1,'complete')},'complete');
     await putRun(stored);
-    await expect(coordinatorTestHooks.handleRequest({type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching'},{})).resolves.toMatchObject({ok:false,code:'provider_terminal',providerState:{status:'complete'}});
+    await expect(coordinatorTestHooks.handleRequest(
+      {type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching'},contentSender(),
+    )).resolves.toMatchObject({ok:false,code:'provider_terminal',providerState:{status:'complete'}});
   });
   it('does not inject another script when a reachable receiver rejects startup', async () => {
     const stored=run({chatgpt:provider('chatgpt',1,'setting_mode')});

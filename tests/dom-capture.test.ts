@@ -165,6 +165,8 @@ describe('provider DOM capture', () => {
       <span>Elapsed time: 1h 2m 3s</span>
       <span aria-label="Elapsed company history">The company was founded in 1982.</span>
       <p>Elapsed time: 1:23:45</p>
+      <p><span aria-label="Elapsed time">00:33</span></p>
+      <li>Researching evidence — elapsed time: 2m 3s</li>
       <table><tbody><tr><td>Elapsed time: 1:23:45</td></tr></tbody></table>
     `;
     const snapshot = createResponseSnapshot(response);
@@ -179,15 +181,26 @@ describe('provider DOM capture', () => {
     expect(snapshot.text).not.toContain('1h 2m 3s');
     expect(snapshot.text).toContain('The company was founded in 1982.');
     expect(snapshot.text.match(/Elapsed time: 1:23:45/g)).toHaveLength(2);
+    expect(snapshot.text).toContain('00:33');
+    expect(snapshot.text).toContain('Researching evidence — elapsed time: 2m 3s');
+    expect(snapshot.activityText).not.toMatch(/00:33|1:23:45|2m 3s/);
+    expect(snapshot.activityText).toContain('Researching evidence');
   });
 
   it('uses timer-stripped text for response activity fingerprints', () => {
     const response = document.createElement('article');
     response.id = 'response';
-    response.innerHTML = '<p>Researching the requested topic.</p><span aria-label="Elapsed time">00:31</span>';
+    response.innerHTML = `
+      <p>Researching the requested topic.</p>
+      <p><span aria-label="Elapsed time">00:31</span></p>
+      <li>Progress details — elapsed time: 1m 31s</li>
+    `;
     const first = finalResponseFingerprint(response);
     response.querySelector('span')!.textContent = '00:32';
+    response.querySelector('li')!.textContent = 'Progress details — elapsed time: 1m 32s';
     expect(finalResponseFingerprint(response)).toBe(first);
+    response.querySelector('li')!.textContent = 'Different progress details — elapsed time: 1m 33s';
+    expect(finalResponseFingerprint(response)).not.toBe(first);
   });
 
   it('requires an interactive Gemini plan approval control', () => {

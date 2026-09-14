@@ -84,6 +84,7 @@ export interface ResponseSnapshot {
   root: HTMLElement;
   content: HTMLElement;
   text: string;
+  activityText: string;
 }
 
 const DURATION = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
@@ -91,13 +92,25 @@ const BARE_DURATION = new RegExp(`^${DURATION}$`, 'i');
 const EXPLICIT_ELAPSED_DURATION = new RegExp(`^(?:elapsed(?: time)?[:\\s]+${DURATION}|${DURATION}\\s+elapsed)$`, 'i');
 const REPORT_BEARING_ELEMENT = 'p, li, h1, h2, h3, h4, h5, h6, table, thead, tbody, tfoot, tr, th, td';
 
-function isElapsedTimerElement(element: Element): boolean {
-  if (element.matches(REPORT_BEARING_ELEMENT) || element.querySelector(REPORT_BEARING_ELEMENT)) return false;
+function isElapsedTimerElement(element: Element, preserveReportBearing = true): boolean {
+  if (preserveReportBearing
+    && (element.closest(REPORT_BEARING_ELEMENT)
+      || element.querySelector(REPORT_BEARING_ELEMENT))) return false;
   const text = normalizeVisibleText(element.textContent ?? '');
   if (EXPLICIT_ELAPSED_DURATION.test(text)) return true;
   if (!BARE_DURATION.test(text)) return false;
   return [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid')]
     .some((value) => value !== null && /\belapsed(?:[\s_-]+(?:time|timer))?\b/i.test(value));
+}
+
+const INLINE_ELAPSED_DURATION = new RegExp(
+  String.raw`(?:\s*[·•—-]\s*)?(?:elapsed(?: time)?[:\s]+${DURATION}|${DURATION}\s+elapsed)|\s*[·•—-]\s*${DURATION}\s*$`,
+  'gi',
+);
+
+export function normalizeActivityText(value: string): string {
+  INLINE_ELAPSED_DURATION.lastIndex = 0;
+  return normalizeVisibleText(value.replace(INLINE_ELAPSED_DURATION, ' '));
 }
 
 const TEXT_BOUNDARY_ELEMENTS = new Set([
@@ -132,7 +145,16 @@ export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   for (const element of Array.from(content.querySelectorAll('*'))) {
     if (isElapsedTimerElement(element)) element.remove();
   }
-  return { root, content, text: structurallySeparatedText(content) };
+  const activityContent = content.cloneNode(true) as HTMLElement;
+  for (const element of Array.from(activityContent.querySelectorAll('*'))) {
+    if (isElapsedTimerElement(element, false)) element.remove();
+  }
+  return {
+    root,
+    content,
+    text: structurallySeparatedText(content),
+    activityText: normalizeActivityText(structurallySeparatedText(activityContent)),
+  };
 }
 
 function isTextMatch(text: string, pattern?: RegExp, maximumLength?: number): boolean {
@@ -176,12 +198,12 @@ export interface FinalResponseBaseline {
 
 function finalResponseSignature(root: HTMLElement): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
-  return stableId ? `id:${stableId}` : `text:${normalizeVisibleText(root.innerText || root.textContent || '')}`;
+  return stableId ? `id:${stableId}` : `text:${createResponseSnapshot(root).activityText}`;
 }
 
 export function finalResponseFingerprint(root: HTMLElement, snapshot?: ResponseSnapshot): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
-  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
+  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).activityText;
   return `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${text}`;
 }
 
@@ -199,7 +221,7 @@ export function evaluateStableResponse(
   snapshot?: ResponseSnapshot,
 ): { candidate?: StableResponseCandidate; ready: boolean } {
   if (!root) return { ready: false };
-  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
+  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).activityText;
   if (text.length < (copyAvailable ? 1 : DOM_ONLY_COMPLETION_MIN_CHARS)) return { ready: false };
   const fingerprint = `${root.getAttribute('data-message-id') || root.id}\u0000${text}`;
   if (candidate?.fingerprint !== fingerprint) {

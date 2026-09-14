@@ -94,6 +94,29 @@ describe('Gemini plan timeout recovery', () => {
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
   });
 
+  it('preserves per-element retry counts across visibility gaps and resets only for a new element', async () => {
+    response('A research plan is ready for approval.');
+    const firstPlan = planButton();
+    const firstClick = vi.fn();
+    firstPlan.addEventListener('click', firstClick);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(firstClick).toHaveBeenCalledTimes(1);
+
+    firstPlan.style.display = 'none';
+    await vi.advanceTimersByTimeAsync(3000);
+    firstPlan.style.display = '';
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(firstClick).toHaveBeenCalledTimes(3);
+
+    firstPlan.remove();
+    const replacementPlan = planButton();
+    const replacementClick = vi.fn();
+    replacementPlan.addEventListener('click', replacementClick);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(replacementClick).toHaveBeenCalledTimes(3);
+  });
+
   it('grants a fresh interval only after the plan disappears and verified progress begins', async () => {
     response('A research plan is ready for approval.');
     const plan = planButton();
@@ -125,6 +148,22 @@ describe('Gemini plan timeout recovery', () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(storedStatus).toBe('researching');
     expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  it('prioritizes a page-level quota notice over simultaneous streaming and plan controls', async () => {
+    response('A partial response that must not hide the terminal page notice.');
+    const plan = planButton();
+    const click = vi.fn();
+    plan.addEventListener('click', click);
+    document.body.insertAdjacentHTML('beforeend', `
+      <button style="position:fixed" aria-label="Stop response"></button>
+      <span style="position:fixed">Your deep research limit has been reached.</span>
+    `);
+    await start('researching');
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('quota_exhausted');
+    expect(click).not.toHaveBeenCalled();
   });
 
   it('leaves awaiting-user state when a plain-text progress indicator appears', async () => {
