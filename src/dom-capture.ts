@@ -5,15 +5,23 @@ import type { DomCitation } from './types';
 
 const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
 const DOM_ONLY_COMPLETION_MIN_MS = 30_000;
-const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea, [role="status"], [role="progressbar"], time';
+const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea';
 
 export function normalizeVisibleText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-export function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter, snapshot?: ResponseSnapshot): DomCitation[] {
-  const anchors = findAll(adapter.selectors.citationAnchors, root, { extractionRoot: root })
+function citationAnchors(root: HTMLElement, adapter: ProviderAdapter): HTMLAnchorElement[] {
+  return findAll(adapter.selectors.citationAnchors, root, { extractionRoot: root })
     .filter((element): element is HTMLAnchorElement => element instanceof HTMLAnchorElement);
+}
+
+export function domCitationCount(root: HTMLElement, adapter: ProviderAdapter): number {
+  return citationAnchors(root, adapter).filter((anchor) => anchor.href.startsWith('http')).length;
+}
+
+export function domCitationInventory(root: HTMLElement, adapter: ProviderAdapter, snapshot?: ResponseSnapshot): DomCitation[] {
+  const anchors = citationAnchors(root, adapter);
   const fullText = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
   let cursor = 0;
   return anchors.flatMap((anchor, domOrder) => {
@@ -108,7 +116,13 @@ function structurallySeparatedText(root: HTMLElement): string {
 export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   const content = cloneResponseContent(root);
   for (const element of Array.from(content.querySelectorAll('*'))) {
-    if (!element.children.length && /^(?:(?:elapsed(?: time)?[:\s]*)?\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i.test(normalizeVisibleText(element.textContent ?? ''))) element.remove();
+    if (element.children.length) continue;
+    const text = normalizeVisibleText(element.textContent ?? '');
+    const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid')]
+      .filter(Boolean).join(' ');
+    const explicitlyElapsed = /\belapsed(?:\s+time)?\b/i.test(label)
+      || /^(?:elapsed(?: time)?[:\s]+\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i.test(text);
+    if (explicitlyElapsed) element.remove();
   }
   return { root, content, text: structurallySeparatedText(content) };
 }
@@ -178,7 +192,7 @@ export function evaluateStableResponse(
 ): { candidate?: StableResponseCandidate; ready: boolean } {
   if (!root) return { ready: false };
   const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).text;
-  if (text.length < (copyAvailable ? 40 : DOM_ONLY_COMPLETION_MIN_CHARS)) return { ready: false };
+  if (text.length < (copyAvailable ? 1 : DOM_ONLY_COMPLETION_MIN_CHARS)) return { ready: false };
   const fingerprint = `${root.getAttribute('data-message-id') || root.id}\u0000${text}`;
   if (candidate?.fingerprint !== fingerprint) {
     return { candidate: { fingerprint, since: now }, ready: false };

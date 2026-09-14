@@ -153,6 +153,7 @@ export interface CaptureJob {
   tabUnavailable?: boolean;
   domMarkdown: string;
   domCitations: DomCitation[];
+  copyControlObserved?: boolean;
   researchTrail?: CapturedResearchTrail;
   title?: string;
 }

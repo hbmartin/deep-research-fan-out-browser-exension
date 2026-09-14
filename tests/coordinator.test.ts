@@ -203,6 +203,19 @@ describe('coordinator run guards', () => {
     expect(await getCapture(`${stored.id}:chatgpt`)).toMatchObject({ captureMethod: 'dom_only' });
   });
 
+  it('persists a short DOM-backed reply when an owned Copy control established completion', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 909, 'capturing') });
+    await putRun(stored);
+    await putJob({
+      id: `${stored.id}:chatgpt`, runId: stored.id, provider: 'chatgpt', tabId: 909,
+      state: 'queued', createdAt: Date.now(), attempts: MAX_CAPTURE_ATTEMPTS,
+      tabUnavailable: true, domMarkdown: 'OK', domCitations: [], copyControlObserved: true,
+    });
+    await coordinatorTestHooks.processCaptureQueue();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('complete');
+    expect(await getCapture(`${stored.id}:chatgpt`)).toMatchObject({ rawMarkdown: 'OK', captureMethod: 'dom_only' });
+  });
+
   it('links a persisted capture without overwriting a terminal status that won concurrently', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 910, 'interrupted') });
     await putRun(stored);
@@ -316,6 +329,24 @@ describe('coordinator run guards', () => {
     await expect(pending).resolves.toMatchObject({ text: report, restored: true });
     expect(browser.tabs.update).toHaveBeenCalledWith(2, { active: true });
     expect(clipboard).toBe(privateText);
+  });
+
+  it('rejects short copy-only clipboard data even when provider feedback confirms the click', async () => {
+    vi.useFakeTimers();
+    let clipboard = 'Original clipboard material that should not be mistaken for a report.';
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = 'Too short';
+      return { ok: true, copyConfirmed: true };
+    });
+    const job: CaptureJob = {
+      id: 'run:claude-short', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: '', domCitations: [],
+    };
+    const pending = coordinatorTestHooks.clipboardCapture(platform, job);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
   });
 
   it('accepts a fresh provider copy identical to the original clipboard', async () => {
@@ -704,7 +735,7 @@ describe('durable acceptance and state recovery regressions', () => {
     expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
     expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('complete');
   });
-  it('preserves the first submission time and notifies only once for a persisted timeout', async () => {
+  it('preserves timeout state per active interval and resets it for genuine resumed research', async () => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});
     const submittedAt = Date.now()-3600000;
     stored.providerRuns.chatgpt!.submittedAt=submittedAt;
@@ -715,9 +746,14 @@ describe('durable acceptance and state recovery regressions', () => {
     expect(first).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt,researchTimedOutAt:expect.any(Number)}});
     expect(second).toEqual(first);
     expect(platform.notify).toHaveBeenCalledTimes(1);
-    await expect(coordinatorTestHooks.handleRequest({...request,status:'researching'},{})).resolves.toMatchObject({ok:false,code:'invalid_transition',providerState:{status:'manual_required',submittedAt}});
     await coordinatorTestHooks.startContent((await getRun(stored.id))!,'chatgpt',true);
     expect(platform.sendTabEvent).toHaveBeenCalledWith(1,expect.objectContaining({type:'content:start',submittedAt,researchTimedOutAt:expect.any(Number)}));
+    const resumedAt=Date.now();
+    await expect(coordinatorTestHooks.handleRequest({...request,status:'researching',submittedAt:resumedAt,reason:undefined},{}))
+      .resolves.toEqual({ok:true,providerState:{status:'researching',submittedAt:resumedAt,researchTimedOutAt:undefined}});
+    const nextTimeout = await coordinatorTestHooks.handleRequest({...request,submittedAt:resumedAt},{});
+    expect(nextTimeout).toMatchObject({ok:true,providerState:{status:'manual_required',submittedAt:resumedAt,researchTimedOutAt:expect.any(Number)}});
+    expect(platform.notify).toHaveBeenCalledTimes(2);
   });
   it('acknowledges a stored state even if notification delivery fails', async () => {
     vi.spyOn(console,'error').mockImplementation(() => undefined);

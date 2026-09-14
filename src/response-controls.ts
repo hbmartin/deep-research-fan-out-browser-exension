@@ -2,37 +2,27 @@ import type { ProviderAdapter, SelectorChain } from './adapters';
 import { findAll, isVisible } from './selectors';
 
 const PAGE_BOUNDARY = 'html, body, main, [role="main"], [role="dialog"], dialog, aside';
-const FOREIGN_REGION = 'form, [contenteditable="true"], textarea, [data-message-author-role="user"], [role="dialog"], dialog, aside';
-const EXCLUDED_CONTROL = 'pre, code, table, form, [contenteditable="true"], [data-message-author-role="user"]';
-const TURN = 'section, article, [data-message-id], [data-testid^="conversation-turn"]';
+const EXCLUDED_CONTROL = 'pre, code, table, form, [contenteditable="true"], textarea, [data-message-author-role="user"], [role="dialog"], dialog, aside';
 const DISCOVERY = { allowTransparent: true, ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 
-interface Container { count: number; last: HTMLElement }
+interface Container { roots: HTMLElement[] }
 
 /** Short-lived index: ancestry is built once, never once per response/control pair. */
 export class ResponseControlIndex {
   private roots: Set<HTMLElement>;
   private containers = new Map<HTMLElement, Container>();
-  private foreignContainers = new Set<HTMLElement>();
   private owners = new Map<HTMLElement, HTMLElement | undefined>();
   private candidates = new Map<SelectorChain, HTMLElement[]>();
   ancestorVisits = 0;
 
-  constructor(roots: readonly HTMLElement[], private adapter?: ProviderAdapter) {
+  constructor(roots: readonly HTMLElement[], _adapter?: ProviderAdapter) {
     this.roots = new Set(roots);
     for (const root of roots) {
       for (let node: HTMLElement | null = root; node; node = node.parentElement) {
         this.ancestorVisits++;
-        const prior = this.containers.get(node);
-        this.containers.set(node, { count: (prior?.count ?? 0) + 1, last: root });
-        if (node.matches(PAGE_BOUNDARY)) break;
-      }
-    }
-    for (const region of document.querySelectorAll<HTMLElement>(FOREIGN_REGION)) {
-      for (let node: HTMLElement | null = region; node; node = node.parentElement) {
-        this.ancestorVisits++;
-        if (this.foreignContainers.has(node)) break;
-        this.foreignContainers.add(node);
+        const info = this.containers.get(node) ?? { roots: [] };
+        info.roots.push(root);
+        this.containers.set(node, info);
         if (node.matches(PAGE_BOUNDARY)) break;
       }
     }
@@ -51,7 +41,13 @@ export class ResponseControlIndex {
       if (!id) continue;
       const controlled = document.getElementById(id);
       const info = controlled ? this.containers.get(controlled) : undefined;
-      if (info?.count === 1 && candidate.closest(FOREIGN_REGION) === info.last.closest(FOREIGN_REGION)) return info.last;
+      const owner = info?.roots.length === 1 ? info.roots[0] : undefined;
+      if (owner) {
+        for (let node: HTMLElement | null = candidate; node; node = node.parentElement) {
+          if (node.matches(PAGE_BOUNDARY)) break;
+          if (node.contains(owner)) return owner;
+        }
+      }
     }
     for (let node: HTMLElement | null = candidate; node; node = node.parentElement) {
       this.ancestorVisits++;
@@ -59,11 +55,13 @@ export class ResponseControlIndex {
       if (node.matches(PAGE_BOUNDARY)) return undefined;
       const info = this.containers.get(node);
       if (!info) continue;
-      if (this.foreignContainers.has(node)) return undefined;
-      if (info.count === 1) return info.last;
-      if (node.matches(this.adapter?.responseContainerSelector ?? TURN)
-        && Boolean(info.last.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING)) return info.last;
-      return undefined;
+      if (info.roots.length === 1) return info.roots[0];
+      let preceding: HTMLElement | undefined;
+      for (const root of info.roots) {
+        if (!(root.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+        if (!preceding || (preceding.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)) preceding = root;
+      }
+      return preceding;
     }
     return undefined;
   }

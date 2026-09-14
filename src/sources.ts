@@ -192,14 +192,12 @@ export async function captureGrokResearchTrail(
   }
   const openedByCapture = !sidebar;
   if (!sidebar) {
-    const sidebarsBeforeOpen = new Set(sourceSidebars(document).filter((panel) => !isEffectivelyHidden(panel)));
     toggle.click();
     sidebar = await waitFor(() => {
       const visible = sourceSidebars(document).filter((panel) => !isEffectivelyHidden(panel));
       const owned = visible.filter((panel) => sidebarBelongsToToggle(panel, toggle));
       if (owned.length === 1) return owned[0];
-      const opened = visible.filter((panel) => !sidebarsBeforeOpen.has(panel));
-      return opened.length === 1 && visible.length === 1 ? opened[0] : undefined;
+      return visible.length === 1 ? visible[0] : undefined;
     }, Date.now() + Math.min(timeoutMs, 3000), signal);
   }
   if (!sidebar) {

@@ -26,6 +26,33 @@ describe('bounded response ownership', () => {
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
   });
+  it('assigns a shared plain-container control to the nearest preceding response', () => {
+    document.body.innerHTML = `<div><article>Earlier</article><article>Latest</article>${copy}</div>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+  });
+  it('assigns a control between responses to the preceding response', () => {
+    document.body.innerHTML = `<div><article>Earlier</article>${copy}<article>Later</article></div>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('does not assign a control across a page-level boundary', () => {
+    document.body.innerHTML = `<main><article>Earlier</article><article>Latest</article>${copy}</main>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[1]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('does not let aria-controls bypass a page-level boundary', () => {
+    document.body.innerHTML = `<main><article id="answer">Report</article><button style="position:fixed" aria-controls="answer" aria-label="Copy response">Copy</button></main>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBeNull();
+  });
+  it('does not reject an owned control merely because its container also has a separate form', () => {
+    document.body.innerHTML = `<section><form><textarea></textarea></form><article>Report</article>${copy}</section>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+  });
   it('distinguishes discovery of modal-blocked sources from permission to click', () => {
     document.body.innerHTML = `<main aria-hidden="true"><section><article>Report</article>${copy}</section></main>`;
     const { roots, controls } = index();

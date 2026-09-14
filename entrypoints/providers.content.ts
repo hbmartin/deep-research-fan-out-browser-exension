@@ -1,11 +1,12 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent, ProviderSnapshot } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
 import { captureGrokResearchTrail } from '@/src/sources';
+import { isSetupProviderStatus } from '@/src/state';
 import { isTerminalProviderStatus, type ProviderRunStatus, type RunId } from '@/src/types';
 import { ProviderReporter } from '@/src/provider-reporting';
 import { ResponseControlIndex, isResponseControlActionable } from '@/src/response-controls';
@@ -32,6 +33,9 @@ interface ActiveRun {
   copyButtonBaseline: ReadonlySet<HTMLElement>;
   automationInFlight: boolean;
   submissionAttempted: boolean;
+  manualSetupRequired: boolean;
+  timeoutActivityFingerprint?: string;
+  timeoutObservedInactive: boolean;
 }
 
 let active: ActiveRun | undefined;
@@ -52,9 +56,17 @@ function assertCurrent(run: ActiveRun): void {
 
 function applyProviderState(run: ActiveRun, snapshot: ProviderSnapshot): void {
   if (active !== run || run.stopped || run.captureSent) return;
+  const priorStatus = run.status;
   run.status = snapshot.status;
-  run.submittedAt ??= snapshot.submittedAt;
-  run.researchTimedOutAt ??= snapshot.researchTimedOutAt;
+  if (snapshot.submittedAt !== undefined) run.submittedAt = snapshot.submittedAt;
+  if (snapshot.status === 'researching' && priorStatus !== 'researching') {
+    run.researchTimedOutAt = undefined;
+    run.timeoutActivityFingerprint = undefined;
+    run.timeoutObservedInactive = false;
+    run.timeoutGraceUntil = undefined;
+  } else if (snapshot.researchTimedOutAt !== undefined) {
+    run.researchTimedOutAt = snapshot.researchTimedOutAt;
+  }
   if (isTerminalProviderStatus(snapshot.status)) stopRun(run);
 }
 
@@ -62,7 +74,17 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
   if (!active) return;
   const run = active;
   assertCurrent(run);
-  if (status === 'researching') run.submittedAt ??= submittedAt ?? Date.now();
+  if (status === 'researching') {
+    if (run.status !== 'researching') {
+      run.submittedAt = submittedAt ?? Date.now();
+      run.researchTimedOutAt = undefined;
+      run.timeoutActivityFingerprint = undefined;
+      run.timeoutObservedInactive = false;
+      run.timeoutGraceUntil = undefined;
+    } else {
+      run.submittedAt ??= submittedAt ?? Date.now();
+    }
+  }
   await run.reporter.report({
     type: 'content:state', runId: run.id, provider: run.adapter.id,
     status, detail, submittedAt: run.submittedAt, reason,
@@ -80,6 +102,9 @@ function reportEventually(status: ProviderRunStatus, detail?: string, submittedA
 function reportTimeout(): void {
   if (!active || active.researchTimedOutAt !== undefined) return;
   active.researchTimedOutAt = Date.now();
+  const latestResponse = responseRoots(active.adapter).at(-1) ?? null;
+  active.timeoutActivityFingerprint = latestResponse ? finalResponseFingerprint(latestResponse) : undefined;
+  active.timeoutObservedInactive = !findStreamingIndicator(active.adapter, latestResponse);
   reportEventually('manual_required', `${active.adapter.label} has not completed after 45 minutes. Check the provider tab.`, undefined, 'research_timeout');
 }
 
@@ -114,6 +139,7 @@ function waitFor(predicate: () => HTMLElement | null, timeoutMs: number): Promis
 async function prefillOnly(detail: string): Promise<void> {
   if (!active) return;
   const run = active;
+  run.manualSetupRequired = true;
   const composer = findElement(run.adapter.selectors.composer);
   if (composer && !run.submissionAttempted) await injectQuery(composer, run.adapter.composerKind, run.submittedQuery);
   assertCurrent(run);
@@ -169,7 +195,7 @@ async function automate(): Promise<void> {
   }
   const submitted = await waitFor(() => {
     const text = composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? '';
-    const streaming = findElement(adapter.selectors.streamingIndicator, document, [], RESPONSE_VISIBILITY);
+    const streaming = findElement(adapter.selectors.streamingIndicator);
     const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
     const latestResponse = responseRoots(adapter).at(-1) ?? null;
     const responseStarted = isNewFinalResponse(latestResponse, submissionBaseline);
@@ -194,22 +220,50 @@ function responseRoots(adapter: ProviderAdapter): HTMLElement[] {
   return findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY);
 }
 
+function obscuringAncestors(element: HTMLElement): Set<HTMLElement> {
+  const ancestors = new Set<HTMLElement>();
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const opacity = Number.parseFloat(getComputedStyle(current).opacity);
+    if (current.getAttribute('aria-hidden')?.toLowerCase() === 'true'
+      || current.hasAttribute('inert')
+      || (!Number.isNaN(opacity) && opacity <= 0)) ancestors.add(current);
+  }
+  return ancestors;
+}
+
+function isModalBlockedControl(control: HTMLElement, root: HTMLElement): boolean {
+  const rootObscurers = obscuringAncestors(root);
+  return rootObscurers.size > 0
+    && Array.from(obscuringAncestors(control)).some((ancestor) => rootObscurers.has(ancestor));
+}
+
+function findStreamingIndicator(adapter: ProviderAdapter, root?: HTMLElement | null): HTMLElement | null {
+  const visible = findElement(adapter.selectors.streamingIndicator);
+  if (visible || !root) return visible;
+  const rootObscurers = obscuringAncestors(root);
+  if (!rootObscurers.size) return null;
+  return findAll(adapter.selectors.streamingIndicator, document, RESPONSE_VISIBILITY)
+    .find((candidate) => Array.from(obscuringAncestors(candidate)).some((ancestor) => rootObscurers.has(ancestor))) ?? null;
+}
+
 function isInteractiveProgressIndicator(element: HTMLElement | null): boolean {
   return Boolean(element && (element instanceof HTMLButtonElement
     || element.getAttribute('role') === 'button'
     || (element instanceof HTMLInputElement && ['button', 'submit'].includes(element.type))));
 }
 
-function copyControlState(button: HTMLElement): string {
+function copyControlFields(button: HTMLElement): string[] {
   return [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-    .filter(Boolean)
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .map((value) => (value ?? '').replace(/\s+/g, ' ').trim());
+}
+
+function isCopiedSuccessText(value: string): boolean {
+  return !/\b(?:not|never|wasn['’]t|couldn['’]t|failed\s+to)\s+(?:be\s+)?copied\b|\bcopy\s+failed\b/i.test(value)
+    && /\b(?:copied(?:\s+to\s+(?:the\s+)?clipboard)?|response\s+copied|copy\s+successful)\b/i.test(value);
 }
 
 async function clickCopyControl(button: HTMLElement, adapter: ProviderAdapter): Promise<boolean> {
-  const initialState = copyControlState(button);
+  const initialFields = copyControlFields(button);
   const success = () => Boolean(adapter.copySuccessSelector
     && (button.matches(adapter.copySuccessSelector) || button.querySelector(adapter.copySuccessSelector)));
   const initialSuccess = success();
@@ -224,12 +278,12 @@ async function clickCopyControl(button: HTMLElement, adapter: ProviderAdapter): 
     try { button.click(); } finally { clicking = false; }
     const deadline = Date.now() + 500;
     do {
-      const currentState = copyControlState(button);
-      const copiedText = [button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]
-        .some((value) => /^(?:copied(?: to clipboard)?[.!]?|response copied[.!]?|copy successful[.!]?)$/i.test(value?.trim() ?? ''));
+      const currentFields = copyControlFields(button);
+      const copiedText = currentFields.some((value, index) => value !== initialFields[index]
+        && isCopiedSuccessText(value));
       if (copyEventObserved
         || (!initialSuccess && success())
-        || (currentState !== initialState && copiedText)) return true;
+        || copiedText) return true;
       await delay(50);
     } while (Date.now() < deadline);
     return false;
@@ -248,19 +302,28 @@ export function findResponseControl(
   return new ResponseControlIndex(roots).find(root, selectors, baseline, allowHoverTransparent);
 }
 
-async function capture(root: HTMLElement, controls: ResponseControlIndex): Promise<void> {
+async function capture(root: HTMLElement, copyControlObserved: boolean): Promise<void> {
   if (!active || active.captureSent || active.captureInFlight || active.stopped) return;
   const capturingRun = active;
   capturingRun.captureInFlight = true;
   try {
     const initialSnapshot = createResponseSnapshot(root);
     const before = domCitationInventory(root, capturingRun.adapter, initialSnapshot);
-    const toggle = capturingRun.adapter.selectors.sourcesPanelToggle
-      ? controls.find(root, capturingRun.adapter.selectors.sourcesPanelToggle)
-      : null;
     const title = initialSnapshot.content.querySelector('h1, h2, h3')?.textContent?.trim();
     await capturingRun.reporter.idle();
     assertCurrent(capturingRun);
+    let toggle: HTMLElement | null = null;
+    const sourceSelectors = capturingRun.adapter.selectors.sourcesPanelToggle;
+    if (root.isConnected && sourceSelectors) {
+      const refreshedRoots = responseRoots(capturingRun.adapter);
+      const refreshedControls = new ResponseControlIndex(refreshedRoots, capturingRun.adapter);
+      const possibleToggle = refreshedControls.find(root, sourceSelectors, new Set(), true, true);
+      if (possibleToggle?.isConnected) {
+        const actionable = isResponseControlActionable(possibleToggle, true, root);
+        if (!actionable && isModalBlockedControl(possibleToggle, root)) return;
+        if (actionable) toggle = possibleToggle;
+      }
+    }
     let after = before;
     const researchTrail = capturingRun.adapter.id === 'grok'
       ? await captureGrokResearchTrail(document, toggle, 5000, capturingRun.abort.signal)
@@ -273,8 +336,12 @@ async function capture(root: HTMLElement, controls: ResponseControlIndex): Promi
         do {
           await delay(100);
           assertCurrent(capturingRun);
-          after = domCitationInventory(root, capturingRun.adapter);
-        } while (Date.now() - started < 1000 && after.length === before.length);
+        } while (root.isConnected && Date.now() - started < 1000
+          && domCitationCount(root, capturingRun.adapter) === before.length);
+        if (root.isConnected) {
+          const expandedSnapshot = createResponseSnapshot(root);
+          after = domCitationInventory(root, capturingRun.adapter, expandedSnapshot);
+        }
       } finally {
         if (toggle.isConnected) toggle.click();
       }
@@ -295,6 +362,7 @@ async function capture(root: HTMLElement, controls: ResponseControlIndex): Promi
         domCitations: mergeCitationInventories(before, after),
         researchTrail,
         title,
+        copyControlObserved,
       });
     } catch (error) {
       if (error instanceof ContentMessageError && error.providerState) applyProviderState(capturingRun, error.providerState);
@@ -317,7 +385,8 @@ async function capture(root: HTMLElement, controls: ResponseControlIndex): Promi
     if (active === capturingRun && !capturingRun.stopped) {
       capturingRun.captureFailureCount += 1;
       capturingRun.captureRetryAt = Date.now() + Math.min(60_000, 5000 * 2 ** (capturingRun.captureFailureCount - 1));
-      if (capturingRun.submittedAt !== undefined && Date.now() - capturingRun.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
+      if (capturingRun.status === 'researching' && capturingRun.submittedAt !== undefined
+        && Date.now() - capturingRun.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
     }
     throw error;
   } finally {
@@ -332,8 +401,8 @@ function inspectPage(): void {
     reportEventually('interrupted', 'Provider tab navigated away.');
     return;
   }
-  if (active.captureInFlight || active.automationInFlight || ['pending', 'opening', 'awaiting_ready', 'setting_mode'].includes(active.status)) return;
-  const researchTimedOut = active.submittedAt !== undefined
+  if (active.captureInFlight || active.automationInFlight || isSetupProviderStatus(active.status)) return;
+  const researchTimedOut = active.status === 'researching' && active.submittedAt !== undefined
     && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS;
   const finalRoots = responseRoots(adapter);
   if (active.status !== 'capturing' && active.captureFailureCount === 0
@@ -344,31 +413,40 @@ function inspectPage(): void {
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const latestResponse = finalRoots.at(-1) ?? null;
   const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
-  const streaming = findElement(adapter.selectors.streamingIndicator, document, [], RESPONSE_VISIBILITY);
-  if (active.researchTimedOutAt === undefined && (active.status === 'manual_required' || active.status === 'submitting')
-    && (newResponse || isInteractiveProgressIndicator(streaming) || plan)) {
-    reportEventually('researching');
-    return;
-  }
+  const root = newResponse;
+  const streaming = findStreamingIndicator(adapter, root);
+  const responseActivityResumed = active.researchTimedOutAt === undefined;
+  const streamingActivityResumed = responseActivityResumed || active.timeoutObservedInactive;
+  const progressActivityResumed = responseActivityResumed || (active.timeoutObservedInactive && Boolean(root
+    && finalResponseFingerprint(root) !== active.timeoutActivityFingerprint));
   if (plan) {
-    if (researchTimedOut) reportTimeout();
-    if (active.researchTimedOutAt !== undefined) return;
-    if (active.geminiAutoApprove) plan.click();
+    active.completionCandidate = undefined;
+    if (active.geminiAutoApprove) {
+      plan.click();
+      if (active.status === 'awaiting_user' || active.researchTimedOutAt !== undefined) {
+        reportEventually('researching', undefined, Date.now());
+      }
+    }
     else if (active.status !== 'awaiting_user') reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
     return;
   }
-  const root = newResponse;
+  if ((active.status === 'manual_required' || active.status === 'submitting') && root && responseActivityResumed) {
+    reportEventually('researching', undefined, Date.now());
+    return;
+  }
   if (streaming) {
     active.completionCandidate = undefined;
     if (researchTimedOut) reportTimeout();
-    else if (active.researchTimedOutAt === undefined && active.status === 'awaiting_user') reportEventually('researching');
+    else if (active.status === 'awaiting_user'
+      || ((active.status === 'manual_required' || active.status === 'submitting') && streamingActivityResumed)) {
+      reportEventually('researching', undefined, Date.now());
+    }
     return;
   }
   const responseSnapshot = root ? createResponseSnapshot(root) : undefined;
   if (active.status !== 'capturing' && isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern, responseSnapshot)) {
     active.completionCandidate = undefined;
-    if (researchTimedOut) reportTimeout();
-    else if (active.researchTimedOutAt === undefined && active.status !== 'awaiting_user') reportEventually('awaiting_user', `${adapter.label} is asking a clarifying question.`);
+    if (active.status !== 'awaiting_user') reportEventually('awaiting_user', `${adapter.label} is asking a clarifying question.`);
     return;
   }
   if (active.status !== 'capturing' && isQuotaResponse(newResponse, adapter.quotaResponsePattern, responseSnapshot)) {
@@ -382,9 +460,17 @@ function inspectPage(): void {
   if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy), responseSnapshot)) {
     active.completionCandidate = undefined;
     if (researchTimedOut) reportTimeout();
-    else if (active.researchTimedOutAt === undefined && active.status === 'awaiting_user') reportEventually('researching');
+    else if (active.status === 'awaiting_user'
+      || ((active.status === 'manual_required' || active.status === 'submitting') && progressActivityResumed)) {
+      reportEventually('researching', undefined, Date.now());
+    } else if (active.researchTimedOutAt !== undefined && active.status === 'manual_required') {
+      // A timed-out streaming interval has now gone quiet. A later change to
+      // this progress response is new activity and receives a fresh budget.
+      active.timeoutObservedInactive = true;
+    }
     return;
   }
+  if (active.researchTimedOutAt !== undefined && active.status === 'manual_required') active.timeoutObservedInactive = true;
   const completion = evaluateStableResponse(root, Boolean(copy), active.completionCandidate, Date.now(), active.completionDebounceMs, responseSnapshot);
   active.completionCandidate = completion.candidate;
   if (researchTimedOut && !completion.ready) {
@@ -395,13 +481,15 @@ function inspectPage(): void {
     if (Date.now() < active.captureRetryAt) return;
     const sourceSelectors = adapter.selectors.sourcesPanelToggle;
     if (sourceSelectors) {
-      const possibleToggle = controls.find(root, sourceSelectors, new Set(), false, true);
-      if (possibleToggle && !isResponseControlActionable(possibleToggle)) {
+      const possibleToggle = controls.find(root, sourceSelectors, new Set(), true, true);
+      if (possibleToggle?.isConnected
+        && !isResponseControlActionable(possibleToggle, true, root)
+        && isModalBlockedControl(possibleToggle, root)) {
         if (researchTimedOut) reportTimeout();
         return;
       }
     }
-    void capture(root, controls).catch((error) => console.error('Could not deliver captured report to the coordinator.', error));
+    void capture(root, Boolean(copy)).catch((error) => console.error('Could not deliver captured report to the coordinator.', error));
   }
 }
 
@@ -412,7 +500,8 @@ function scheduleInspection(): void {
     inspectionScheduled = false;
     try { inspectPage(); } catch (error) {
       console.error('Could not inspect provider response.', error);
-      if (active?.submittedAt !== undefined && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
+      if (active?.status === 'researching' && active.submittedAt !== undefined
+        && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
     }
   });
 }
@@ -442,12 +531,13 @@ function stopRun(run: ActiveRun): void {
 }
 
 async function runAutomation(run: ActiveRun): Promise<void> {
-  if (run.automationInFlight || run.submissionAttempted || run.stopped || run.captureSent
-    || !['pending', 'opening', 'awaiting_ready', 'setting_mode'].includes(run.status)) return;
+  if (run.automationInFlight || run.submissionAttempted || run.manualSetupRequired || run.stopped || run.captureSent
+    || !isSetupProviderStatus(run.status)) return;
   run.automationInFlight = true;
   try { await automate(); }
   catch (error) {
     if (active === run && !run.stopped && !(error instanceof ContentMessageError)) {
+      run.manualSetupRequired = true;
       reportEventually('manual_required', 'Automatic setup could not finish. Check the provider tab before sending.');
     }
     throw error;
@@ -461,18 +551,24 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
-    active.researchTimedOutAt ??= event.researchTimedOutAt;
+    if (active.researchTimedOutAt === undefined && event.researchTimedOutAt !== undefined) {
+      active.researchTimedOutAt = event.researchTimedOutAt;
+      const latestResponse = responseRoots(active.adapter).at(-1) ?? null;
+      active.timeoutActivityFingerprint = latestResponse ? finalResponseFingerprint(latestResponse) : undefined;
+      active.timeoutObservedInactive = !findStreamingIndicator(active.adapter, latestResponse);
+    }
     active.submittedAt ??= event.submittedAt;
     beginMonitoring();
-    if (event.resumeOnly || active.submissionAttempted) return;
+    if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
     await runAutomation(active);
     return;
   }
   if (active) stopRun(active);
   const adapter = ADAPTERS[event.provider];
-  const streaming = findElement(adapter.selectors.streamingIndicator, document, [], RESPONSE_VISIBILITY);
+  const existingRoots = responseRoots(adapter);
+  const streaming = findElement(adapter.selectors.streamingIndicator);
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
-  const setup = ['pending', 'opening', 'awaiting_ready', 'setting_mode'].includes(event.status);
+  const setup = isSetupProviderStatus(event.status);
   const resumedSubmissionConfirmed = !setup && event.status === 'submitting'
     && (isInteractiveProgressIndicator(streaming) || Boolean(plan));
   const resumeExistingResponse = (!setup && event.status !== 'submitting') || resumedSubmissionConfirmed;
@@ -486,10 +582,15 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     researchTimedOutAt: event.researchTimedOutAt,
     captureSent: event.captureAccepted === true,
     stopped: false, abort: new AbortController(), captureInFlight: false, captureFailureCount: 0, captureRetryAt: 0,
-    finalResponseBaseline: createFinalResponseBaseline(resumeExistingResponse ? [] : responseRoots(adapter)),
+    finalResponseBaseline: createFinalResponseBaseline(resumeExistingResponse ? [] : existingRoots),
     copyButtonBaseline: new Set(resumeExistingResponse ? [] : findAll(adapter.selectors.copyButton, document, HOVER_COPY_VISIBILITY)),
     automationInFlight: false,
     submissionAttempted: !setup,
+    manualSetupRequired: false,
+    timeoutActivityFingerprint: event.researchTimedOutAt === undefined || !existingRoots.at(-1)
+      ? undefined
+      : finalResponseFingerprint(existingRoots.at(-1)!),
+    timeoutObservedInactive: event.researchTimedOutAt !== undefined && !findStreamingIndicator(adapter, existingRoots.at(-1)),
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? { status: request.status, submittedAt: request.submittedAt });
     }, (error) => {

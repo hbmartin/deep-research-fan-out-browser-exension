@@ -151,6 +151,25 @@ describe('provider DOM capture', () => {
     expect(snapshot.text).not.toContain('Hidden duplicate');
   });
 
+  it('preserves report timestamps and semantic live-region content', () => {
+    const response = document.createElement('article');
+    response.innerHTML = `
+      <time datetime="2026-09-13T12:34:00Z">12:34</time>
+      <span>09:45</span>
+      <p role="status">Final status: complete</p>
+      <div role="progressbar">Survey completion was 87 percent.</div>
+      <span>Elapsed 00:30</span>
+      <span aria-label="Elapsed time">00:31</span>
+    `;
+    const snapshot = createResponseSnapshot(response);
+    expect(snapshot.text).toContain('12:34');
+    expect(snapshot.text).toContain('09:45');
+    expect(snapshot.text).toContain('Final status: complete');
+    expect(snapshot.text).toContain('Survey completion was 87 percent.');
+    expect(snapshot.text).not.toContain('Elapsed 00:30');
+    expect(snapshot.text).not.toContain('00:31');
+  });
+
   it('requires an interactive Gemini plan approval control', () => {
     const prose = visible(document.createElement('span'));
     prose.textContent = 'Begin research';
@@ -193,5 +212,10 @@ describe('provider DOM capture', () => {
     expect(domOnly.ready).toBe(false);
     expect(evaluateStableResponse(response, false, domOnly.candidate, 59_999, 10_000).ready).toBe(false);
     expect(evaluateStableResponse(response, false, domOnly.candidate, 60_000, 10_000).ready).toBe(true);
+
+    response.textContent = 'OK';
+    const short = evaluateStableResponse(response, true, undefined, 70_000, 1000);
+    expect(short.ready).toBe(false);
+    expect(evaluateStableResponse(response, true, short.candidate, 71_000, 1000).ready).toBe(true);
   });
 });
