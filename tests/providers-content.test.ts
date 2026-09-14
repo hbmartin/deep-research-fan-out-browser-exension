@@ -58,6 +58,7 @@ async function resume(status: 'researching' | 'capturing' | 'submitting', captur
   await listener({
     type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '',
     geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true, status, submittedAt, captureAccepted,
+    conversationKey: 'https://chatgpt.com/c/review',
   });
 }
 
@@ -168,7 +169,7 @@ describe('provider content-script recovery', () => {
     expect(storedStatus).toBe('researching');
     expect(messages.some((message) => message.type === 'content:state' && message.status === 'awaiting_user')).toBe(true);
     acceptAttention = true;
-    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(5000);
     expect(storedStatus).toBe('awaiting_user');
     expect(messages.filter((message) => message.type === 'content:state' && message.status === 'awaiting_user').length).toBeGreaterThanOrEqual(2);
   });
@@ -200,6 +201,22 @@ describe('provider content-script recovery', () => {
     stop.remove();
     await vi.advanceTimersByTimeAsync(120000);
     expect(captures()).toHaveLength(1);
+  });
+
+  it.each([
+    'Before I begin, could you specify the target market?',
+    'Your deep research limit has been reached.',
+  ])('does not classify partial response text while a streaming indicator is present: %s', async (text) => {
+    answer(text);
+    document.body.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Stop generating"></button>');
+    await resume('researching');
+    const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
+    const clone = vi.spyOn(root, 'cloneNode');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(storedStatus).toBe('researching');
+    expect(captures()).toHaveLength(0);
+    expect(clone).not.toHaveBeenCalled();
   });
 
   it('does not treat a prior answer as proof that a reloaded submission was sent', async () => {
@@ -330,7 +347,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => document.dispatchEvent(new Event('copy')));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
@@ -339,7 +356,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => button.setAttribute('title', 'Response copied to the clipboard successfully'));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
@@ -801,7 +818,7 @@ describe('provider reliability regressions', () => {
     answer();
     await resume('researching');
     document.querySelector('button')!.addEventListener('click', () => { document.querySelector('button')!.innerHTML = '<svg><path d="M0 0"></path></svg>'; });
-    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
   });
@@ -825,14 +842,14 @@ describe('verified ChatGPT Copy feedback', () => {
       }
     });
     await resume('researching');
-    await expect(listener({type:'capture:copy-now',jobId:'review-run:chatgpt'})).resolves.toEqual({ok:true,copyConfirmed:true});
+    await expect(listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'})).resolves.toEqual({ok:true,copyConfirmed:true});
   });
   it('does not accept a success icon that was already present before the click', async () => {
     answer();
     const button = document.querySelector('button')!;
     button.innerHTML = '<svg><use href="#lightweight-conversation-check"></use></svg>';
     await resume('researching');
-    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
   });
@@ -923,7 +940,7 @@ describe('capture cancellation and setup exceptions', () => {
   it('does not use an unrelated asynchronous copy event as provider confirmation', async () => {
     answer();
     await resume('researching');
-    const result=listener({type:'capture:copy-now',jobId:'review-run:chatgpt'});
+    const result=listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
     document.dispatchEvent(new Event('copy'));
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});

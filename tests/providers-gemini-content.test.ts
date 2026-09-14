@@ -65,19 +65,19 @@ function planButton(): HTMLButtonElement {
   return button;
 }
 
-async function start(status: 'researching' | 'manual_required', timedOut = false): Promise<void> {
+async function start(status: 'researching' | 'manual_required' | 'awaiting_user', timedOut = false): Promise<void> {
   storedStatus = status;
   submittedAt = Date.now() - 45 * 60 * 1000;
   researchTimedOutAt = timedOut ? Date.now() - 60_000 : undefined;
   await listener({
     type: 'content:start', runId: 'gemini-run', provider: 'gemini', query: 'Research topic', appendString: '',
     geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true,
-    status, submittedAt, researchTimedOutAt,
+    status, submittedAt, researchTimedOutAt, conversationKey: 'https://gemini.google.com/app/review',
   });
 }
 
 describe('Gemini plan timeout recovery', () => {
-  it('times out before handling a persistent plan and auto-clicks it only once', async () => {
+  it('times out, retries a persistent plan three times, then asks the user', async () => {
     response('A research plan is ready for approval.');
     const plan = planButton();
     const click = vi.fn();
@@ -86,8 +86,8 @@ describe('Gemini plan timeout recovery', () => {
     await start('researching');
     await vi.advanceTimersByTimeAsync(20_000);
 
-    expect(storedStatus).toBe('manual_required');
-    expect(click).toHaveBeenCalledTimes(1);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(click).toHaveBeenCalledTimes(3);
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'content:state', status: 'manual_required', reason: 'research_timeout',
     }));
@@ -110,5 +110,43 @@ describe('Gemini plan timeout recovery', () => {
     expect(resumed).toMatchObject({ submittedAt: expect.any(Number) });
     expect((resumed as Extract<RuntimeRequest, { type: 'content:state' }>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
     expect(researchTimedOutAt).toBeUndefined();
+  });
+
+  it('confirms plan approval from new research activity even if the plan control remains mounted', async () => {
+    response('A research plan is ready for approval.');
+    const plan = planButton();
+    const click = vi.fn();
+    plan.addEventListener('click', click);
+    await start('manual_required');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(click).toHaveBeenCalledTimes(1);
+
+    document.body.insertAdjacentHTML('beforeend', '<span style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+    expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves awaiting-user state when a plain-text progress indicator appears', async () => {
+    await start('awaiting_user');
+    const resumedAt = Date.now();
+    document.body.innerHTML = '<span style="position:fixed">Researching · 23 sources</span>';
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('researching');
+    expect(submittedAt).toBeGreaterThanOrEqual(resumedAt);
+  });
+
+  it('uses a progress-pill state change to recover a hydrated timeout without a response root', async () => {
+    document.body.innerHTML = '<button style="position:fixed">Researching · 23 sources</button>';
+    await start('manual_required', true);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('manual_required');
+
+    const resumedAt = Date.now();
+    document.querySelector('button')!.textContent = 'Researching · 24 sources';
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+    expect(submittedAt).toBeGreaterThanOrEqual(resumedAt);
   });
 });

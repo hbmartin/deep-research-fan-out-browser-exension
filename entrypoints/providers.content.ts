@@ -1,5 +1,5 @@
 import TurndownService from 'turndown';
-import { ADAPTERS, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
+import { ADAPTERS, conversationKeyFromUrl, providerFromLocation, type ProviderAdapter, type SelectorChain } from '@/src/adapters';
 import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
@@ -20,6 +20,7 @@ interface ActiveRun {
   status: ProviderRunStatus;
   submittedAt?: number;
   researchTimedOutAt?: number;
+  conversationKey?: string;
   reporter: ProviderReporter;
   stopped: boolean;
   abort: AbortController;
@@ -35,20 +36,31 @@ interface ActiveRun {
   submissionAttempted: boolean;
   manualSetupRequired: boolean;
   timeoutActivity: TimeoutActivity;
-  timeoutPlanObserved: boolean;
-  autoApprovedPlans: WeakSet<HTMLElement>;
+  planApprovalAttempts: number;
+  lastPlanApprovalAt: number;
+}
+
+interface ActivitySignature {
+  response?: string;
+  progress?: string;
 }
 
 type TimeoutActivity =
-  | { phase: 'uninitialized' }
-  | { phase: 'quiet_candidate'; fingerprint: string; since: number }
-  | { phase: 'armed'; fingerprint: string };
+  | { phase: 'hydrating' }
+  | {
+    phase: 'baseline';
+    signature: ActivitySignature;
+    responseArmed: boolean;
+    responseStableSince?: number;
+  };
 
 let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
 let sweepTimer: number | undefined;
-let inspectionScheduled = false;
+let inspectionTimer: number | undefined;
+let lastInspectionAt = 0;
 const RESEARCH_TIMEOUT_MS = 45 * 60 * 1000;
+const INSPECTION_THROTTLE_MS = 250;
 const RESPONSE_VISIBILITY = { ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 const HOVER_COPY_VISIBILITY = { allowTransparent: true, ignoreAncestorOpacity: true } as const;
 
@@ -65,9 +77,9 @@ function applyProviderState(run: ActiveRun, snapshot: ProviderSnapshot): void {
   run.status = snapshot.status;
   run.submittedAt = snapshot.submittedAt;
   run.researchTimedOutAt = snapshot.researchTimedOutAt;
+  run.conversationKey = snapshot.conversationKey ?? run.conversationKey;
   if (snapshot.researchTimedOutAt === undefined) {
-    run.timeoutActivity = { phase: 'uninitialized' };
-    run.timeoutPlanObserved = false;
+    run.timeoutActivity = { phase: 'baseline', signature: {}, responseArmed: true };
     run.timeoutGraceUntil = undefined;
   }
   if (isTerminalProviderStatus(snapshot.status)) stopRun(run);
@@ -77,14 +89,13 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
   if (!active) return;
   const run = active;
   assertCurrent(run);
+  const continuingResearch = run.status === 'researching' && run.researchTimedOutAt === undefined;
   const reportSubmittedAt = status === 'researching'
-    ? submittedAt ?? (run.status !== 'researching' || run.researchTimedOutAt !== undefined
-      ? Date.now()
-      : run.submittedAt ?? Date.now())
+    ? submittedAt ?? (continuingResearch ? run.submittedAt : Date.now())
     : run.submittedAt;
   await run.reporter.report({
     type: 'content:state', runId: run.id, provider: run.adapter.id,
-    status, detail, submittedAt: reportSubmittedAt, reason,
+    status, detail, submittedAt: reportSubmittedAt, reason, conversationKey: run.conversationKey,
   });
   if (!isTerminalProviderStatus(status)) assertCurrent(run);
 }
@@ -96,11 +107,15 @@ function reportEventually(status: ProviderRunStatus, detail?: string, submittedA
   void report(status, detail, submittedAt, reason).catch(() => undefined);
 }
 
-function reportTimeout(): void {
+function reportTimeout(signature: ActivitySignature = {}): void {
   if (!active || active.researchTimedOutAt !== undefined) return;
   active.researchTimedOutAt = Date.now();
-  active.timeoutActivity = { phase: 'uninitialized' };
-  active.timeoutPlanObserved = false;
+  active.timeoutActivity = {
+    phase: 'baseline',
+    signature,
+    responseArmed: signature.response === undefined,
+    responseStableSince: signature.response === undefined ? undefined : Date.now(),
+  };
   reportEventually('manual_required', `${active.adapter.label} has not completed after 45 minutes. Check the provider tab.`, undefined, 'research_timeout');
 }
 
@@ -203,6 +218,7 @@ async function automate(): Promise<void> {
     reportEventually('manual_required', 'The query may not have sent. Check the provider tab.');
     return;
   }
+  observeConversation(run);
   reportEventually('researching', undefined, Date.now());
 }
 
@@ -213,19 +229,45 @@ function contentToMarkdown(content: HTMLElement): string {
 }
 
 function responseRoots(adapter: ProviderAdapter): HTMLElement[] {
-  return findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY);
+  const roots = adapter.selectors.finalMessageRoot.flatMap((selector) => findAll([selector], document, RESPONSE_VISIBILITY));
+  return Array.from(new Set(roots)).sort((left, right) => {
+    if (left === right) return 0;
+    return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  });
 }
 
-function currentResponseSnapshot(adapter: ProviderAdapter): CurrentResponseSnapshot {
+function currentResponseSnapshot(
+  adapter: ProviderAdapter,
+  expectedRunId?: RunId,
+  expectedConversationKey?: string,
+): CurrentResponseSnapshot {
+  const currentConversationKey = conversationKeyFromUrl(location.href, adapter.id);
+  if (expectedRunId !== undefined) {
+    if (!active || active.id !== expectedRunId) throw new Error('The provider tab is no longer attached to this run.');
+    if (!expectedConversationKey || !active.conversationKey || !currentConversationKey
+      || expectedConversationKey !== active.conversationKey || expectedConversationKey !== currentConversationKey) {
+      throw new Error('The provider tab is showing a different or unverified conversation.');
+    }
+  }
   const root = responseRoots(adapter).at(-1);
   if (!root) throw new Error(`No ${adapter.label} response is available to copy.`);
   const snapshot = createResponseSnapshot(root);
   const domMarkdown = contentToMarkdown(snapshot.content);
   if (!snapshot.text || !domMarkdown) throw new Error(`The current ${adapter.label} response is empty.`);
   return {
+    provider: adapter.id,
+    pageUrl: location.href,
+    activeRunId: active?.id,
+    conversationKey: currentConversationKey,
     domMarkdown,
     domCitations: domCitationInventory(root, adapter, snapshot),
   };
+}
+
+function observeConversation(run: ActiveRun): string | undefined {
+  const current = conversationKeyFromUrl(location.href, run.adapter.id);
+  if (!run.conversationKey && current) run.conversationKey = current;
+  return current;
 }
 
 function obscuringAncestors(element: HTMLElement): Set<HTMLElement> {
@@ -260,33 +302,59 @@ function isInteractiveProgressIndicator(element: HTMLElement | null): boolean {
     || (element instanceof HTMLInputElement && ['button', 'submit'].includes(element.type))));
 }
 
-function observeTimeoutQuiescence(
-  run: ActiveRun,
-  root: HTMLElement | null,
-  snapshot: ResponseSnapshot | undefined,
-  blocked: boolean,
-  now: number,
-): void {
-  if (run.researchTimedOutAt === undefined || run.timeoutActivity.phase === 'armed') return;
-  if (!root || !snapshot || blocked) {
-    run.timeoutActivity = { phase: 'uninitialized' };
-    return;
-  }
-  const fingerprint = finalResponseFingerprint(root, snapshot);
-  if (run.timeoutActivity.phase !== 'quiet_candidate' || run.timeoutActivity.fingerprint !== fingerprint) {
-    run.timeoutActivity = { phase: 'quiet_candidate', fingerprint, since: now };
-    return;
-  }
-  if (now - run.timeoutActivity.since >= run.completionDebounceMs) {
-    run.timeoutActivity = { phase: 'armed', fingerprint };
-  }
+function progressActivitySignature(element: HTMLElement | null): string | undefined {
+  if (!element) return undefined;
+  return [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-state'),
+    element.getAttribute('aria-valuenow'), element.textContent]
+    .map((value) => (value ?? '').replace(/\s+/g, ' ').trim())
+    .join('\u0000');
 }
 
-function timedOutActivityResumed(run: ActiveRun, fingerprint: string | undefined, interactive: boolean): boolean {
+function activitySignature(
+  root: HTMLElement | null,
+  snapshot: ResponseSnapshot | undefined,
+  progress: HTMLElement | null,
+): ActivitySignature {
+  return {
+    response: root && snapshot ? finalResponseFingerprint(root, snapshot) : undefined,
+    progress: progressActivitySignature(progress),
+  };
+}
+
+function timedOutActivityResumed(run: ActiveRun, signature: ActivitySignature): boolean {
   if (run.researchTimedOutAt === undefined) return false;
-  if (run.timeoutPlanObserved) return interactive || fingerprint !== undefined;
-  return run.timeoutActivity.phase === 'armed'
-    && (interactive || (fingerprint !== undefined && fingerprint !== run.timeoutActivity.fingerprint));
+  const now = Date.now();
+  if (run.timeoutActivity.phase === 'hydrating') {
+    if (signature.response !== undefined || signature.progress !== undefined) {
+      run.timeoutActivity = {
+        phase: 'baseline',
+        signature,
+        responseArmed: signature.response === undefined,
+        responseStableSince: signature.response === undefined ? undefined : now,
+      };
+    }
+    return false;
+  }
+  const checkpoint = run.timeoutActivity;
+  if (signature.progress !== undefined && signature.progress !== checkpoint.signature.progress) return true;
+
+  if (signature.response !== checkpoint.signature.response) {
+    if (signature.response !== undefined && checkpoint.responseArmed) return true;
+    run.timeoutActivity = {
+      phase: 'baseline',
+      signature,
+      responseArmed: signature.response === undefined,
+      responseStableSince: signature.response === undefined ? undefined : now,
+    };
+    return false;
+  }
+
+  const responseArmed = checkpoint.responseArmed
+    || (signature.response !== undefined
+      && checkpoint.responseStableSince !== undefined
+      && now - checkpoint.responseStableSince >= run.completionDebounceMs);
+  run.timeoutActivity = { ...checkpoint, signature, responseArmed };
+  return false;
 }
 
 function copyControlFields(button: HTMLElement): string[] {
@@ -344,6 +412,10 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
   const capturingRun = active;
   capturingRun.captureInFlight = true;
   try {
+    const currentConversationKey = observeConversation(capturingRun);
+    if (!capturingRun.conversationKey || currentConversationKey !== capturingRun.conversationKey) {
+      throw new Error('Cannot capture an unverified or different provider conversation.');
+    }
     const initialSnapshot = createResponseSnapshot(root);
     const before = domCitationInventory(root, capturingRun.adapter, initialSnapshot);
     const title = initialSnapshot.content.querySelector('h1, h2, h3')?.textContent?.trim();
@@ -353,7 +425,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
     const sourceSelectors = capturingRun.adapter.selectors.sourcesPanelToggle;
     if (root.isConnected && sourceSelectors) {
       const refreshedRoots = responseRoots(capturingRun.adapter);
-      const refreshedControls = new ResponseControlIndex(refreshedRoots, capturingRun.adapter);
+      const refreshedControls = new ResponseControlIndex(refreshedRoots);
       const possibleToggle = refreshedControls.find(root, sourceSelectors, new Set(), true, true);
       if (possibleToggle?.isConnected) {
         const actionable = isResponseControlActionable(possibleToggle, true, root);
@@ -395,6 +467,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
         type: 'content:capture',
         runId: capturingRun.id,
         provider: capturingRun.adapter.id,
+        conversationKey: capturingRun.conversationKey,
         domMarkdown: contentToMarkdown(finalContent),
         domCitations: mergeCitationInventories(before, after),
         researchTrail,
@@ -405,6 +478,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
         status: 'capturing',
         submittedAt: capturingRun.submittedAt,
         researchTimedOutAt: capturingRun.researchTimedOutAt,
+        conversationKey: capturingRun.conversationKey,
       });
     } catch (error) {
       if (error instanceof ContentMessageError && error.providerState) applyProviderState(capturingRun, error.providerState);
@@ -442,42 +516,84 @@ function inspectPage(): void {
     reportEventually('interrupted', 'Provider tab navigated away.');
     return;
   }
+  const currentConversationKey = conversationKeyFromUrl(location.href, adapter.id);
+  if (active.conversationKey && currentConversationKey !== active.conversationKey) {
+    reportEventually('interrupted', 'Provider tab navigated to a different conversation.');
+    return;
+  }
   if (active.captureInFlight || active.automationInFlight || isSetupProviderStatus(active.status)) return;
   const now = Date.now();
   const researchTimeoutDue = active.researchTimedOutAt === undefined
     && active.status === 'researching' && active.submittedAt !== undefined
     && now - active.submittedAt >= RESEARCH_TIMEOUT_MS;
+  const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const finalRoots = responseRoots(adapter);
+  const latestResponse = finalRoots.at(-1) ?? null;
+  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
+  const root = newResponse;
+  const streaming = findStreamingIndicator(adapter, latestResponse);
+  if (streaming) {
+    const conversationWasBound = active.conversationKey !== undefined;
+    const approvedPlan = active.planApprovalAttempts > 0;
+    observeConversation(active);
+    active.planApprovalAttempts = 0;
+    const latestSnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
+      ? (latestResponse ? createResponseSnapshot(latestResponse) : undefined)
+      : undefined;
+    const signature = activitySignature(latestResponse, latestSnapshot, streaming);
+    active.completionCandidate = undefined;
+    if (researchTimeoutDue) reportTimeout(signature);
+    else if (active.researchTimedOutAt !== undefined ? timedOutActivityResumed(active, signature)
+      : approvedPlan || ['awaiting_user', 'manual_required', 'submitting'].includes(active.status)) {
+      reportEventually('researching', undefined, Date.now());
+    } else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
+      reportEventually('researching', undefined, active.submittedAt);
+    }
+    return;
+  }
+  if (plan) {
+    active.completionCandidate = undefined;
+    const conversationWasBound = active.conversationKey !== undefined;
+    observeConversation(active);
+    const signature = activitySignature(null, undefined, plan);
+    if (researchTimeoutDue) reportTimeout(signature);
+    else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature);
+    else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
+      reportEventually('researching', undefined, active.submittedAt);
+    }
+    const approvalExhausted = active.planApprovalAttempts >= 3;
+    if (active.geminiAutoApprove && active.planApprovalAttempts < 3
+      && now - active.lastPlanApprovalAt >= 1000) {
+      active.planApprovalAttempts += 1;
+      active.lastPlanApprovalAt = now;
+      plan.click();
+    }
+    if ((!active.geminiAutoApprove || approvalExhausted) && active.status !== 'awaiting_user') {
+      reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
+    }
+    return;
+  }
+  if (active.planApprovalAttempts > 0) {
+    active.planApprovalAttempts = 0;
+    active.completionCandidate = undefined;
+    observeConversation(active);
+    reportEventually('researching', undefined, Date.now());
+    return;
+  }
+  const latestSnapshot = latestResponse ? createResponseSnapshot(latestResponse) : undefined;
+  const responseSnapshot = root && latestSnapshot?.root === root ? latestSnapshot : undefined;
+  const signature = activitySignature(latestResponse, latestSnapshot, null);
+  const conversationWasBound = active.conversationKey !== undefined;
+  if (newResponse) observeConversation(active);
+  if (!conversationWasBound && active.conversationKey && active.status === 'researching'
+    && !researchTimeoutDue && active.researchTimedOutAt === undefined) {
+    reportEventually('researching', undefined, active.submittedAt);
+  }
   if (active.status !== 'capturing' && active.captureFailureCount === 0
     && findElement(adapter.selectors.quotaNotice, document, finalRoots)) {
     reportEventually('quota_exhausted', `${adapter.label} deep research limit reached.`);
     return;
   }
-  const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
-  const latestResponse = finalRoots.at(-1) ?? null;
-  const newResponse = isNewFinalResponse(latestResponse, active.finalResponseBaseline) ? latestResponse : null;
-  const root = newResponse;
-  const streaming = findStreamingIndicator(adapter, latestResponse);
-  const interactiveStreaming = isInteractiveProgressIndicator(streaming);
-  if (plan) {
-    active.completionCandidate = undefined;
-    if (researchTimeoutDue) reportTimeout();
-    if (active.researchTimedOutAt !== undefined) active.timeoutPlanObserved = true;
-    if (active.geminiAutoApprove && !active.autoApprovedPlans.has(plan)) {
-      active.autoApprovedPlans.add(plan);
-      plan.click();
-    }
-    else if (!active.geminiAutoApprove && active.researchTimedOutAt === undefined && active.status !== 'awaiting_user') {
-      reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
-    }
-    return;
-  }
-  const latestSnapshot = latestResponse ? createResponseSnapshot(latestResponse) : undefined;
-  const responseSnapshot = root && latestSnapshot?.root === root ? latestSnapshot : undefined;
-  const activityFingerprint = latestResponse && latestSnapshot
-    ? finalResponseFingerprint(latestResponse, latestSnapshot)
-    : undefined;
-  observeTimeoutQuiescence(active, latestResponse, latestSnapshot, Boolean(streaming), now);
   if (active.status !== 'capturing' && isClarifyingResponse(newResponse, adapter.clarifyingPromptPattern, responseSnapshot)) {
     active.completionCandidate = undefined;
     if (active.status !== 'awaiting_user') reportEventually('awaiting_user', `${adapter.label} is asking a clarifying question.`);
@@ -487,30 +603,19 @@ function inspectPage(): void {
     reportEventually('quota_exhausted', `${adapter.label} deep research limit reached.`);
     return;
   }
-  const controls = new ResponseControlIndex(finalRoots, adapter);
+  if (isProgressResponse(newResponse, adapter.progressResponsePattern, false, responseSnapshot)) {
+    active.completionCandidate = undefined;
+    if (researchTimeoutDue) reportTimeout(signature);
+    else if (active.researchTimedOutAt !== undefined ? timedOutActivityResumed(active, signature)
+      : ['awaiting_user', 'manual_required', 'submitting'].includes(active.status)) {
+      reportEventually('researching', undefined, Date.now());
+    }
+    return;
+  }
+  const controls = new ResponseControlIndex(finalRoots);
   const copy = root
     ? controls.find(root, adapter.selectors.copyButton, active.copyButtonBaseline, true)
     : null;
-  if (isProgressResponse(newResponse, adapter.progressResponsePattern, Boolean(copy), responseSnapshot)) {
-    active.completionCandidate = undefined;
-    if (researchTimeoutDue) reportTimeout();
-    else if (timedOutActivityResumed(active, activityFingerprint, false)
-      || (active.researchTimedOutAt === undefined
-        && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
-      reportEventually('researching', undefined, Date.now());
-    }
-    return;
-  }
-  if (streaming) {
-    active.completionCandidate = undefined;
-    if (researchTimeoutDue) reportTimeout();
-    else if (timedOutActivityResumed(active, activityFingerprint, interactiveStreaming)
-      || (interactiveStreaming && active.researchTimedOutAt === undefined
-        && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
-      reportEventually('researching', undefined, Date.now());
-    }
-    return;
-  }
   if (active.researchTimedOutAt === undefined
     && (active.status === 'manual_required' || active.status === 'submitting') && root) {
     reportEventually('researching', undefined, Date.now());
@@ -522,7 +627,11 @@ function inspectPage(): void {
   active.completionCandidate = completion.candidate;
   if (researchTimeoutDue && !completion.ready) {
     active.timeoutGraceUntil ??= now + (copy ? active.completionDebounceMs : Math.max(30_000, active.completionDebounceMs * 3));
-    if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout();
+    if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout(signature);
+  } else if (active.researchTimedOutAt !== undefined && !completion.ready
+    && timedOutActivityResumed(active, signature)) {
+    reportEventually('researching', undefined, Date.now());
+    return;
   }
   if (completion.ready && root) {
     if (now < active.captureRetryAt) return;
@@ -532,7 +641,7 @@ function inspectPage(): void {
       if (possibleToggle?.isConnected
         && !isResponseControlActionable(possibleToggle, true, root)
         && isModalBlockedControl(possibleToggle, root)) {
-        if (researchTimeoutDue) reportTimeout();
+        if (researchTimeoutDue) reportTimeout(signature);
         return;
       }
     }
@@ -540,17 +649,22 @@ function inspectPage(): void {
   }
 }
 
+function runInspection(): void {
+  lastInspectionAt = Date.now();
+  try { inspectPage(); } catch (error) {
+    console.error('Could not inspect provider response.', error);
+    if (active?.status === 'researching' && active.submittedAt !== undefined
+      && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
+  }
+}
+
 function scheduleInspection(): void {
-  if (inspectionScheduled) return;
-  inspectionScheduled = true;
-  queueMicrotask(() => {
-    inspectionScheduled = false;
-    try { inspectPage(); } catch (error) {
-      console.error('Could not inspect provider response.', error);
-      if (active?.status === 'researching' && active.submittedAt !== undefined
-        && Date.now() - active.submittedAt >= RESEARCH_TIMEOUT_MS) reportTimeout();
-    }
-  });
+  if (inspectionTimer !== undefined) return;
+  const wait = Math.max(0, INSPECTION_THROTTLE_MS - (Date.now() - lastInspectionAt));
+  inspectionTimer = window.setTimeout(() => {
+    inspectionTimer = undefined;
+    runInspection();
+  }, wait);
 }
 
 function beginMonitoring(): void {
@@ -559,7 +673,9 @@ function beginMonitoring(): void {
   observer = new MutationObserver(scheduleInspection);
   observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
   if (sweepTimer) clearInterval(sweepTimer);
-  sweepTimer = window.setInterval(scheduleInspection, 2000);
+  sweepTimer = window.setInterval(() => {
+    if (inspectionTimer === undefined && Date.now() - lastInspectionAt >= INSPECTION_THROTTLE_MS) runInspection();
+  }, 2000);
   scheduleInspection();
 }
 
@@ -568,6 +684,8 @@ function stopMonitoring(): void {
   observer = undefined;
   if (sweepTimer) clearInterval(sweepTimer);
   sweepTimer = undefined;
+  if (inspectionTimer !== undefined) clearTimeout(inspectionTimer);
+  inspectionTimer = undefined;
 }
 
 function stopRun(run: ActiveRun): void {
@@ -598,6 +716,7 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
+    active.conversationKey ??= event.conversationKey;
     beginMonitoring();
     if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
     await runAutomation(active);
@@ -611,7 +730,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const setup = isSetupProviderStatus(event.status);
   const resumedSubmissionConfirmed = !setup && event.status === 'submitting'
-    && (isInteractiveProgressIndicator(streaming) || Boolean(plan));
+    && (Boolean(streaming) || Boolean(plan));
   const resumeExistingResponse = (!setup && event.status !== 'submitting') || resumedSubmissionConfirmed;
   const run: ActiveRun = {
     id: event.runId, adapter,
@@ -621,6 +740,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     status: event.status,
     submittedAt: event.submittedAt ?? (event.status === 'researching' ? Date.now() : undefined),
     researchTimedOutAt: event.researchTimedOutAt,
+    conversationKey: event.conversationKey,
     captureSent: event.captureAccepted === true,
     stopped: false, abort: new AbortController(), captureInFlight: false, captureFailureCount: 0, captureRetryAt: 0,
     finalResponseBaseline: createFinalResponseBaseline(resumeExistingResponse ? [] : existingRoots),
@@ -628,14 +748,17 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     automationInFlight: false,
     submissionAttempted: !setup,
     manualSetupRequired: false,
-    timeoutActivity: { phase: 'uninitialized' },
-    timeoutPlanObserved: false,
-    autoApprovedPlans: new WeakSet(),
+    timeoutActivity: event.researchTimedOutAt === undefined
+      ? { phase: 'baseline', signature: {}, responseArmed: true }
+      : { phase: 'hydrating' },
+    planApprovalAttempts: 0,
+    lastPlanApprovalAt: 0,
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? {
         status: request.status,
         submittedAt: request.submittedAt,
         researchTimedOutAt: request.status === 'researching' ? undefined : run.researchTimedOutAt,
+        conversationKey: request.conversationKey ?? run.conversationKey,
       });
     }, (error) => {
       if (active !== run) return;
@@ -671,9 +794,15 @@ export default defineContentScript({
         return { ok: true };
       }
       if (message.type === 'capture:dom-current' && message.provider === provider) {
-        return currentResponseSnapshot(ADAPTERS[provider]);
+        return currentResponseSnapshot(ADAPTERS[provider], message.runId, message.conversationKey);
       }
       if (message.type === 'capture:copy-now' && active) {
+        const currentConversationKey = conversationKeyFromUrl(location.href, active.adapter.id);
+        if (!message.conversationKey || !active.conversationKey
+          || message.conversationKey !== active.conversationKey
+          || message.conversationKey !== currentConversationKey) {
+          throw new Error('Provider copy rejected because the conversation changed.');
+        }
         const roots = responseRoots(active.adapter);
         const root = roots.at(-1) ?? null;
         const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton, new Set(), true) : null;

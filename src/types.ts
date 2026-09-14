@@ -116,6 +116,7 @@ export interface ProviderRun {
   startedAt?: number;
   submittedAt?: number;
   researchTimedOutAt?: number;
+  conversationKey?: string;
   completedAt?: number;
   captureId?: string;
   attempts: number;
@@ -145,6 +146,7 @@ export interface CaptureJob {
   id: string;
   runId: RunId;
   provider: ProviderId;
+  conversationKey?: string;
   tabId: number;
   state: 'queued' | 'leased';
   createdAt: number;

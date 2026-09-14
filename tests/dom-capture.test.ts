@@ -161,7 +161,11 @@ describe('provider DOM capture', () => {
       <span>Elapsed 00:30</span>
       <span aria-label="Elapsed time">00:31</span>
       <span aria-label="Elapsed time"><strong>00:32</strong></span>
+      <span aria-label="Elapsed time">1m 23s</span>
+      <span>Elapsed time: 1h 2m 3s</span>
       <span aria-label="Elapsed company history">The company was founded in 1982.</span>
+      <p>Elapsed time: 1:23:45</p>
+      <table><tbody><tr><td>Elapsed time: 1:23:45</td></tr></tbody></table>
     `;
     const snapshot = createResponseSnapshot(response);
     expect(snapshot.text).toContain('12:34');
@@ -171,7 +175,10 @@ describe('provider DOM capture', () => {
     expect(snapshot.text).not.toContain('Elapsed 00:30');
     expect(snapshot.text).not.toContain('00:31');
     expect(snapshot.text).not.toContain('00:32');
+    expect(snapshot.text).not.toContain('1m 23s');
+    expect(snapshot.text).not.toContain('1h 2m 3s');
     expect(snapshot.text).toContain('The company was founded in 1982.');
+    expect(snapshot.text.match(/Elapsed time: 1:23:45/g)).toHaveLength(2);
   });
 
   it('uses timer-stripped text for response activity fingerprints', () => {

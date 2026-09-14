@@ -1,4 +1,4 @@
-import { ADAPTERS, providerFromUrl } from './adapters';
+import { ADAPTERS, conversationKeyFromUrl, isProviderUrl, providerFromUrl } from './adapters';
 import { buildArtifact, buildCurrentResponseCopy } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
 import { acceptCaptureJob, captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
@@ -12,6 +12,7 @@ import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type 
 const ALARM_NAME = 'reconcile-runs';
 const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
 let contextMenuRegistrationTail = Promise.resolve();
+let clipboardOperationTail = Promise.resolve();
 const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
 let captureWorkerRunning = false;
 let reconcileWorkerRunning = false;
@@ -76,6 +77,19 @@ function withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> 
   return serializeByKey(runMutationTails, runId, operation);
 }
 
+async function withClipboardLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = clipboardOperationTail.catch(() => undefined);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  clipboardOperationTail = previous.then(() => gate);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
   return withRunLock(runId, async () => {
     const run = await getRun(runId);
@@ -87,7 +101,12 @@ async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Pro
 }
 
 function providerSnapshot(provider: ProviderRun): ProviderSnapshot {
-  return { status: provider.status, submittedAt: provider.submittedAt, researchTimedOutAt: provider.researchTimedOutAt };
+  return {
+    status: provider.status,
+    submittedAt: provider.submittedAt,
+    researchTimedOutAt: provider.researchTimedOutAt,
+    conversationKey: provider.conversationKey,
+  };
 }
 
 function validateProviderTransition(provider: ProviderRun | undefined, status: ProviderRunStatus): asserts provider is ProviderRun {
@@ -193,6 +212,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
       status: providerRun.status,
       submittedAt: providerRun.submittedAt,
       researchTimedOutAt: providerRun.researchTimedOutAt,
+      conversationKey: providerRun.conversationKey,
       captureAccepted,
     } as const;
     await ensureContentReceiver(providerRun.tabId, provider);
@@ -266,10 +286,23 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
   return run;
 }
 
-async function mutateProvider(runId: string, provider: ProviderId, status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: 'research_timeout'): Promise<Run> {
+async function mutateProvider(
+  runId: string,
+  provider: ProviderId,
+  status: ProviderRunStatus,
+  detail?: string,
+  submittedAt?: number,
+  reason?: 'research_timeout',
+  conversationKey?: string,
+): Promise<Run> {
   const { run, value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
     validateProviderTransition(providerRun, status);
+    if (providerRun.conversationKey && providerRun.conversationKey !== conversationKey) {
+      throw new CoordinatorRequestError('Provider tab is showing a different conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
+    }
+    const conversationBound = !providerRun.conversationKey && conversationKey !== undefined;
+    providerRun.conversationKey ??= conversationKey;
     const timeout = reason === 'research_timeout' && status === 'manual_required';
     const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
     const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
@@ -287,7 +320,7 @@ async function mutateProvider(runId: string, provider: ProviderId, status: Provi
     if (firstTimeout) providerRun.researchTimedOutAt = Date.now();
     if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
-    return timeout ? firstTimeout : changed || refreshedResearchInterval;
+    return timeout ? firstTimeout : changed || refreshedResearchInterval || conversationBound;
   });
   // The state is durable. UI side effects must not invalidate its acknowledgement.
   try {
@@ -336,7 +369,12 @@ async function resolveCitationUrls(provider: ProviderId, citations: DomCitation[
 function validateCurrentResponseSnapshot(value: unknown): CurrentResponseSnapshot {
   if (!value || typeof value !== 'object') throw new Error('Provider did not return a response snapshot.');
   const candidate = value as Partial<CurrentResponseSnapshot>;
-  if (typeof candidate.domMarkdown !== 'string' || !candidate.domMarkdown.trim() || !Array.isArray(candidate.domCitations)) {
+  if (!candidate.provider || !PROVIDERS.includes(candidate.provider)
+    || typeof candidate.pageUrl !== 'string'
+    || (candidate.activeRunId !== undefined && typeof candidate.activeRunId !== 'string')
+    || (candidate.conversationKey !== undefined && typeof candidate.conversationKey !== 'string')
+    || typeof candidate.domMarkdown !== 'string' || !candidate.domMarkdown.trim()
+    || !Array.isArray(candidate.domCitations)) {
     throw new Error('Provider returned an invalid response snapshot.');
   }
   const optionalString = (value: unknown) => value === undefined || typeof value === 'string';
@@ -353,15 +391,67 @@ function validateCurrentResponseSnapshot(value: unknown): CurrentResponseSnapsho
     catch { return false; }
   });
   if (!validCitations) throw new Error('Provider returned invalid citation data.');
-  return { domMarkdown: candidate.domMarkdown, domCitations: candidate.domCitations };
+  return {
+    provider: candidate.provider,
+    pageUrl: candidate.pageUrl,
+    activeRunId: candidate.activeRunId,
+    conversationKey: candidate.conversationKey,
+    domMarkdown: candidate.domMarkdown,
+    domCitations: candidate.domCitations,
+  };
 }
 
-async function copyCurrentResponse(tabId: number, provider: ProviderId): Promise<void> {
+interface ExpectedCurrentResponse {
+  runId: string;
+  conversationKey: string;
+}
+
+function assertCurrentResponseIdentity(
+  snapshot: CurrentResponseSnapshot,
+  provider: ProviderId,
+  expected?: ExpectedCurrentResponse,
+): void {
+  if (snapshot.provider !== provider || !isProviderUrl(snapshot.pageUrl, provider)) {
+    throw new CoordinatorRequestError('Provider response identity did not match the requested provider.', 'conversation_mismatch');
+  }
+  if (expected && (snapshot.activeRunId !== expected.runId
+    || snapshot.conversationKey !== expected.conversationKey
+    || conversationKeyFromUrl(snapshot.pageUrl, provider) !== expected.conversationKey)) {
+    throw new CoordinatorRequestError('Provider tab is showing a different or unverified conversation.', 'conversation_mismatch');
+  }
+}
+
+async function copyCurrentResponse(tabId: number, provider: ProviderId, expected?: ExpectedCurrentResponse): Promise<void> {
+  const tab = await browser.tabs.get(tabId);
+  if (!isProviderUrl(tab.url, provider)
+    || (expected && conversationKeyFromUrl(tab.url!, provider) !== expected.conversationKey)) {
+    throw new CoordinatorRequestError('Provider tab is no longer on the expected provider.', 'conversation_mismatch');
+  }
   await ensureContentReceiver(tabId, provider);
-  const snapshot = validateCurrentResponseSnapshot(await sendTabEvent(tabId, { type: 'capture:dom-current', provider }));
+  let snapshot: CurrentResponseSnapshot;
+  try {
+    snapshot = validateCurrentResponseSnapshot(await sendTabEvent(tabId, {
+      type: 'capture:dom-current', provider, runId: expected?.runId, conversationKey: expected?.conversationKey,
+    }));
+  } catch (error) {
+    if (!expected || error instanceof CoordinatorRequestError) throw error;
+    throw new CoordinatorRequestError(
+      'The provider tab could not verify the active run and conversation. Reopen the run or use the provider-page context menu.',
+      'conversation_mismatch',
+    );
+  }
+  assertCurrentResponseIdentity(snapshot, provider, expected);
   const resolved = await resolveCitationUrls(provider, snapshot.domCitations);
   const reconciled = reconcileCitations(snapshot.domMarkdown, resolved.citations, ADAPTERS[provider].citationMarkerStyle);
-  await createPlatform().writeClipboard(buildCurrentResponseCopy(reconciled.markdown, reconciled.citations));
+  await withClipboardLock(async () => {
+    assertCurrentResponseIdentity(snapshot, provider, expected);
+    const currentTab = await browser.tabs.get(tabId);
+    if (!isProviderUrl(currentTab.url, provider)
+      || (expected && conversationKeyFromUrl(currentTab.url!, provider) !== expected.conversationKey)) {
+      throw new CoordinatorRequestError('Provider tab changed before the response could be copied.', 'conversation_mismatch');
+    }
+    await createPlatform().writeClipboard(buildCurrentResponseCopy(reconciled.markdown, reconciled.citations));
+  });
 }
 
 async function registerCopyCurrentContextMenu(): Promise<void> {
@@ -384,80 +474,88 @@ async function handleCopyCurrentContextMenu(info: Browser.contextMenus.OnClickDa
   try {
     if (tab?.id === undefined || !provider) throw new Error('Open a supported provider response before copying.');
     await copyCurrentResponse(tab.id, provider);
-    await createPlatform().notify(`copy-current:${tab.id}`, `${ADAPTERS[provider].label} response copied`, 'The current normalized response is on your clipboard.');
   } catch (error) {
     await createPlatform().notify(
       `copy-current:${tab?.id ?? 'unavailable'}`,
       'Could not copy current response',
       error instanceof Error ? error.message : String(error),
     ).catch(() => undefined);
+    return;
   }
+  await createPlatform().notify(
+    `copy-current:${tab!.id}`, `${ADAPTERS[provider!].label} response copied`, 'The current normalized response is on your clipboard.',
+  ).catch((error) => console.error('Could not show the Copy current success notification.', error));
 }
 
 async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Promise<{ text: string; restored: boolean } | undefined> {
-  const settings = await loadSettings();
-  const domMarkdown = job.domMarkdown.trim();
-  const hasVerifiableDom = domMarkdown.length >= 20;
-  const attemptCapture = async (allowCopyOnly = false): Promise<{ text: string; restored: boolean }> => {
-    const original = await platform.readClipboard();
-    const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
-    let primed = false;
-    let observed: string | undefined;
-    let copyConfirmed = false;
+  return withClipboardLock(async () => {
+    const settings = await loadSettings();
+    const domMarkdown = job.domMarkdown.trim();
+    const hasVerifiableDom = domMarkdown.length >= 20;
+    const attemptCapture = async (allowCopyOnly = false): Promise<{ text: string; restored: boolean }> => {
+      const original = await platform.readClipboard();
+      const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
+      let primed = false;
+      let observed: string | undefined;
+      let copyConfirmed = false;
+      try {
+        await platform.writeClipboard(sentinel);
+        primed = true;
+        if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
+        const clickResult = await sendTabEvent(job.tabId, {
+          type: 'capture:copy-now', jobId: job.id, conversationKey: job.conversationKey,
+        });
+        copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
+          && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        observed = await platform.readClipboard();
+        const resemblesDomReport = hasVerifiableDom
+          && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
+        const confirmedShortCopy = copyConfirmed && (resemblesDomReport || (allowCopyOnly && !hasVerifiableDom));
+        if (observed === sentinel
+          || !observed.trim()
+          || (observed.trim().length < 40 && !confirmedShortCopy)
+          || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom && copyConfirmed))) {
+          throw new Error('Provider copy did not produce a new report.');
+        }
+        let restored = false;
+        if (settings.restoreClipboard) {
+          const current = await platform.readClipboard();
+          if (current === observed) {
+            await platform.writeClipboard(original);
+            restored = true;
+          }
+        }
+        return { text: observed, restored };
+      } catch (error) {
+        if (primed) {
+          const current = await platform.readClipboard().catch(() => undefined);
+          if (current === sentinel
+            || (settings.restoreClipboard && copyConfirmed && observed !== undefined && current === observed)) {
+            await platform.writeClipboard(original).catch(() => undefined);
+          }
+        }
+        throw error;
+      }
+    };
+    if (hasVerifiableDom) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try { return await attemptCapture(); }
+        catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
+      }
+    }
+    if (job.tabUnavailable || Date.now() - lastNonRunInteractionAt < 5000) return undefined;
+    const [current] = await browser.tabs.query({ active: true, currentWindow: true });
     try {
-      await platform.writeClipboard(sentinel);
-      primed = true;
-      if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
-      const clickResult = await sendTabEvent(job.tabId, { type: 'capture:copy-now', jobId: job.id });
-      copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
-        && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      observed = await platform.readClipboard();
-      const resemblesDomReport = hasVerifiableDom
-        && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
-      const confirmedShortCopy = copyConfirmed && (resemblesDomReport || (allowCopyOnly && !hasVerifiableDom));
-      if (observed === sentinel
-        || !observed.trim()
-        || (observed.trim().length < 40 && !confirmedShortCopy)
-        || (!resemblesDomReport && !(allowCopyOnly && !hasVerifiableDom && copyConfirmed))) {
-        throw new Error('Provider copy did not produce a new report.');
-      }
-      let restored = false;
-      if (settings.restoreClipboard) {
-        const current = await platform.readClipboard();
-        if (current === observed) {
-          await platform.writeClipboard(original);
-          restored = true;
-        }
-      }
-      return { text: observed, restored };
-    } catch (error) {
-      if (primed) {
-        const current = await platform.readClipboard().catch(() => undefined);
-        if (current === sentinel || (copyConfirmed && observed !== undefined && current === observed)) {
-          await platform.writeClipboard(original).catch(() => undefined);
-        }
-      }
-      throw error;
+      await activateTabInternally(job.tabId);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return await attemptCapture(!hasVerifiableDom);
+    } catch {
+      return undefined;
+    } finally {
+      if (current?.id !== undefined && current.id !== job.tabId) await activateTabInternally(current.id).catch(() => undefined);
     }
-  };
-  if (hasVerifiableDom) {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try { return await attemptCapture(); }
-      catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
-    }
-  }
-  if (job.tabUnavailable || Date.now() - lastNonRunInteractionAt < 5000) return undefined;
-  const [current] = await browser.tabs.query({ active: true, currentWindow: true });
-  try {
-    await activateTabInternally(job.tabId);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    return await attemptCapture(!hasVerifiableDom);
-  } catch {
-    return undefined;
-  } finally {
-    if (current?.id !== undefined && current.id !== job.tabId) await activateTabInternally(current.id).catch(() => undefined);
-  }
+  });
 }
 
 function captureIsDegraded(capture: Capture): boolean {
@@ -679,9 +777,10 @@ async function ensureProviderCapturing(runId: string, provider: ProviderId): Pro
 async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:capture' }>): Promise<Run> {
   const id = captureId(request.runId, request.provider);
   const run = await serializeCapture(id, () => withRunLock(request.runId, async () => {
+    const existingJob = await getJob(id);
     // The DB validator fills the tab ID from the same run version it commits.
     const job: CaptureJob = {
-      id, runId: request.runId, provider: request.provider, tabId: 0,
+      id, runId: request.runId, provider: request.provider, conversationKey: request.conversationKey, tabId: 0,
       state: 'queued', createdAt: Date.now(), attempts: 0,
       domMarkdown: request.domMarkdown, domCitations: request.domCitations, copyControlObserved: request.copyControlObserved,
       researchTrail: request.researchTrail, title: request.title,
@@ -690,6 +789,16 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
       if (!storedRun) throw new CoordinatorRequestError('Run not found for capture.', 'run_not_found');
       const provider = storedRun.providerRuns[request.provider];
       validateProviderTransition(provider, 'capturing');
+      const verifiedConversationKey = request.conversationKey ?? existingJob?.conversationKey;
+      if ((!existingJob && !verifiedConversationKey)
+        || (provider.conversationKey && provider.conversationKey !== verifiedConversationKey)) {
+        throw new CoordinatorRequestError(
+          'Capture rejected because the provider conversation could not be verified.',
+          'conversation_mismatch',
+          providerSnapshot(provider),
+        );
+      }
+      provider.conversationKey ??= verifiedConversationKey;
       job.tabId = provider.tabId;
       provider.status = 'capturing';
       provider.statusDetail = undefined;
@@ -783,12 +892,6 @@ async function endProvider(runId: string, provider: ProviderId): Promise<void> {
   if (!ended) return;
   await maybeFinalize(run);
   await broadcastRuns();
-}
-
-function isProviderUrl(url: string | undefined, provider: ProviderId): boolean {
-  if (!url) return false;
-  try { return new URL(url).origin === ADAPTERS[provider].origin; }
-  catch { return false; }
 }
 
 function isProviderAuthenticationUrl(url: string | undefined, provider: ProviderId): boolean {
@@ -949,7 +1052,9 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const capture = await getCapture(providerRun?.captureId);
         if (!run || !providerRun || !capture) throw new Error('No captured report is available.');
         const settings = await loadSettings();
-        await createPlatform().writeClipboard(buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets }));
+        await withClipboardLock(() => createPlatform().writeClipboard(
+          buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets }),
+        ));
         await mutateStoredRun(run.id, (storedRun) => {
           const storedProviderRun = storedRun.providerRuns[message.provider];
           if (storedProviderRun) storedProviderRun.copiedAt = Date.now();
@@ -960,7 +1065,17 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         const run = await getRun(message.runId);
         const providerRun = run?.providerRuns[message.provider];
         if (!run || !providerRun) throw new Error('Provider run not found.');
-        await copyCurrentResponse(providerRun.tabId, message.provider);
+        if (!providerRun.conversationKey) {
+          throw new CoordinatorRequestError(
+            'This run has no verified provider conversation. Use the provider-page context menu instead.',
+            'conversation_mismatch',
+            providerSnapshot(providerRun),
+          );
+        }
+        await copyCurrentResponse(providerRun.tabId, message.provider, {
+          runId: run.id,
+          conversationKey: providerRun.conversationKey,
+        });
         return { ok: true };
       }
       case 'provider:download': {
@@ -981,7 +1096,10 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         return { ok: true };
       }
       case 'content:state': {
-        const run = await mutateProvider(message.runId, message.provider, message.status, message.detail, message.submittedAt, message.reason);
+        const run = await mutateProvider(
+          message.runId, message.provider, message.status, message.detail,
+          message.submittedAt, message.reason, message.conversationKey,
+        );
         return { ok: true, providerState: providerSnapshot(run.providerRuns[message.provider]!) };
       }
       case 'content:capture': {
@@ -1032,6 +1150,7 @@ export const coordinatorTestHooks = {
   getBrowserSessionId,
   handleRequest,
   serializeCapture,
+  withClipboardLock,
   mutateStoredRun,
   maybeFinalize,
   recordReconcileCheck,
@@ -1053,6 +1172,7 @@ export const coordinatorTestHooks = {
     fallbackBrowserSessionId = undefined;
     captureMutationTails.clear();
     contextMenuRegistrationTail = Promise.resolve();
+    clipboardOperationTail = Promise.resolve();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
 };

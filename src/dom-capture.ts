@@ -86,10 +86,13 @@ export interface ResponseSnapshot {
   text: string;
 }
 
-const BARE_DURATION = /^\d{1,3}:\d{2}(?::\d{2})?$/;
-const EXPLICIT_ELAPSED_DURATION = /^(?:elapsed(?: time)?[:\s]+\d{1,3}:\d{2}(?::\d{2})?|\d+\s*(?:seconds?|minutes?)\s+elapsed)$/i;
+const DURATION = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
+const BARE_DURATION = new RegExp(`^${DURATION}$`, 'i');
+const EXPLICIT_ELAPSED_DURATION = new RegExp(`^(?:elapsed(?: time)?[:\\s]+${DURATION}|${DURATION}\\s+elapsed)$`, 'i');
+const REPORT_BEARING_ELEMENT = 'p, li, h1, h2, h3, h4, h5, h6, table, thead, tbody, tfoot, tr, th, td';
 
 function isElapsedTimerElement(element: Element): boolean {
+  if (element.matches(REPORT_BEARING_ELEMENT) || element.querySelector(REPORT_BEARING_ELEMENT)) return false;
   const text = normalizeVisibleText(element.textContent ?? '');
   if (EXPLICIT_ELAPSED_DURATION.test(text)) return true;
   if (!BARE_DURATION.test(text)) return false;
