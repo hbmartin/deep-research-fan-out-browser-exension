@@ -6,7 +6,7 @@ import type { ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeRespons
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
 import { loadSettings } from './settings';
 import { normalizeResearchTrail } from './sources';
-import { canTransition, assertTransition, createDownloadFolder, deriveRunStatus, slugify } from './state';
+import { canTransition, assertTransition, createDownloadFolder, deriveRunStatus, isSetupProviderStatus, slugify } from './state';
 import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
 
 const ALARM_NAME = 'reconcile-runs';
@@ -55,19 +55,23 @@ async function getBrowserSessionId(): Promise<string> {
   return browserSessionIdPromise;
 }
 
-async function withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
-  const previous = runMutationTails.get(runId)?.catch(() => undefined) ?? Promise.resolve();
+async function serializeByKey<T>(tails: Map<string, Promise<void>>, key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = tails.get(key)?.catch(() => undefined) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const tail = previous.then(() => gate);
-  runMutationTails.set(runId, tail);
+  tails.set(key, tail);
   await previous;
   try {
     return await operation();
   } finally {
     release();
-    if (runMutationTails.get(runId) === tail) runMutationTails.delete(runId);
+    if (tails.get(key) === tail) tails.delete(key);
   }
+}
+
+function withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+  return serializeByKey(runMutationTails, runId, operation);
 }
 
 async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Promise<{ run: Run; value: T }> {
@@ -89,25 +93,13 @@ function validateProviderTransition(provider: ProviderRun | undefined, status: P
   if (isTerminalProviderStatus(provider.status)) {
     throw new CoordinatorRequestError('Provider run has ended.', 'provider_terminal', providerSnapshot(provider));
   }
-  if (!canTransition(provider.status, status)
-    || (provider.researchTimedOutAt !== undefined && ['researching', 'awaiting_user'].includes(status))) {
+  if (!canTransition(provider.status, status)) {
     throw new CoordinatorRequestError(`Invalid provider transition: ${provider.status} -> ${status}`, 'invalid_transition', providerSnapshot(provider));
   }
 }
 
-async function serializeCapture<T>(id: string, operation: () => Promise<T>): Promise<T> {
-  const previous = captureMutationTails.get(id)?.catch(() => undefined) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  const tail = previous.then(() => gate);
-  captureMutationTails.set(id, tail);
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (captureMutationTails.get(id) === tail) captureMutationTails.delete(id);
-  }
+function serializeCapture<T>(id: string, operation: () => Promise<T>): Promise<T> {
+  return serializeByKey(captureMutationTails, id, operation);
 }
 
 function setKnownRunTabs(runs: Run[]): void {
@@ -205,7 +197,7 @@ async function startContent(run: Run, provider: ProviderId, resumeOnly = false):
 }
 
 function shouldResumeContentOnly(status: ProviderRunStatus): boolean {
-  return !['pending', 'opening', 'awaiting_ready', 'setting_mode'].includes(status);
+  return !isSetupProviderStatus(status);
 }
 
 async function createRun(queryInput: string, requestedWindowId?: number): Promise<Run> {
@@ -275,9 +267,15 @@ async function mutateProvider(runId: string, provider: ProviderId, status: Provi
     const timeout = reason === 'research_timeout' && status === 'manual_required';
     const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
     const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
+    const enteredResearch = status === 'researching' && providerRun.status !== 'researching';
     providerRun.status = status;
     providerRun.statusDetail = detail;
-    providerRun.submittedAt ??= submittedAt ?? (status === 'researching' ? Date.now() : undefined);
+    if (enteredResearch) {
+      providerRun.submittedAt = submittedAt ?? Date.now();
+      providerRun.researchTimedOutAt = undefined;
+    } else {
+      providerRun.submittedAt ??= submittedAt ?? (status === 'researching' ? Date.now() : undefined);
+    }
     if (firstTimeout) providerRun.researchTimedOutAt = Date.now();
     if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
@@ -402,7 +400,10 @@ async function persistCaptureJob(
   copied?: { text: string; restored: boolean },
 ): Promise<{ id: string; degraded: boolean }> {
   const rawMarkdown = copied?.text || job.domMarkdown;
-  if (rawMarkdown.trim().length < 40) throw new Error('Clipboard and DOM capture were both empty.');
+  const shortDomBacked = Boolean(job.copyControlObserved && job.domMarkdown.trim());
+  if (!rawMarkdown.trim() || (rawMarkdown.trim().length < 40 && !shortDomBacked)) {
+    throw new Error('Clipboard and DOM capture did not contain a usable report.');
+  }
   const resolved = await resolveCitationUrls(job.provider, job.domCitations);
   const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
   const researchTrail = job.researchTrail
@@ -610,7 +611,8 @@ async function queueCapture(request: Extract<RuntimeRequest, { type: 'content:ca
     const job: CaptureJob = {
       id, runId: request.runId, provider: request.provider, tabId: 0,
       state: 'queued', createdAt: Date.now(), attempts: 0,
-      domMarkdown: request.domMarkdown, domCitations: request.domCitations, researchTrail: request.researchTrail, title: request.title,
+      domMarkdown: request.domMarkdown, domCitations: request.domCitations, copyControlObserved: request.copyControlObserved,
+      researchTrail: request.researchTrail, title: request.title,
     };
     return acceptCaptureJob(job, (storedRun) => {
       if (!storedRun) throw new CoordinatorRequestError('Run not found for capture.', 'run_not_found');

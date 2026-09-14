@@ -19,7 +19,7 @@ export type RuntimeRequest =
   | { type: 'provider:download'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
   | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout' }
-  | { type: 'content:capture'; runId: RunId; provider: ProviderId; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string }
+  | { type: 'content:capture'; runId: RunId; provider: ProviderId; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }
   | { type: 'capture:clipboard-read'; requestId: string }
   | { type: 'capture:clipboard-write'; requestId: string; text: string }
   | { type: 'download:blob-create'; requestId: string; text: string }

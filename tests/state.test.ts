@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canTransition, createDownloadFolder, deriveRunStatus, slugify } from '../src/state';
+import { canTransition, createDownloadFolder, deriveRunStatus, isSetupProviderStatus, slugify } from '../src/state';
 import type { ProviderRun, Run } from '../src/types';
 
 function provider(status: ProviderRun['status']): ProviderRun {
@@ -16,6 +16,7 @@ function run(statuses: ProviderRun['status'][]): Run {
 describe('provider state machine', () => {
   it('keeps manual states recoverable and nonterminal', () => {
     expect(canTransition('manual_required', 'researching')).toBe(true);
+    expect(canTransition('manual_required', 'awaiting_user')).toBe(true);
     expect(canTransition('awaiting_user', 'capturing')).toBe(true);
     expect(canTransition('manual_required', 'quota_exhausted')).toBe(true);
     expect(canTransition('awaiting_user', 'quota_exhausted')).toBe(true);
@@ -25,6 +26,11 @@ describe('provider state machine', () => {
   it('completes only when every provider is terminal', () => {
     expect(deriveRunStatus(run(['complete', 'failed', 'abandoned', 'interrupted']))).toBe('complete');
     expect(canTransition('complete', 'researching')).toBe(false);
+  });
+
+  it('shares one definition of setup-phase statuses', () => {
+    expect(['pending', 'opening', 'awaiting_ready', 'setting_mode'].every((status) => isSetupProviderStatus(status as ProviderRun['status']))).toBe(true);
+    expect(['submitting', 'researching', 'awaiting_user', 'manual_required', 'complete'].some((status) => isSetupProviderStatus(status as ProviderRun['status']))).toBe(false);
   });
 });
 

@@ -194,6 +194,14 @@ describe('provider content-script recovery', () => {
     expect(captures()).toHaveLength(0);
   });
 
+  it('does not use an ancestor-hidden historical Stop control to confirm a reloaded submission', async () => {
+    answer('An answer from the previous query');
+    document.body.insertAdjacentHTML('afterbegin', '<div aria-hidden="true"><button style="position:fixed" aria-label="Stop generating"></button></div>');
+    await resume('submitting');
+    expect(storedStatus).toBe('manual_required');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
+  });
+
   it('times out a researching provider that never reaches a report', async () => {
     await resume('researching', false, Date.now() - 45 * 60 * 1000);
     await vi.advanceTimersByTimeAsync(2000);
@@ -310,6 +318,23 @@ describe('provider content-script recovery', () => {
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
+  it('accepts a changed Copy field containing a copied-success phrase', async () => {
+    answer();
+    await resume('researching');
+    const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
+    button.addEventListener('click', () => button.setAttribute('title', 'Response copied to the clipboard successfully'));
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review:chatgpt' }))
+      .resolves.toEqual({ ok: true, copyConfirmed: true });
+  });
+
+  it('accepts a non-empty short DOM response only with owned Copy evidence', async () => {
+    answer('OK');
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+    expect(captures()[0]).toMatchObject({ domMarkdown: '## OK', copyControlObserved: true });
+  });
+
   it('prefers the response Copy control over a nested Copy code control', () => {
     document.body.innerHTML = `
       <section>
@@ -360,6 +385,38 @@ describe('provider content-script recovery', () => {
     expect(captures()[0]).toMatchObject({ domMarkdown: expect.stringContaining('completed research report') });
   });
 
+  it('uses hover-transparent Sources controls without stalling capture', async () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant"><h2>${report}</h2></div>
+        <button style="position:fixed" aria-label="Copy response">Copy</button>
+        <button style="position:fixed;opacity:0" aria-label="Sources" aria-expanded="false">Sources</button>
+      </section>
+    `;
+    const click = vi.fn();
+    document.querySelector<HTMLButtonElement>('[aria-label="Sources"]')!.addEventListener('click', click);
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(click).toHaveBeenCalledTimes(2);
+    expect(captures()).toHaveLength(1);
+  });
+
+  it('ignores a hidden optional Sources control outside the response layer', async () => {
+    document.body.innerHTML = `
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant"><h2>${report}</h2></div>
+        <button style="position:fixed" aria-label="Copy response">Copy</button>
+        <div aria-hidden="true"><button style="position:fixed" aria-label="Sources">Sources</button></div>
+      </section>
+    `;
+    const click = vi.fn();
+    document.querySelector<HTMLButtonElement>('[aria-label="Sources"]')!.addEventListener('click', click);
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(click).not.toHaveBeenCalled();
+    expect(captures()).toHaveLength(1);
+  });
+
   it('finds a Grok Sources control beyond the former three-ancestor limit', () => {
     document.body.innerHTML = `
       <section>
@@ -405,6 +462,33 @@ describe('provider reliability regressions', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'awaiting_ready' }));
     expect(captures()).toHaveLength(1);
+  });
+  it('latches manual setup synchronously while its report acknowledgement is delayed', async () => {
+    storedStatus = 'setting_mode';
+    document.body.innerHTML = '<div id="prompt-textarea" contenteditable="true" role="textbox" style="position:fixed"></div>';
+    const composer = document.querySelector<HTMLElement>('#prompt-textarea')!;
+    const paste = vi.fn((event: Event) => { composer.textContent = (event as ClipboardEvent).clipboardData!.getData('text/plain'); });
+    composer.addEventListener('paste', paste);
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      const request = message as RuntimeRequest;
+      if (request.type !== 'content:state' || request.status !== 'manual_required') return original(message);
+      messages.push(request);
+      await acknowledgement;
+      storedStatus = 'manual_required';
+      return { ok: true };
+    });
+    await listener(setupEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(paste).toHaveBeenCalledTimes(1);
+    await listener(setupEvent());
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(paste).toHaveBeenCalledTimes(1);
+    acknowledge();
+    await vi.advanceTimersByTimeAsync(0);
   });
   it('keeps monitoring after the first post-submit report fails', async () => {
     storedStatus = 'setting_mode';
@@ -458,6 +542,28 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(10000);
     expect(captures()).toHaveLength(1);
   });
+  it('pauses timeout during clarification and grants a fresh interval when research resumes', async () => {
+    answer('Before I begin, could you specify the target market?');
+    const firstInterval = Date.now() - 45 * 60 * 1000;
+    await resume('researching', false, firstInterval);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(storedStatus).toBe('awaiting_user');
+
+    const resumedAt = Date.now();
+    document.querySelector('h2')!.textContent = 'Researching the requested topic now…';
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+    const resumed = messages.filter((message) => message.type === 'content:state' && message.status === 'researching').at(-1);
+    expect(resumed).toMatchObject({ submittedAt: expect.any(Number) });
+    expect((resumed as Extract<RuntimeRequest, { type: 'content:state' }>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
+    await vi.advanceTimersByTimeAsync(44 * 60 * 1000);
+    expect(storedStatus).toBe('researching');
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    expect(storedStatus).toBe('manual_required');
+  });
   it('stops monitoring when the coordinator rejects a terminal report permanently', async () => {
     const sendMessage = vi.mocked(browser.runtime.sendMessage);
     const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
@@ -496,6 +602,21 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(40000);
     expect(captures()).toHaveLength(1);
   });
+  it('ignores an ancestor-hidden historical streaming indicator in another response layer', async () => {
+    document.body.innerHTML = `
+      <section aria-hidden="true">
+        <div style="position:fixed" data-message-author-role="assistant">Historical response</div>
+        <button style="position:fixed" aria-label="Stop generating"></button>
+      </section>
+      <section>
+        <div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p></div>
+        <button style="position:fixed" aria-label="Copy response">Copy</button>
+      </section>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+  });
   it('defers Sources clicks until a modal unblocks the response', async () => {
     document.body.innerHTML = `<main aria-hidden="true"><section><div style="position:fixed" data-message-author-role="assistant"><p>${report.repeat(10)}</p></div><button style="position:fixed" aria-label="Sources">Sources</button></section></main>`;
     const click = vi.fn();
@@ -515,11 +636,25 @@ describe('provider reliability regressions', () => {
     const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
     const clone = root.cloneNode.bind(root);
     let clones = 0;
-    vi.spyOn(root,'cloneNode').mockImplementation((deep) => { if (++clones === 4) throw new Error('snapshot failed'); return clone(deep); });
+    vi.spyOn(root,'cloneNode').mockImplementation((deep) => { if (++clones === 1) throw new Error('snapshot failed'); return clone(deep); });
     await resume('researching');
     await vi.advanceTimersByTimeAsync(20000);
     expect(captures()).toHaveLength(1);
-    expect(clones).toBeGreaterThan(4);
+    expect(clones).toBeGreaterThan(1);
+  });
+  it('does not clone response snapshots inside the citation polling loop', async () => {
+    answer();
+    const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
+    root.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Sources" aria-expanded="false">Sources</button>');
+    const toggle = root.querySelector<HTMLButtonElement>('[aria-label="Sources"]')!;
+    let clonesAtOpen = 0;
+    const clone = root.cloneNode.bind(root);
+    const cloneSpy = vi.spyOn(root, 'cloneNode').mockImplementation((deep) => clone(deep));
+    toggle.addEventListener('click', () => { clonesAtOpen ||= cloneSpy.mock.calls.length; });
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(captures()).toHaveLength(1);
+    expect(cloneSpy.mock.calls.length - clonesAtOpen).toBeLessThanOrEqual(2);
   });
   it('does not confirm arbitrary icon changes as Copy success', async () => {
     answer();
@@ -583,14 +718,45 @@ describe('capture cancellation and setup exceptions', () => {
     const find=ResponseControlIndex.prototype.find;
     const sourceSelectors=(await import('../src/adapters')).ADAPTERS.chatgpt.selectors.sourcesPanelToggle;
     let failed=false;
+    let sourceLookups=0;
     vi.spyOn(ResponseControlIndex.prototype,'find').mockImplementation(function(this: InstanceType<typeof ResponseControlIndex>,root,selectors,baseline,hover,includeBlocked){
-      if (!failed && selectors===sourceSelectors && includeBlocked===undefined) { failed=true; throw new Error('source control failed'); }
+      if (selectors===sourceSelectors && ++sourceLookups===2) { failed=true; throw new Error('source control failed'); }
       return find.call(this,root,selectors,baseline,hover,includeBlocked);
     });
     answer();
     await resume('researching');
     await vi.advanceTimersByTimeAsync(20000);
     expect(failed).toBe(true);
+    expect(captures()).toHaveLength(1);
+  });
+  it('rebuilds Sources ownership after pending state-report retries', async () => {
+    answer('Before I begin, could you specify the target market?');
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+    sendMessage.mockImplementation(async (message: unknown) => {
+      const request = message as RuntimeRequest;
+      if (request.type !== 'content:state' || request.status !== 'awaiting_user') return original(message);
+      messages.push(request);
+      await acknowledgement;
+      storedStatus = 'awaiting_user';
+      return { ok: true };
+    });
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(2000);
+    document.querySelector('h2')!.textContent = report;
+    const oldToggle = document.createElement('button');
+    oldToggle.style.position = 'fixed';
+    oldToggle.setAttribute('aria-label', 'Sources');
+    const oldClick = vi.fn();
+    oldToggle.addEventListener('click', oldClick);
+    document.querySelector('[data-message-author-role="assistant"]')!.append(oldToggle);
+    await vi.advanceTimersByTimeAsync(4000);
+    oldToggle.remove();
+    acknowledge();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(oldClick).not.toHaveBeenCalled();
     expect(captures()).toHaveLength(1);
   });
   it('cancels old source capture without blocking or clearing a newer run', async () => {

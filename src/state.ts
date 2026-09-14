@@ -14,7 +14,7 @@ const transitions: Record<ProviderRunStatus, ReadonlySet<ProviderRunStatus>> = {
   submitting: new Set(['researching', 'manual_required', 'unauthenticated', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   researching: new Set(['awaiting_user', 'capturing', 'manual_required', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   awaiting_user: new Set(['researching', 'capturing', 'manual_required', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
-  manual_required: new Set(['researching', 'capturing', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
+  manual_required: new Set(['researching', 'awaiting_user', 'capturing', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   capturing: new Set(['complete', 'researching', 'interrupted', 'abandoned', 'failed']),
   complete: new Set(),
   unauthenticated: new Set(),
@@ -23,6 +23,17 @@ const transitions: Record<ProviderRunStatus, ReadonlySet<ProviderRunStatus>> = {
   abandoned: new Set(),
   failed: new Set(),
 };
+
+const SETUP_PROVIDER_STATUSES: ReadonlySet<ProviderRunStatus> = new Set([
+  'pending',
+  'opening',
+  'awaiting_ready',
+  'setting_mode',
+]);
+
+export function isSetupProviderStatus(status: ProviderRunStatus): boolean {
+  return SETUP_PROVIDER_STATUSES.has(status);
+}
 
 export function canTransition(from: ProviderRunStatus, to: ProviderRunStatus): boolean {
   return from === to || transitions[from].has(to);
