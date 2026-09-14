@@ -28,7 +28,7 @@ export class ProviderReporter {
 
   report(request: StateRequest): Promise<void> {
     if (this.stopped) return Promise.reject(new Error('Provider reporting stopped.'));
-    const key = JSON.stringify([request.status, request.detail, request.reason]);
+    const key = JSON.stringify([request.status, request.detail, request.reason, request.conversationKey]);
     if (this.rejected.has(key)) return Promise.reject(this.rejected.get(key));
     const existing = this.queue.find((item) => item.key === key);
     if (existing) return existing.promise;

@@ -1,4 +1,4 @@
-import type { ProviderAdapter, SelectorChain } from './adapters';
+import type { SelectorChain } from './adapters';
 import { findAll, isVisible } from './selectors';
 
 const PAGE_BOUNDARY = 'html, body, main, [role="main"], [role="dialog"], dialog, aside';
@@ -19,7 +19,7 @@ export class ResponseControlIndex {
   private candidates = new Map<SelectorChain, HTMLElement[]>();
   ancestorVisits = 0;
 
-  constructor(roots: readonly HTMLElement[], private adapter?: ProviderAdapter) {
+  constructor(roots: readonly HTMLElement[]) {
     this.roots = new Set(roots);
     for (const root of roots) {
       for (let node: HTMLElement | null = root; node; node = node.parentElement) {
@@ -65,7 +65,12 @@ export class ResponseControlIndex {
     let controlledOwner: HTMLElement | undefined;
     for (const id of controlledIds) {
       const controlled = this.uniqueIds.get(id);
-      if (!controlled) return undefined;
+      // A lazily mounted popover is not evidence that the control is unrelated.
+      // Duplicate IDs, however, make an existing relationship ambiguous.
+      if (!controlled) {
+        if (this.uniqueIds.has(id)) return undefined;
+        continue;
+      }
       let controlledNode: HTMLElement | null = controlled;
       let info: Container | undefined;
       while (controlledNode && !info) {
@@ -85,9 +90,14 @@ export class ResponseControlIndex {
       if (node.matches(PAGE_BOUNDARY)) return undefined;
       const info = this.containers.get(node);
       if (!info) continue;
-      const providerContainer = this.adapter?.responseContainerSelector;
-      if ((!node.matches(TURN) && !(providerContainer && node.matches(providerContainer)))
-        || this.foreignContainers.has(node)) continue;
+      if (this.foreignContainers.has(node)) continue;
+      if (!node.matches(TURN) && info.roots.length === 1) {
+        const owner = info.roots[0]!;
+        if (candidateRegion === owner.closest(FOREIGN_REGION)
+          && (owner.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING)) return owner;
+        continue;
+      }
+      if (!node.matches(TURN)) continue;
       let preceding: HTMLElement | undefined;
       for (const root of info.roots) {
         if (candidateRegion !== root.closest(FOREIGN_REGION)) continue;

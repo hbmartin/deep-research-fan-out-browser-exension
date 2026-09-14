@@ -397,6 +397,50 @@ describe('coordinator run guards', () => {
     expect(clipboard).toBe(original);
   });
 
+  it('retains a confirmed provider value after failed validation when clipboard restoration is disabled', async () => {
+    vi.useFakeTimers();
+    (browser.storage.sync.get as unknown as { mockResolvedValue(value: Record<string, unknown>): void }).mockResolvedValue({
+      'settings.general.v1': { restoreClipboard: false },
+    });
+    const original = 'Original clipboard material that should be replaced by the confirmed provider copy.';
+    const providerValue = 'A different confirmed provider response that does not match the visible report.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async () => {
+      clipboard = providerValue;
+      return { ok: true, copyConfirmed: true };
+    });
+    const pending = coordinatorTestHooks.clipboardCapture(platform, {
+      id: 'run:claude-no-restore', runId: 'run', provider: 'claude', tabId: 2, state: 'queued',
+      createdAt: 1, attempts: 0, tabUnavailable: true,
+      domMarkdown: 'The visible provider report has unrelated content and must be used for validation.', domCitations: [],
+    });
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(providerValue);
+  });
+
+  it('never leaves an internal clipboard sentinel when restoration is disabled', async () => {
+    vi.useFakeTimers();
+    (browser.storage.sync.get as unknown as { mockResolvedValue(value: Record<string, unknown>): void }).mockResolvedValue({
+      'settings.general.v1': { restoreClipboard: false },
+    });
+    const original = 'Original clipboard material that must survive a provider copy that never arrives.';
+    let clipboard = original;
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    const pending = coordinatorTestHooks.clipboardCapture(platform, {
+      id: 'run:sentinel', runId: 'run', provider: 'chatgpt', tabId: 1, state: 'queued',
+      createdAt: 1, attempts: 0, tabUnavailable: true,
+      domMarkdown: 'A sufficiently long visible provider response for validation.', domCitations: [],
+    });
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBeUndefined();
+    expect(clipboard).toBe(original);
+    expect(clipboard).not.toMatch(/^__DRFO_COPY_/);
+  });
+
   it('accepts a fresh provider copy identical to the original clipboard', async () => {
     vi.useFakeTimers();
     const report = 'A complete provider research report with sufficient content for a valid capture.';
@@ -458,10 +502,14 @@ describe('coordinator run guards', () => {
   it('copies a normalized current response without changing provider state', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 44, 'researching') });
     stored.providerRuns.chatgpt!.submittedAt = 1234;
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/current';
     await putRun(stored);
+    tabsGet.mockResolvedValue({ id: 44, url: 'https://chatgpt.com/c/current' } as Browser.tabs.Tab);
     platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
       if ((event as { type: string }).type === 'content:ping') return { ok: true };
       return {
+        provider: 'chatgpt', pageUrl: 'https://chatgpt.com/c/current',
+        activeRunId: stored.id, conversationKey: 'https://chatgpt.com/c/current',
         domMarkdown: 'Current report with [Evidence](https://example.com/source).',
         domCitations: [{
           url: 'https://example.com/source', markerText: 'Evidence', domOrder: 0,
@@ -481,10 +529,110 @@ describe('coordinator run guards', () => {
     expect(await getRun(stored.id)).toEqual(stored);
   });
 
-  it('registers and handles the provider-page Copy current context menu', async () => {
+  it('serializes Copy current behind capture restoration and emits one References section', async () => {
+    vi.useFakeTimers();
+    const conversationKey = 'https://chatgpt.com/c/current';
+    const copiedReport = 'Current report with [Evidence](https://example.com/source).';
+    let clipboard = 'User clipboard before capture.';
+    let copyStarted!: () => void;
+    let releaseProviderCopy!: () => void;
+    const providerCopyStarted = new Promise<void>((resolve) => { copyStarted = resolve; });
+    const providerCopyGate = new Promise<void>((resolve) => { releaseProviderCopy = resolve; });
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    tabsGet.mockResolvedValue({ id: 44, url: conversationKey } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      const request = event as { type: string };
+      if (request.type === 'capture:copy-now') {
+        clipboard = copiedReport;
+        copyStarted();
+        await providerCopyGate;
+        return { ok: true, copyConfirmed: true };
+      }
+      if (request.type === 'content:ping') return { ok: true };
+      return {
+        provider: 'chatgpt', pageUrl: conversationKey, activeRunId: 'run', conversationKey,
+        domMarkdown: copiedReport,
+        domCitations: [{
+          url: 'https://example.com/source', markerText: 'Evidence', domOrder: 0,
+          contextBefore: 'Current report with ', contextAfter: '.',
+        }],
+      };
+    });
+    const capture = coordinatorTestHooks.clipboardCapture(platform, {
+      id: 'run:chatgpt', runId: 'run', provider: 'chatgpt', conversationKey, tabId: 44, state: 'queued',
+      createdAt: 1, attempts: 0, domMarkdown: copiedReport, domCitations: [],
+    });
+    await providerCopyStarted;
+    const copyCurrent = coordinatorTestHooks.copyCurrentResponse(44, 'chatgpt', { runId: 'run', conversationKey });
+    await Promise.resolve();
+    expect(clipboard).toBe(copiedReport);
+
+    releaseProviderCopy();
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(capture).resolves.toMatchObject({ text: copiedReport, restored: true });
+    await copyCurrent;
+    expect(clipboard.match(/^## References$/gm)).toHaveLength(1);
+    expect(clipboard).toContain('Current report with');
+  });
+
+  it('fails closed for legacy or mismatched side-panel Copy current requests', async () => {
+    const legacy = run({ chatgpt: provider('chatgpt', 45, 'researching') });
+    await putRun(legacy);
+    await expect(coordinatorTestHooks.handleRequest(
+      { type: 'provider:copy-current', runId: legacy.id, provider: 'chatgpt' }, {},
+    )).resolves.toMatchObject({ ok: false, code: 'conversation_mismatch' });
+
+    legacy.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/expected';
+    await putRun(legacy);
+    tabsGet.mockResolvedValue({ id: 45, url: 'https://chatgpt.com/c/other' } as Browser.tabs.Tab);
+    await expect(coordinatorTestHooks.handleRequest(
+      { type: 'provider:copy-current', runId: legacy.id, provider: 'chatgpt' }, {},
+    )).resolves.toMatchObject({ ok: false, code: 'conversation_mismatch' });
+    expect(platform.writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['wrong active run', { activeRunId: 'other-run', conversationKey: 'https://chatgpt.com/c/expected', pageUrl: 'https://chatgpt.com/c/expected' }],
+    ['wrong snapshot conversation', { activeRunId: 'run', conversationKey: 'https://chatgpt.com/c/expected', pageUrl: 'https://chatgpt.com/c/other' }],
+  ])('rejects %s identity before writing Copy current', async (_label, identity) => {
+    tabsGet.mockResolvedValue({ id: 46, url: 'https://chatgpt.com/c/expected' } as Browser.tabs.Tab);
     platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
       if ((event as { type: string }).type === 'content:ping') return { ok: true };
-      return { domMarkdown: 'Current Gemini response.', domCitations: [] };
+      return { provider: 'chatgpt', ...identity, domMarkdown: 'Current response.', domCitations: [] };
+    });
+    await expect(coordinatorTestHooks.copyCurrentResponse(46, 'chatgpt', {
+      runId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+    })).rejects.toMatchObject({ code: 'conversation_mismatch' });
+    expect(platform.writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the tab conversation after snapshot processing and before clipboard write', async () => {
+    tabsGet
+      .mockResolvedValueOnce({ id: 47, url: 'https://chatgpt.com/c/expected' } as Browser.tabs.Tab)
+      .mockResolvedValueOnce({ id: 47, url: 'https://chatgpt.com/c/other' } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return {
+        provider: 'chatgpt', pageUrl: 'https://chatgpt.com/c/expected',
+        activeRunId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+        domMarkdown: 'Current response.', domCitations: [],
+      };
+    });
+    await expect(coordinatorTestHooks.copyCurrentResponse(47, 'chatgpt', {
+      runId: 'run', conversationKey: 'https://chatgpt.com/c/expected',
+    })).rejects.toMatchObject({ code: 'conversation_mismatch' });
+    expect(platform.writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it('registers and handles the provider-page Copy current context menu', async () => {
+    tabsGet.mockResolvedValue({ id: 55, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return {
+        provider: 'gemini', pageUrl: 'https://gemini.google.com/app',
+        domMarkdown: 'Current Gemini response.', domCitations: [],
+      };
     });
 
     await coordinatorTestHooks.registerCopyCurrentContextMenu();
@@ -522,6 +670,7 @@ describe('coordinator run guards', () => {
   });
 
   it('notifies when a context-menu current-response copy fails', async () => {
+    tabsGet.mockResolvedValue({ id: 56, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab);
     platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
       if ((event as { type: string }).type === 'content:ping') return { ok: true };
       throw new Error('No Gemini response is available to copy.');
@@ -534,6 +683,23 @@ describe('coordinator run guards', () => {
     expect(platform.notify).toHaveBeenCalledWith(
       'copy-current:56', 'Could not copy current response', 'No Gemini response is available to copy.',
     );
+  });
+
+  it('does not report copy failure when only the success notification fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    tabsGet.mockResolvedValue({ id: 57, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab);
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type: string }).type === 'content:ping') return { ok: true };
+      return { provider: 'gemini', pageUrl: 'https://gemini.google.com/app', domMarkdown: 'Current response.', domCitations: [] };
+    });
+    platform.notify.mockRejectedValue(new Error('Notifications unavailable'));
+    await coordinatorTestHooks.handleCopyCurrentContextMenu(
+      { menuItemId: 'copy-current-research-response' } as Browser.contextMenus.OnClickData,
+      { id: 57, url: 'https://gemini.google.com/app' } as Browser.tabs.Tab,
+    );
+    expect(platform.writeClipboard).toHaveBeenCalledWith('Current response.\n');
+    expect(platform.notify).toHaveBeenCalledTimes(1);
+    expect(platform.notify).not.toHaveBeenCalledWith(expect.anything(), 'Could not copy current response', expect.anything());
   });
 
   it.each([false, true])('reports durable capture acceptance as %s when resuming capturing', async (accepted) => {
@@ -821,6 +987,34 @@ describe('durable acceptance and state recovery regressions', () => {
   function jobFor(stored: Run): CaptureJob {
     return {...captureRequest(stored),id:`${stored.id}:chatgpt`,tabId:1,state:'queued',createdAt:Date.now(),attempts:0,domCitations:[]};
   }
+  it('persists the first conversation key and rejects later unavailable or different keys', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    const bound = await coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+      conversationKey:'https://chatgpt.com/c/bound',
+    },{});
+    expect(bound).toMatchObject({ok:true,providerState:{conversationKey:'https://chatgpt.com/c/bound'}});
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey).toBe('https://chatgpt.com/c/bound');
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+      conversationKey:'https://chatgpt.com/c/other',
+    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+  });
+  it.each([undefined, 'https://chatgpt.com/c/other'])('rejects automatic capture with mismatched conversation key %s', async (conversationKey) => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound';
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({
+      ...captureRequest(stored), conversationKey, domCitations: [],
+    },{})).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('researching');
+  });
   it.each(['setting_mode','submitting','opening'] as const)('rejects capture in %s without leaving a job', async (status) => {
     const stored = run({chatgpt:provider('chatgpt',1,status)});
     await putRun(stored);

@@ -1,16 +1,21 @@
 import type { CaptureJob, CapturedResearchTrail, DomCitation, ProviderId, ProviderRunStatus, Run, RunId } from './types';
 
 export interface CurrentResponseSnapshot {
+  provider: ProviderId;
+  pageUrl: string;
+  activeRunId?: RunId;
+  conversationKey?: string;
   domMarkdown: string;
   domCitations: DomCitation[];
 }
 
-export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found';
+export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found' | 'conversation_mismatch';
 
 export interface ProviderSnapshot {
   status: ProviderRunStatus;
   submittedAt?: number;
   researchTimedOutAt?: number;
+  conversationKey?: string;
 }
 
 export type RuntimeRequest =
@@ -24,8 +29,8 @@ export type RuntimeRequest =
   | { type: 'provider:copy-current'; runId: RunId; provider: ProviderId }
   | { type: 'provider:download'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
-  | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout' }
-  | { type: 'content:capture'; runId: RunId; provider: ProviderId; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }
+  | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout'; conversationKey?: string }
+  | { type: 'content:capture'; runId: RunId; provider: ProviderId; conversationKey?: string; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }
   | { type: 'capture:clipboard-read'; requestId: string }
   | { type: 'capture:clipboard-write'; requestId: string; text: string }
   | { type: 'download:blob-create'; requestId: string; text: string }
@@ -48,10 +53,11 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   status: ProviderRunStatus;
   submittedAt?: number;
   researchTimedOutAt?: number;
+  conversationKey?: string;
   captureAccepted?: boolean;
 } | { type: 'content:ping'; provider: ProviderId }
-  | { type: 'capture:dom-current'; provider: ProviderId }
-  | { type: 'capture:copy-now'; jobId: string }
+  | { type: 'capture:dom-current'; provider: ProviderId; runId?: RunId; conversationKey?: string }
+  | { type: 'capture:copy-now'; jobId: string; conversationKey?: string }
   | { type: 'content:stop'; runId: RunId };
 
 export async function sendRequest(request: RuntimeRequest): Promise<RuntimeResponse> {

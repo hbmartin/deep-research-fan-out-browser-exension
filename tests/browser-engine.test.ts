@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { injectionTestHooks, injectQuery } from '../src/injection';
 import { cloneVisibleContent, findElement } from '../src/selectors';
-import { ADAPTERS, providerFromUrl } from '../src/adapters';
+import { ADAPTERS, conversationKeyFromUrl, providerFromUrl } from '../src/adapters';
 
 function visible(element: HTMLElement): HTMLElement {
   element.style.position = 'fixed';
@@ -13,6 +13,15 @@ describe('selector engine', () => {
     expect(providerFromUrl('https://gemini.google.com/app/123')).toBe('gemini');
     expect(providerFromUrl('https://example.com/')).toBeUndefined();
     expect(providerFromUrl('not a URL')).toBeUndefined();
+  });
+
+  it('canonicalizes conversation URLs and rejects provider entry pages', () => {
+    expect(conversationKeyFromUrl(
+      'https://chatgpt.com/c/123/?utm_source=test&model=research#sources',
+      'chatgpt',
+    )).toBe('https://chatgpt.com/c/123?model=research');
+    expect(conversationKeyFromUrl('https://claude.ai/new?utm_source=test&model=opus', 'claude')).toBeUndefined();
+    expect(conversationKeyFromUrl('https://example.com/c/123', 'chatgpt')).toBeUndefined();
   });
 
   it('uses ordered fallbacks and supports selecting the last result', () => {
@@ -103,6 +112,14 @@ describe('selector engine', () => {
     `;
     expect(findElement(ADAPTERS.gemini.selectors.streamingIndicator)).toBeNull();
     expect(findElement(ADAPTERS.grok.selectors.streamingIndicator)?.textContent).toBe('Searching…');
+  });
+
+  it.each([
+    ['gemini', 'Researching · 23 sources'],
+    ['grok', 'Researching · 23 sources'],
+  ] as const)('recognizes %s progress pills with source counts', (provider, label) => {
+    document.body.innerHTML = `<button style="position:fixed">${label}</button>`;
+    expect(findElement(ADAPTERS[provider].selectors.streamingIndicator)?.textContent).toBe(label);
   });
 
   it('checks each captured descendant style once instead of walking every ancestor', () => {

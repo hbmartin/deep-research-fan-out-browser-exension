@@ -26,6 +26,16 @@ describe('bounded response ownership', () => {
     const { roots, controls } = index();
     expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
   });
+  it('falls back from an unmounted aria-controls target to a unique plain wrapper', () => {
+    document.body.innerHTML = `<div><article>Report</article><button style="position:fixed" aria-controls="lazy-sources" aria-label="Copy response">Copy</button></div>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+  });
+  it('accepts a following control in a unique plain wrapper', () => {
+    document.body.innerHTML = `<div><article>Report</article>${copy}</div>`;
+    const { roots, controls } = index();
+    expect(controls.find(roots[0]!, selectors, new Set(), true)).toBe(document.querySelector('button'));
+  });
   it('does not assign a shared plain-container control to the nearest preceding response', () => {
     document.body.innerHTML = `<div><article>Earlier</article><article>Latest</article>${copy}</div>`;
     const { roots, controls } = index();
