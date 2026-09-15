@@ -92,7 +92,7 @@ function validCaptureJob(value: unknown): value is CaptureJob {
     && finiteNumber(value.attempts)
     && typeof value.domMarkdown === 'string'
     && Array.isArray(value.domCitations)
-    && optionalNumber(value.leasedAt)
+    && (value.state === 'leased' ? finiteNumber(value.leasedAt) : optionalNumber(value.leasedAt))
     && optionalNumber(value.orphanedAt)
     && optionalNumber(value.deferredAt)
     && optionalString(value.conversationKey)

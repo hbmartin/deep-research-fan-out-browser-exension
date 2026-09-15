@@ -64,6 +64,26 @@ describe('run history', () => {
     await deleteJob(invalid.id);
   });
 
+  it('requires a finite lease timestamp only for leased capture jobs', async () => {
+    const valid: CaptureJob = {
+      id: 'lease-valid', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      state: 'leased', createdAt: Date.now(), leasedAt: Date.now(), attempts: 1,
+      domMarkdown: 'Report', domCitations: [],
+    };
+    const jobs = [
+      valid,
+      { ...valid, id: 'lease-missing', leasedAt: undefined },
+      { ...valid, id: 'lease-string', leasedAt: 'yesterday' },
+      { ...valid, id: 'lease-infinite', leasedAt: Infinity },
+      { ...valid, id: 'queued-without-lease', state: 'queued', leasedAt: undefined },
+    ] as CaptureJob[];
+    for (const job of jobs) await putJob(job);
+    expect(await getJob(valid.id)).toMatchObject({ leasedAt: valid.leasedAt });
+    for (const job of jobs.slice(1, 4)) expect(await getJob(job.id)).toBeUndefined();
+    expect(await getJob('queued-without-lease')).toMatchObject({ state: 'queued' });
+    for (const job of jobs) await deleteJob(job.id);
+  });
+
   it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {
     const legacy = {
       id: 'legacy-run-12345678', query: 'Legacy query', createdAt: 1, windowId: 1, status: 'active', slug: 'legacy-query',

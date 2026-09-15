@@ -96,8 +96,9 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
     }));
   }
   if (providerRun.captureRecoveryPending) actions.append(button('Retry report', () => command({ type: 'provider:retry-capture', runId: run.id, provider }), 'secondary'));
-  if (isTerminalProviderStatus(providerRun.status) && !providerRun.captureRecoveryPending) actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
-  else actions.append(button('End provider', () => command({ type: 'provider:end', runId: run.id, provider }), 'danger'));
+  if (isTerminalProviderStatus(providerRun.status)) {
+    if (!providerRun.captureRecoveryPending) actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
+  } else actions.append(button('End provider', () => command({ type: 'provider:end', runId: run.id, provider }), 'danger'));
   row.append(actions);
   return row;
 }
