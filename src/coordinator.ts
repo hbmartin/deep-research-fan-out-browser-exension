@@ -4,10 +4,11 @@ import { reconcileCitations, tokenContainment, tokenSimilarity } from './citatio
 import { acceptCaptureJob, captureId, deleteJob, evictHistory, getCapture, getJob, getRedirect, getRun, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRedirect, putRun } from './db';
 import type { CurrentResponseSnapshot, ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
+import { classifyDirectoryError, getReportDirectoryConfig, markReportDirectoryNeedsReconnect, queryDirectoryPermission, writeUniqueMarkdown } from './report-storage';
 import { loadSettings } from './settings';
 import { normalizeResearchTrail } from './sources';
-import { canTransition, assertTransition, createDownloadFolder, deriveRunStatus, isSetupProviderStatus, slugify } from './state';
-import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type Run } from './types';
+import { canTransition, assertTransition, createDownloadFolder, createReportFolder, deriveRunStatus, isSetupProviderStatus, slugify } from './state';
+import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type ArtifactSaveFallbackReason, type Capture, type CaptureJob, type DomCitation, type ProviderId, type ProviderRun, type ProviderRunStatus, type ReportDirectoryConfig, type Run } from './types';
 
 const ALARM_NAME = 'reconcile-runs';
 const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
@@ -22,6 +23,7 @@ const expectedTabActivations = new Map<number, number>();
 const finalizingRunIds = new Set<string>();
 const runMutationTails = new Map<string, Promise<void>>();
 const captureMutationTails = new Map<string, Promise<void>>();
+const artifactSaveMutationTails = new Map<string, Promise<void>>();
 let browserSessionIdPromise: Promise<string> | undefined;
 let fallbackBrowserSessionId: string | undefined;
 
@@ -101,7 +103,7 @@ function providerSnapshot(provider: ProviderRun): ProviderSnapshot {
 }
 
 interface VerifiedContentPage {
-  kind: 'entry' | 'conversation';
+  kind: 'entry' | 'conversation' | 'interrupted';
   conversationKey?: string;
 }
 
@@ -109,24 +111,36 @@ function verifyContentPage(
   providerRun: ProviderRun,
   sender: Browser.runtime.MessageSender,
   reportedConversationKey?: string,
+  allowInterruptedNavigation = false,
 ): VerifiedContentPage {
   if (sender.tab?.id !== providerRun.tabId) {
     throw new CoordinatorRequestError('Provider message came from a different or unavailable tab.', 'conversation_mismatch', providerSnapshot(providerRun));
   }
   const senderUrl = sender.url ?? sender.tab.url;
+  if (allowInterruptedNavigation) {
+    if (!isProviderUrl(senderUrl, providerRun.provider)) {
+      throw new CoordinatorRequestError('Interrupted provider message came from outside its provider.', 'conversation_mismatch', providerSnapshot(providerRun));
+    }
+    return { kind: 'interrupted' };
+  }
   const page = senderUrl ? classifyProviderPage(senderUrl, providerRun.provider) : { kind: 'unsupported' } as const;
   if (page.kind === 'unsupported') {
     throw new CoordinatorRequestError('Provider tab is not showing a supported conversation or entry page.', 'conversation_mismatch', providerSnapshot(providerRun));
   }
   const storedConversationKey = normalizeConversationKey(providerRun.conversationKey, providerRun.provider);
   const reportedKey = normalizeConversationKey(reportedConversationKey, providerRun.provider);
+  if ((providerRun.conversationKey !== undefined && storedConversationKey === undefined)
+    || (reportedConversationKey !== undefined && reportedKey === undefined)) {
+    throw new CoordinatorRequestError('Provider message contains an unrecognized conversation identity.', 'conversation_mismatch', providerSnapshot(providerRun));
+  }
   if (page.kind === 'entry') {
     if (providerRun.conversationKey !== undefined || reportedConversationKey !== undefined) {
       throw new CoordinatorRequestError('Provider tab left its verified conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
     }
     return { kind: 'entry' };
   }
-  if (!conversationKeysMatch(page.key, reportedKey, providerRun.provider)
+  if ((storedConversationKey !== undefined && reportedKey === undefined)
+    || (reportedKey !== undefined && !conversationKeysMatch(page.key, reportedKey, providerRun.provider))
     || (storedConversationKey && !conversationKeysMatch(storedConversationKey, page.key, providerRun.provider))) {
     throw new CoordinatorRequestError('Provider tab is showing a different or unverified conversation.', 'conversation_mismatch', providerSnapshot(providerRun));
   }
@@ -264,6 +278,7 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
   const now = Date.now();
   const id = crypto.randomUUID();
   const slug = slugify(query);
+  const reportFolder = createReportFolder(slug, id);
   const tabs = await Promise.all(enabled.map((provider) => browser.tabs.create({ windowId: currentWindow.id, url: ADAPTERS[provider].entryUrl, active: false })));
   const providerRuns: Run['providerRuns'] = {};
   enabled.forEach((provider, index) => {
@@ -291,7 +306,8 @@ async function createRun(queryInput: string, requestedWindowId?: number): Promis
     providerRuns,
     status: 'active',
     slug,
-    downloadFolder: createDownloadFolder(settings.downloadRoot, now, slug, id),
+    reportFolder,
+    downloadFolder: createDownloadFolder(settings.downloadRoot, slug, id),
   };
   const tabIds = tabs.flatMap((tab) => tab.id === undefined ? [] : [tab.id]);
   const updateTab = browser.tabs.update as unknown as (tabId: number, properties: Record<string, unknown>) => Promise<unknown>;
@@ -323,11 +339,13 @@ async function mutateProvider(
   const { run, value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
     if (!providerRun) throw new CoordinatorRequestError('Provider run not found.', 'run_not_found');
-    const verifiedPage = verifyContentPage(providerRun, sender ?? {}, conversationKey);
+    const verifiedPage = verifyContentPage(providerRun, sender ?? {}, conversationKey, status === 'interrupted');
     validateProviderTransition(providerRun, status);
     const previousConversationKey = normalizeConversationKey(providerRun.conversationKey, provider);
-    const conversationBound = previousConversationKey === undefined && verifiedPage.conversationKey !== undefined;
-    providerRun.conversationKey = verifiedPage.conversationKey ?? previousConversationKey;
+    const conversationBound = providerRun.conversationKey === undefined && verifiedPage.conversationKey !== undefined;
+    if (verifiedPage.kind !== 'interrupted') {
+      providerRun.conversationKey = verifiedPage.conversationKey ?? previousConversationKey;
+    }
     const timeout = reason === 'research_timeout' && status === 'manual_required';
     const changed = providerRun.status !== status || providerRun.statusDetail !== detail;
     const firstTimeout = timeout && providerRun.researchTimedOutAt === undefined;
@@ -349,6 +367,9 @@ async function mutateProvider(
   });
   // The state is durable. UI side effects must not invalidate its acknowledgement.
   try {
+    if (changed && isTerminalProviderStatus(status)) await saveProviderArtifact(runId, provider).catch((error) => {
+      console.error(`Could not immediately save the ${provider} artifact.`, error);
+    });
     if (changed && (status === 'awaiting_user' || status === 'manual_required')) {
       await createPlatform().notify(`attention:${runId}:${provider}`, `${ADAPTERS[provider].label} needs your input`, detail || 'Open the provider tab to continue.');
     }
@@ -651,9 +672,8 @@ async function completeProviderCapture(runId: string, provider: ProviderId, capt
     providerRun.captureId = captureIdValue;
     providerRun.degraded ||= degraded;
     if (isTerminalProviderStatus(providerRun.status)) {
-      if (captureChanged && providerRun.downloadedAt) {
-        providerRun.downloadedAt = undefined;
-        providerRun.downloadId = undefined;
+      if (captureChanged && providerRun.saveReceipt) {
+        providerRun.saveReceipt = undefined;
         storedRun.completedAt = undefined;
       }
       storedRun.status = deriveRunStatus(storedRun);
@@ -667,6 +687,9 @@ async function completeProviderCapture(runId: string, provider: ProviderId, capt
     return { completed: true, attached: true };
   });
   if (!value.attached) return false;
+  await saveProviderArtifact(runId, provider).catch((error) => {
+    console.error(`Could not immediately save the ${provider} artifact.`, error);
+  });
   if (value.completed) {
     await createPlatform().notify(`complete:${runId}:${provider}`, `${ADAPTERS[provider].label} finished`, 'The normalized report is ready.');
   }
@@ -687,6 +710,9 @@ async function failProviderIfActive(runId: string, provider: ProviderId, detail:
     return true;
   });
   if (!failed) return;
+  await saveProviderArtifact(runId, provider).catch((error) => {
+    console.error(`Could not immediately save the ${provider} failure artifact.`, error);
+  });
   await maybeFinalize(run);
   await broadcastRuns();
 }
@@ -711,6 +737,9 @@ async function reconcilePersistedCaptureFailure(
       providerRun.completedAt ??= Date.now();
     }
     storedRun.status = deriveRunStatus(storedRun);
+  });
+  await saveProviderArtifact(runId, provider).catch((saveError) => {
+    console.error(`Could not immediately save the ${provider} artifact.`, saveError);
   });
   await maybeFinalize(run);
   await broadcastRuns();
@@ -874,21 +903,61 @@ async function queueCapture(
   return run;
 }
 
-async function downloadProvider(runId: string, provider: ProviderId, force = false): Promise<boolean> {
-  const run = await getRun(runId);
-  const providerRun = run?.providerRuns[provider];
-  if (!run || !providerRun || (!force && providerRun.downloadedAt)) return false;
-  const capture = await getCapture(providerRun.captureId);
-  const settings = await loadSettings();
-  const artifact = buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets });
-  const downloadId = await createPlatform().downloadText(`${run.downloadFolder}/${provider}.md`, artifact);
-  await mutateStoredRun(run.id, (storedRun) => {
-    const storedProviderRun = storedRun.providerRuns[provider];
-    if (!storedProviderRun) return;
-    storedProviderRun.downloadId = downloadId;
-    storedProviderRun.downloadedAt = Date.now();
+async function saveProviderArtifact(runId: string, provider: ProviderId, force = false): Promise<boolean> {
+  return serializeByKey(artifactSaveMutationTails, `${runId}:${provider}`, async () => {
+    const run = await getRun(runId);
+    const providerRun = run?.providerRuns[provider];
+    if (!run || !providerRun || !isTerminalProviderStatus(providerRun.status)) return false;
+    const capture = await getCapture(providerRun.captureId);
+    const filename = capture ? `${provider}.md` : `FAILED-${provider}.md`;
+    if (!force && providerRun.saveReceipt?.requestedRelativePath.endsWith(`/${filename}`)) return false;
+    const settings = await loadSettings();
+    const artifact = buildArtifact(run, providerRun, capture, { includeSourceSnippets: settings.includeSourceSnippets });
+    let fallbackReason: ArtifactSaveFallbackReason | undefined;
+    let directoryConfig: ReportDirectoryConfig | undefined;
+    try { directoryConfig = await getReportDirectoryConfig(); }
+    catch { fallbackReason = 'directory_unavailable'; }
+
+    if (directoryConfig) {
+      const permission = await queryDirectoryPermission(directoryConfig.handle);
+      if (permission === 'granted') {
+        try {
+          const path = await writeUniqueMarkdown(directoryConfig.handle, run.reportFolder, filename, artifact);
+          await mutateStoredRun(run.id, (storedRun) => {
+            const storedProviderRun = storedRun.providerRuns[provider];
+            if (!storedProviderRun) return;
+            storedProviderRun.saveReceipt = {
+              destination: 'directory',
+              ...path,
+              savedAt: Date.now(),
+            };
+          });
+          await markReportDirectoryNeedsReconnect(directoryConfig, false).catch(() => undefined);
+          return true;
+        } catch (error) {
+          fallbackReason = classifyDirectoryError(error);
+        }
+      } else {
+        fallbackReason = 'permission_required';
+      }
+      await markReportDirectoryNeedsReconnect(directoryConfig, true).catch(() => undefined);
+    }
+
+    const requestedRelativePath = `${run.downloadFolder}/${filename}`;
+    const downloadId = await createPlatform().downloadText(requestedRelativePath, artifact);
+    await mutateStoredRun(run.id, (storedRun) => {
+      const storedProviderRun = storedRun.providerRuns[provider];
+      if (!storedProviderRun) return;
+      storedProviderRun.saveReceipt = {
+        destination: 'downloads',
+        requestedRelativePath,
+        savedAt: Date.now(),
+        downloadId,
+        ...(fallbackReason ? { fallbackReason } : {}),
+      };
+    });
+    return true;
   });
-  return true;
 }
 
 async function maybeFinalize(runInput: Run): Promise<void> {
@@ -904,10 +973,10 @@ async function maybeFinalize(runInput: Run): Promise<void> {
     });
     if (!shouldFinalize) return;
     const providerRuns = Object.values(run.providerRuns);
-    const failedDownloads: string[] = [];
+    const failedSaves: string[] = [];
     for (const provider of PROVIDERS) {
       if (!run.providerRuns[provider]) continue;
-      try { await downloadProvider(run.id, provider); } catch { failedDownloads.push(provider); }
+      try { await saveProviderArtifact(run.id, provider); } catch { failedSaves.push(provider); }
     }
     const { run: completedRun } = await mutateStoredRun(run.id, (storedRun) => {
       storedRun.status = 'complete';
@@ -915,8 +984,13 @@ async function maybeFinalize(runInput: Run): Promise<void> {
     });
     if (completedRun.tabGroupId !== undefined) await browser.tabGroups.update(completedRun.tabGroupId, { collapsed: true }).catch(() => undefined);
     await evictHistory();
-    const count = providerRuns.length - failedDownloads.length;
-    await createPlatform().notify(`run:${run.id}`, 'Research run complete', `${count} of ${providerRuns.length} files saved${failedDownloads.length ? '; retry failed downloads from history.' : '.'}`);
+    const savedRun = await getRun(run.id);
+    const savedProviderRuns = savedRun ? Object.values(savedRun.providerRuns) : [];
+    const count = savedProviderRuns.filter((item) => item.saveReceipt).length;
+    const fallbackCount = savedProviderRuns.filter((item) => item.saveReceipt?.fallbackReason).length;
+    const fallbackText = fallbackCount ? ` ${fallbackCount} used Downloads fallback.` : '';
+    const failureText = failedSaves.length ? ' Retry failed saves from history.' : '';
+    await createPlatform().notify(`run:${run.id}`, 'Research run complete', `${count} of ${providerRuns.length} files saved.${fallbackText}${failureText}`);
   } finally {
     finalizingRunIds.delete(runId);
   }
@@ -953,6 +1027,9 @@ async function endProvider(runId: string, provider: ProviderId): Promise<void> {
     return true;
   });
   if (!ended) return;
+  await saveProviderArtifact(runId, provider).catch((error) => {
+    console.error(`Could not immediately save the ${provider} failure artifact.`, error);
+  });
   await maybeFinalize(run);
   await broadcastRuns();
 }
@@ -1021,6 +1098,9 @@ async function reconcileRuns(): Promise<void> {
             }
             storedRun.status = deriveRunStatus(storedRun);
           });
+          await saveProviderArtifact(snapshot.id, providerRun.provider).catch((error) => {
+            console.error(`Could not reconcile the ${providerRun.provider} artifact save.`, error);
+          });
         }
         const latest = await getRun(snapshot.id);
         if (latest) await maybeFinalize(latest);
@@ -1032,14 +1112,28 @@ async function reconcileRuns(): Promise<void> {
         let valid = false;
         try {
           const tab = await browser.tabs.get(providerRun.tabId);
-          providerPage = isProviderUrl(tab.url, providerRun.provider);
-          valid = providerPage || isProviderAuthenticationUrl(tab.url, providerRun.provider);
+          const page = tab.url
+            ? classifyProviderPage(tab.url, providerRun.provider)
+            : { kind: 'unsupported' } as const;
+          const storedConversationKey = normalizeConversationKey(providerRun.conversationKey, providerRun.provider);
+          const malformedStoredKey = providerRun.conversationKey !== undefined && storedConversationKey === undefined;
+          providerPage = !malformedStoredKey && (page.kind === 'entry'
+            ? providerRun.conversationKey === undefined
+            : page.kind === 'conversation' && (storedConversationKey === undefined
+              || conversationKeysMatch(storedConversationKey, page.key, providerRun.provider)));
+          valid = !malformedStoredKey
+            && (providerPage || isProviderAuthenticationUrl(tab.url, providerRun.provider));
         } catch {
           valid = false;
         }
         if (!valid && await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) continue;
         const checkedRun = await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
         const checkedProviderRun = checkedRun.providerRuns[providerRun.provider];
+        if (checkedProviderRun && isTerminalProviderStatus(checkedProviderRun.status)) {
+          await saveProviderArtifact(snapshot.id, providerRun.provider).catch((error) => {
+            console.error(`Could not reconcile the ${providerRun.provider} artifact save.`, error);
+          });
+        }
         if (providerPage && checkedProviderRun && !isTerminalProviderStatus(checkedProviderRun.status)) {
           await startContent(checkedRun, providerRun.provider, shouldResumeContentOnly(checkedProviderRun.status));
         }
@@ -1077,6 +1171,9 @@ async function interruptRemovedTab(tabId: number): Promise<void> {
     });
     if (!interrupted) continue;
     changed = true;
+    await saveProviderArtifact(match.runId, match.provider).catch((error) => {
+      console.error(`Could not immediately save the ${match.provider} failure artifact.`, error);
+    });
     await maybeFinalize(run);
   }
   await processCaptureQueue();
@@ -1142,10 +1239,10 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
         });
         return { ok: true };
       }
-      case 'provider:download': {
+      case 'provider:save': {
         const run = await getRun(message.runId);
         if (!run) throw new Error('Run not found.');
-        await downloadProvider(run.id, message.provider, true); await broadcastRuns(); return { ok: true };
+        await saveProviderArtifact(run.id, message.provider, true); await broadcastRuns(); return { ok: true };
       }
       case 'content:hello': {
         const tabId = sender.tab?.id;
@@ -1229,12 +1326,15 @@ export const coordinatorTestHooks = {
   recordTabActivation,
   setKnownRunTabs,
   processCaptureQueue,
+  completeProviderCapture,
+  saveProviderArtifact,
   reconcileRuns,
   reconcilePersistedCaptureFailure,
   resetBrowserSession: () => {
     browserSessionIdPromise = undefined;
     fallbackBrowserSessionId = undefined;
     captureMutationTails.clear();
+    artifactSaveMutationTails.clear();
     clipboardMutationTails.clear();
     contextMenuRegistrationTail = Promise.resolve();
   },

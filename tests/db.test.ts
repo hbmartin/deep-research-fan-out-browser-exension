@@ -1,7 +1,7 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { captureId, evictHistory, getCapture, getRedirect, listRuns, putCapture, putRedirect, putRun, REDIRECT_RETENTION_MS } from '../src/db';
+import { captureId, deleteReportDirectoryConfig, evictHistory, getCapture, getRedirect, getReportDirectoryConfig, getRun, listRuns, putCapture, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
 import type { Capture, Run } from '../src/types';
 
 const capture: Capture = {
@@ -16,7 +16,7 @@ describe('run history', () => {
       const storedCapture = captureId(id, 'chatgpt');
       const run: Run = {
         id, query: id, createdAt: index, completedAt: index + 1, windowId: 1, status: 'complete', slug: id,
-        downloadFolder: `deep-research/${id}`,
+        reportFolder: `${id}-00000000`, downloadFolder: `deep-research/${id}-00000000`,
         providerRuns: {
           chatgpt: {
             provider: 'chatgpt', tabId: index, status: 'complete', submittedQuery: id, appendString: '',
@@ -46,5 +46,43 @@ describe('run history', () => {
     await evictHistory(20);
     expect(await getRedirect('https://wrapper.test/old')).toBeUndefined();
     expect(await getRedirect('https://wrapper.test/current')).toBe('https://canonical.test/current');
+  });
+
+  it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {
+    const legacy = {
+      id: 'legacy-run-12345678', query: 'Legacy query', createdAt: 1, windowId: 1, status: 'active', slug: 'legacy-query',
+      downloadFolder: 'deep-research/2026-01-01_1200_legacy-query_legacyrun12345678',
+      providerRuns: {
+        chatgpt: {
+          provider: 'chatgpt', tabId: 1, status: 'complete', submittedQuery: 'Legacy query', appendString: '', attempts: 0,
+          degraded: false, adapterVersion: 'test', captureId: 'legacy:capture', downloadedAt: 123, downloadId: 9,
+        },
+        claude: {
+          provider: 'claude', tabId: 2, status: 'researching', submittedQuery: 'Legacy query', appendString: '', attempts: 0,
+          degraded: false, adapterVersion: 'test',
+        },
+      },
+    } as unknown as Run;
+    await putRun(legacy);
+
+    const migrated = await getRun(legacy.id);
+    expect(migrated).toMatchObject({
+      reportFolder: 'legacy-query-legacyru',
+      downloadFolder: 'deep-research/legacy-query-legacyru',
+      providerRuns: { chatgpt: { saveReceipt: { destination: 'downloads', savedAt: 123, downloadId: 9 } } },
+    });
+    expect(migrated?.providerRuns.chatgpt?.saveReceipt?.requestedRelativePath).toContain('2026-01-01_1200_legacy-query_legacyrun12345678/chatgpt.md');
+    expect(migrated?.providerRuns.chatgpt?.downloadedAt).toBeUndefined();
+  });
+
+  it('keeps the chosen directory configuration in the local database', async () => {
+    const config = {
+      handle: { name: 'Reports', kind: 'directory' } as FileSystemDirectoryHandle,
+      displayName: 'Reports', configuredAt: 456, needsReconnect: false,
+    };
+    await putReportDirectoryConfig(config);
+    expect(await getReportDirectoryConfig()).toEqual(config);
+    await deleteReportDirectoryConfig();
+    expect(await getReportDirectoryConfig()).toBeUndefined();
   });
 });

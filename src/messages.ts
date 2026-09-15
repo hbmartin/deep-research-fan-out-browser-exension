@@ -27,7 +27,7 @@ export type RuntimeRequest =
   | { type: 'provider:focus'; runId: RunId; provider: ProviderId }
   | { type: 'provider:copy'; runId: RunId; provider: ProviderId }
   | { type: 'provider:copy-current'; runId: RunId; provider: ProviderId }
-  | { type: 'provider:download'; runId: RunId; provider: ProviderId }
+  | { type: 'provider:save'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
   | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout'; conversationKey?: string }
   | { type: 'content:capture'; runId: RunId; provider: ProviderId; conversationKey?: string; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }

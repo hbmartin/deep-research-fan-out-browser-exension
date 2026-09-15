@@ -16,11 +16,28 @@ const platform = vi.hoisted(() => ({
   sendTabEvent: vi.fn<(_tabId: number, _event: unknown) => Promise<unknown>>(async () => undefined),
 }));
 const tabsGet = vi.hoisted(() => vi.fn<(_tabId: number) => Promise<Browser.tabs.Tab>>());
+const reportStorage = vi.hoisted(() => ({
+  config: undefined as { handle: FileSystemDirectoryHandle; displayName: string; configuredAt: number; needsReconnect: boolean } | undefined,
+  permission: 'granted' as PermissionState,
+  writeUniqueMarkdown: vi.fn(async (_handle: FileSystemDirectoryHandle, folder: string, filename: string) => ({
+    requestedRelativePath: `${folder}/${filename}`,
+    actualRelativePath: `${folder}/${filename}`,
+  })),
+  markNeedsReconnect: vi.fn(async () => undefined),
+}));
 
 vi.mock('../src/platform', () => ({
   createPlatform: () => platform,
   handleOffscreenResponse: () => false,
   sendTabEvent: platform.sendTabEvent,
+}));
+
+vi.mock('../src/report-storage', () => ({
+  classifyDirectoryError: () => 'write_failed',
+  getReportDirectoryConfig: async () => reportStorage.config,
+  markReportDirectoryNeedsReconnect: reportStorage.markNeedsReconnect,
+  queryDirectoryPermission: async () => reportStorage.permission,
+  writeUniqueMarkdown: reportStorage.writeUniqueMarkdown,
 }));
 
 import { coordinatorTestHooks } from '../src/coordinator';
@@ -31,7 +48,8 @@ function provider(id: ProviderId, tabId: number, status: ProviderRun['status']):
 
 function run(providerRuns: Run['providerRuns'], status: Run['status'] = 'active'): Run {
   const id = crypto.randomUUID();
-  return { id, browserSessionId: 'current-session', query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: id, downloadFolder: `deep-research/${id}` };
+  const reportFolder = `query-${id.replaceAll('-', '').slice(0, 8)}`;
+  return { id, browserSessionId: 'current-session', query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: 'query', reportFolder, downloadFolder: `deep-research/${reportFolder}` };
 }
 
 function contentSender(tabId = 1, url = 'https://chatgpt.com/'): Browser.runtime.MessageSender {
@@ -47,6 +65,13 @@ beforeEach(() => {
   platform.setBadge.mockClear();
   platform.sendTabEvent.mockReset().mockResolvedValue(undefined);
   tabsGet.mockReset();
+  reportStorage.config = undefined;
+  reportStorage.permission = 'granted';
+  reportStorage.writeUniqueMarkdown.mockReset().mockImplementation(async (_handle, folder, filename) => ({
+    requestedRelativePath: `${folder}/${filename}`,
+    actualRelativePath: `${folder}/${filename}`,
+  }));
+  reportStorage.markNeedsReconnect.mockReset().mockResolvedValue(undefined);
   vi.stubGlobal('browser', {
     runtime: { sendMessage: vi.fn(async () => undefined), getURL: vi.fn((path: string) => path) },
     storage: {
@@ -126,6 +151,117 @@ describe('coordinator run guards', () => {
     expect(await getRun(stored.id)).toMatchObject({ status: 'complete' });
   });
 
+  it('saves a terminal provider immediately with a FAILED filename when no capture exists', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 61, 'researching') });
+    await putRun(stored);
+
+    const response = await coordinatorTestHooks.handleRequest({
+      type: 'content:state', runId: stored.id, provider: 'chatgpt', status: 'failed', detail: 'Provider failed.',
+    }, contentSender(61));
+
+    expect(response.ok).toBe(true);
+    expect(platform.downloadText).toHaveBeenCalledTimes(1);
+    expect(platform.downloadText.mock.calls[0]?.[0]).toBe(`${stored.downloadFolder}/FAILED-chatgpt.md`);
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt).toMatchObject({ destination: 'downloads' });
+  });
+
+  it('writes to a persistently granted directory without invoking Downloads', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    const stored = run({ claude: provider('claude', 62, 'failed') });
+    await putRun(stored);
+
+    await coordinatorTestHooks.saveProviderArtifact(stored.id, 'claude');
+
+    expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledWith(
+      reportStorage.config.handle, stored.reportFolder, 'FAILED-claude.md', expect.stringContaining('# Claude report unavailable'),
+    );
+    expect(platform.downloadText).not.toHaveBeenCalled();
+    expect((await getRun(stored.id))?.providerRuns.claude?.saveReceipt).toMatchObject({
+      destination: 'directory', actualRelativePath: `${stored.reportFolder}/FAILED-claude.md`,
+    });
+  });
+
+  it('falls back immediately when directory permission is no longer granted', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    reportStorage.permission = 'prompt';
+    const stored = run({ gemini: provider('gemini', 63, 'failed') });
+    await putRun(stored);
+
+    await coordinatorTestHooks.saveProviderArtifact(stored.id, 'gemini');
+
+    expect(reportStorage.writeUniqueMarkdown).not.toHaveBeenCalled();
+    expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/FAILED-gemini.md`, expect.any(String));
+    expect(reportStorage.markNeedsReconnect).toHaveBeenCalledWith(reportStorage.config, true);
+    expect((await getRun(stored.id))?.providerRuns.gemini?.saveReceipt).toMatchObject({
+      destination: 'downloads', fallbackReason: 'permission_required',
+    });
+  });
+
+  it('leaves a provider retryable when both the directory and Downloads fail', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    reportStorage.writeUniqueMarkdown.mockRejectedValueOnce(new Error('disk full'));
+    platform.downloadText.mockRejectedValueOnce(new Error('downloads unavailable'));
+    const stored = run({ grok: provider('grok', 64, 'failed') });
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'grok')).rejects.toThrow('downloads unavailable');
+    expect((await getRun(stored.id))?.providerRuns.grok?.saveReceipt).toBeUndefined();
+    expect(reportStorage.markNeedsReconnect).toHaveBeenCalledWith(reportStorage.config, true);
+  });
+
+  it('reports unsaved retryable providers in the run-complete notification', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    reportStorage.writeUniqueMarkdown.mockRejectedValue(new Error('disk full'));
+    platform.downloadText.mockRejectedValue(new Error('downloads unavailable'));
+    const stored = run({ grok: provider('grok', 641, 'failed') });
+    await putRun(stored);
+
+    await coordinatorTestHooks.maybeFinalize(stored);
+
+    expect(await getRun(stored.id)).toMatchObject({ status: 'complete', providerRuns: { grok: { status: 'failed' } } });
+    expect((await getRun(stored.id))?.providerRuns.grok?.saveReceipt).toBeUndefined();
+    expect(platform.notify).toHaveBeenCalledWith(
+      `run:${stored.id}`, 'Research run complete', expect.stringMatching(/0 of 1 files saved.*Retry failed saves/),
+    );
+  });
+
+  it('uses a reconnected directory only for an explicit Save again after fallback', async () => {
+    const chatgpt = provider('chatgpt', 642, 'failed');
+    const stored = run({ chatgpt });
+    chatgpt.saveReceipt = {
+      destination: 'downloads', requestedRelativePath: `${stored.downloadFolder}/FAILED-chatgpt.md`, savedAt: 1,
+      fallbackReason: 'permission_required', downloadId: 8,
+    };
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt')).resolves.toBe(false);
+    expect(reportStorage.writeUniqueMarkdown).not.toHaveBeenCalled();
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt', true)).resolves.toBe(true);
+    expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledTimes(1);
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt?.destination).toBe('directory');
+  });
+
+  it('keeps the failure artifact and saves a normal filename for a late capture', async () => {
+    const chatgpt = provider('chatgpt', 65, 'failed');
+    const stored = run({ chatgpt });
+    await putRun(stored);
+    await coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt');
+    const id = `${stored.id}:chatgpt`;
+    await putCapture(id, {
+      rawMarkdown: 'Late report', normalizedMarkdown: 'Late report', citations: [], captureMethod: 'copy_only',
+      unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    });
+
+    await coordinatorTestHooks.completeProviderCapture(stored.id, 'chatgpt', id, false);
+
+    expect(platform.downloadText.mock.calls.map((call) => call[0])).toEqual([
+      `${stored.downloadFolder}/FAILED-chatgpt.md`,
+      `${stored.downloadFolder}/chatgpt.md`,
+    ]);
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt?.requestedRelativePath).toBe(`${stored.downloadFolder}/chatgpt.md`);
+  });
+
   it('interrupts only after three consecutive reconciliation failures and resets on success', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 7, 'researching') });
     await putRun(stored);
@@ -149,6 +285,41 @@ describe('coordinator run guards', () => {
     expect((await getRun(stored.id))?.providerRuns.gemini).toMatchObject({ status: 'researching' });
     expect((await getRun(stored.id))?.providerRuns.gemini?.reconcileFailureCount).toBeUndefined();
     expect(platform.sendTabEvent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'https://chatgpt.com/c/other',
+    'https://chatgpt.com/library',
+  ])('interrupts a bound run after three reconciliation checks on %s', async (url) => {
+    const stored = run({ chatgpt: provider('chatgpt', 9, 'researching') });
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound';
+    await putRun(stored);
+    tabsGet.mockResolvedValue({ id: 9, url } as Browser.tabs.Tab);
+
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'interrupted' });
+    expect(platform.downloadText).toHaveBeenCalledWith(
+      `${stored.downloadFolder}/FAILED-chatgpt.md`, expect.any(String),
+    );
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(9, expect.anything());
+  });
+
+  it('interrupts an invalid legacy binding instead of rebinding it during reconciliation', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 10, 'researching') });
+    stored.providerRuns.chatgpt!.conversationKey = 'legacy-conversation-key';
+    await putRun(stored);
+    tabsGet.mockResolvedValue({ id: 10, url: 'https://chatgpt.com/c/current' } as Browser.tabs.Tab);
+
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'interrupted', conversationKey: 'legacy-conversation-key',
+    });
   });
 
   it('marks a positively removed provider tab interrupted immediately', async () => {
@@ -872,7 +1043,10 @@ describe('coordinator run guards', () => {
     await coordinatorTestHooks.processCaptureQueue();
     expect(platform.downloadText).not.toHaveBeenCalled();
     expect(platform.notify).not.toHaveBeenCalled();
-    expect(await getRun(stored.id)).toMatchObject({ completedAt: 123, providerRuns: { chatgpt: { downloadedAt: 123, downloadId: 99 } } });
+    expect(await getRun(stored.id)).toMatchObject({
+      completedAt: 123,
+      providerRuns: { chatgpt: { saveReceipt: { destination: 'downloads', savedAt: 123, downloadId: 99 } } },
+    });
   });
 
   it('leases an existing capture job before retrying a failed link', async () => {
@@ -940,6 +1114,7 @@ describe('coordinator run guards', () => {
     expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
       status: 'interrupted',
       statusDetail: 'Browser restarted before completion.',
+      saveReceipt: { destination: 'downloads', requestedRelativePath: `${stored.downloadFolder}/FAILED-chatgpt.md` },
     });
     expect(platform.sendTabEvent).not.toHaveBeenCalledWith(916, expect.objectContaining({ type: 'content:start' }));
   });
@@ -948,13 +1123,19 @@ describe('coordinator run guards', () => {
     const stored = run({ chatgpt: provider('chatgpt', 925, 'researching') });
     const id = `${stored.id}:chatgpt`;
     stored.browserSessionId = 'prior-session';
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
     await putRun(stored);
     await putCapture(id, {
       rawMarkdown: 'Recovered report', normalizedMarkdown: 'Recovered report', citations: [],
       captureMethod: 'copy_only', unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
     });
     await coordinatorTestHooks.reconcileRuns();
-    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', captureId: id });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'complete', captureId: id, saveReceipt: { destination: 'directory', actualRelativePath: `${stored.reportFolder}/chatgpt.md` },
+    });
+    expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledWith(
+      reportStorage.config.handle, stored.reportFolder, 'chatgpt.md', expect.stringContaining('Recovered report'),
+    );
     expect(platform.notify).toHaveBeenCalledWith(`complete:${stored.id}:chatgpt`, 'ChatGPT finished', expect.any(String));
   });
 
@@ -1059,6 +1240,64 @@ describe('durable acceptance and state recovery regressions', () => {
     });
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey)
       .toBe('https://chatgpt.com/c/bound');
+  });
+  it('binds an unbound resumed submission from the sender conversation when the report omitted its key', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'submitting')});
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required',
+      detail:'Submission could not be confirmed.',
+    },contentSender(1, 'https://chatgpt.com/c/bound'))).resolves.toMatchObject({
+      ok:true,providerState:{status:'manual_required',conversationKey:'https://chatgpt.com/c/bound'},
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey)
+      .toBe('https://chatgpt.com/c/bound');
+  });
+  it.each([
+    'https://chatgpt.com/',
+    'https://chatgpt.com/c/other',
+    'https://chatgpt.com/library',
+  ])('accepts interruption from the owning provider tab on %s without rebinding', async (url) => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound';
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'interrupted',
+      conversationKey:'https://chatgpt.com/c/bound',
+    },contentSender(1, url))).resolves.toMatchObject({
+      ok:true,providerState:{status:'interrupted',conversationKey:'https://chatgpt.com/c/bound'},
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey)
+      .toBe('https://chatgpt.com/c/bound');
+  });
+  it.each([
+    ['another tab', contentSender(2, 'https://chatgpt.com/library')],
+    ['another origin', contentSender(1, 'https://example.com/')],
+  ])('rejects interruption from %s', async (_label, sender) => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound';
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'interrupted',
+      conversationKey:'https://chatgpt.com/c/bound',
+    },sender)).resolves.toMatchObject({ok:false,code:'conversation_mismatch'});
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('researching');
+  });
+  it('fails closed when a persisted conversation key cannot be normalized', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'legacy-conversation-key';
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+      conversationKey:'https://chatgpt.com/c/current',
+    },contentSender(1, 'https://chatgpt.com/c/current'))).resolves.toMatchObject({
+      ok:false,code:'conversation_mismatch',
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey).toBe('legacy-conversation-key');
   });
   it('persists the first conversation key and rejects later unavailable or different keys', async () => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});

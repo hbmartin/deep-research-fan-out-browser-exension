@@ -74,6 +74,14 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
   row.append(summary);
   if (providerRun.statusDetail) row.append(element('p', 'detail', providerRun.statusDetail));
   if (providerRun.degraded) row.append(element('p', 'warning', 'Captured or launched through a degraded fallback.'));
+  if (providerRun.saveReceipt) {
+    const destination = providerRun.saveReceipt.destination === 'directory'
+      ? 'Selected folder'
+      : providerRun.saveReceipt.fallbackReason ? 'Downloads fallback' : 'Downloads';
+    const receipt = element('p', 'save-receipt', `Saved to ${destination} · ${new Date(providerRun.saveReceipt.savedAt).toLocaleString()}`);
+    receipt.title = providerRun.saveReceipt.actualRelativePath ?? providerRun.saveReceipt.requestedRelativePath;
+    row.append(receipt);
+  }
   const actions = element('div', 'actions');
   actions.append(button('Open', () => command({ type: 'provider:focus', runId: run.id, provider }), 'secondary'));
   if (providerRun.status === 'complete') {
@@ -87,7 +95,7 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
       setNotice(`${ADAPTERS[provider].label} current response copied.`);
     }));
   }
-  if (isTerminalProviderStatus(providerRun.status)) actions.append(button('Download again', () => command({ type: 'provider:download', runId: run.id, provider }), 'secondary'));
+  if (isTerminalProviderStatus(providerRun.status)) actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
   else actions.append(button('End provider', () => command({ type: 'provider:end', runId: run.id, provider }), 'danger'));
   row.append(actions);
   return row;

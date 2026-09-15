@@ -1,38 +1,108 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
-import type { Capture, CaptureJob, ProviderId, Run, RunId } from './types';
+import { createReportFolder, slugify } from './state';
+import type { Capture, CaptureJob, ProviderId, ReportDirectoryConfig, Run, RunId } from './types';
 
 interface ResearchDb extends DBSchema {
   runs: { key: string; value: Run; indexes: { 'by-created': number; 'by-status': string } };
   captures: { key: string; value: Capture };
   jobs: { key: string; value: CaptureJob; indexes: { 'by-created': number; 'by-state': string } };
   redirects: { key: string; value: { wrapper: string; canonical: string; resolvedAt: number } };
+  configuration: { key: string; value: ReportDirectoryConfig };
 }
 
 let databasePromise: Promise<IDBPDatabase<ResearchDb>> | undefined;
 
 export const MAX_CAPTURE_ATTEMPTS = 3;
 export const REDIRECT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const REPORT_DIRECTORY_KEY = 'report-directory';
+
+function migrateRun(run: Run): boolean {
+  let changed = false;
+  const legacyDownloadFolder = run.downloadFolder;
+  const reportFolder = run.reportFolder || createReportFolder(run.slug || slugify(run.query), run.id);
+  if (run.reportFolder !== reportFolder) {
+    run.reportFolder = reportFolder;
+    changed = true;
+  }
+  const downloadRoot = legacyDownloadFolder?.split('/').filter(Boolean)[0] || 'deep-research';
+  const downloadFolder = `${downloadRoot}/${reportFolder}`;
+  if (run.downloadFolder !== downloadFolder) {
+    run.downloadFolder = downloadFolder;
+    changed = true;
+  }
+  for (const providerRun of Object.values(run.providerRuns)) {
+    if (!providerRun.saveReceipt && providerRun.downloadedAt !== undefined) {
+      const filename = providerRun.captureId ? `${providerRun.provider}.md` : `FAILED-${providerRun.provider}.md`;
+      const relativePath = `${legacyDownloadFolder}/${filename}`;
+      providerRun.saveReceipt = {
+        destination: 'downloads',
+        requestedRelativePath: relativePath,
+        savedAt: providerRun.downloadedAt,
+        downloadId: providerRun.downloadId,
+      };
+      changed = true;
+    }
+    if (providerRun.downloadedAt !== undefined || providerRun.downloadId !== undefined) {
+      delete providerRun.downloadedAt;
+      delete providerRun.downloadId;
+      changed = true;
+    }
+  }
+  return changed;
+}
 
 function db(): Promise<IDBPDatabase<ResearchDb>> {
-  databasePromise ??= openDB<ResearchDb>('deep-research-fan-out', 1, {
-    upgrade(database) {
-      const runs = database.createObjectStore('runs', { keyPath: 'id' });
-      runs.createIndex('by-created', 'createdAt');
-      runs.createIndex('by-status', 'status');
-      const jobs = database.createObjectStore('jobs', { keyPath: 'id' });
-      jobs.createIndex('by-created', 'createdAt');
-      jobs.createIndex('by-state', 'state');
-      database.createObjectStore('captures');
-      database.createObjectStore('redirects', { keyPath: 'wrapper' });
+  databasePromise ??= openDB<ResearchDb>('deep-research-fan-out', 2, {
+    upgrade(database, oldVersion, _newVersion, transaction) {
+      if (oldVersion < 1) {
+        const runs = database.createObjectStore('runs', { keyPath: 'id' });
+        runs.createIndex('by-created', 'createdAt');
+        runs.createIndex('by-status', 'status');
+        const jobs = database.createObjectStore('jobs', { keyPath: 'id' });
+        jobs.createIndex('by-created', 'createdAt');
+        jobs.createIndex('by-state', 'state');
+        database.createObjectStore('captures');
+        database.createObjectStore('redirects', { keyPath: 'wrapper' });
+      }
+      if (oldVersion < 2) {
+        database.createObjectStore('configuration');
+        if (oldVersion >= 1) {
+          const store = transaction.objectStore('runs');
+          void (async () => {
+            let cursor = await store.openCursor();
+            while (cursor) {
+              const run = cursor.value;
+              if (migrateRun(run)) await cursor.update(run);
+              cursor = await cursor.continue();
+            }
+          })().catch(() => transaction.abort());
+        }
+      }
     },
   });
   return databasePromise;
 }
 
-export async function putRun(run: Run): Promise<void> { await (await db()).put('runs', run); }
-export async function getRun(id: RunId): Promise<Run | undefined> { return (await db()).get('runs', id); }
+export async function putRun(run: Run): Promise<void> {
+  migrateRun(run);
+  await (await db()).put('runs', run);
+}
+export async function getRun(id: RunId): Promise<Run | undefined> {
+  const database = await db();
+  const run = await database.get('runs', id);
+  if (run && migrateRun(run)) await database.put('runs', run);
+  return run;
+}
 export async function listRuns(): Promise<Run[]> {
-  return (await (await db()).getAllFromIndex('runs', 'by-created')).sort((a, b) => b.createdAt - a.createdAt);
+  const database = await db();
+  const runs = await database.getAllFromIndex('runs', 'by-created');
+  const migrated = runs.filter(migrateRun);
+  if (migrated.length) {
+    const transaction = database.transaction('runs', 'readwrite');
+    for (const run of migrated) await transaction.store.put(run);
+    await transaction.done;
+  }
+  return runs.sort((a, b) => b.createdAt - a.createdAt);
 }
 export async function putCapture(id: string, capture: Capture): Promise<void> { await (await db()).put('captures', capture, id); }
 export async function getCapture(id?: string): Promise<Capture | undefined> { return id ? (await db()).get('captures', id) : undefined; }
@@ -64,6 +134,18 @@ export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
 export async function getRedirect(wrapper: string): Promise<string | undefined> { return (await db()).get('redirects', wrapper).then((item) => item?.canonical); }
 export async function putRedirect(wrapper: string, canonical: string, resolvedAt = Date.now()): Promise<void> {
   await (await db()).put('redirects', { wrapper, canonical, resolvedAt });
+}
+
+export async function getReportDirectoryConfig(): Promise<ReportDirectoryConfig | undefined> {
+  return (await db()).get('configuration', REPORT_DIRECTORY_KEY);
+}
+
+export async function putReportDirectoryConfig(config: ReportDirectoryConfig): Promise<void> {
+  await (await db()).put('configuration', config, REPORT_DIRECTORY_KEY);
+}
+
+export async function deleteReportDirectoryConfig(): Promise<void> {
+  await (await db()).delete('configuration', REPORT_DIRECTORY_KEY);
 }
 
 export async function evictHistory(limit = 20): Promise<void> {

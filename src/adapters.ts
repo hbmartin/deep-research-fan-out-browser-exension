@@ -14,7 +14,8 @@ export interface ProviderAdapter {
   origin: string;
   authenticationOrigins?: readonly string[];
   entryUrl: string;
-  conversationPathPattern: RegExp;
+  entryPathPatterns: readonly RegExp[];
+  conversationPathPatterns: readonly RegExp[];
   composerKind: 'contenteditable' | 'textarea';
   submitStrategy: 'button' | 'enter';
   citationMarkerStyle: 'numeric_bracket' | 'superscript' | 'markdown_link' | 'none';
@@ -51,13 +52,17 @@ const progressFollowup = String.raw`(?:(?:(?:this|that|it|the (?:research|search
 const commonProgressResponse = new RegExp(`^${progressOpening}(?:\\s+[^.!?…]{0,200})?\\s*[.!?…]*(?:\\s+${progressFollowup})?$`, 'i');
 const commonQuotaResponse = /^(?:(?:sorry|unfortunately)[,.!]?\s*)?(?:(?:you(?:'ve| have)?|your account has)\s+)?(?:reached|hit|exceeded)\s+(?:your\s+)?(?:(?:deepsearch|deep research|research|usage)\s+)?limit\b|^(?:your\s+)?(?:deepsearch|deep research|research|usage)\s+limit\s+(?:has been\s+)?(?:reached|exceeded)\b|^(?:deepsearch|deep research|research)\s+(?:is\s+)?unavailable\b|^upgrade\b.{0,80}\b(?:deepsearch|deep research|research)\b/i;
 const commonCopyButton: SelectorChain = [{ kind: 'aria', role: 'button', name: /^(?:copy|copy response)$/i, pick: 'last' }];
+const streamingDuration = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
+const streamingActivity = String.raw`(?:(?:reading|searching|reviewing|analy[sz]ing|browsing|checking|visiting|summari[sz]ing|collecting|consulting)\s+(?:the\s+)?(?:web|sites?|sources?|pages?|results?|documents?))`;
+const streamingSuffix = String.raw`(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?(?:\d+\s+sources?|${streamingDuration}|${streamingActivity}))?`;
 
 export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   chatgpt: {
     // Success markers verified in tests/fixtures/chatgpt-copy-feedback.json.
     copySuccessSelector: '[data-copy-state="copied"], svg use[href="#lightweight-conversation-check"]',
     id: 'chatgpt', label: 'ChatGPT', version: 'chatgpt@0.2.1', origin: 'https://chatgpt.com', entryUrl: 'https://chatgpt.com/',
-    conversationPathPattern: /^\/c\/[^/]+$/,
+    entryPathPatterns: [/^\/$/],
+    conversationPathPatterns: [/^\/c\/[^/]+$/, /^\/g\/[^/]+\/c\/[^/]+$/],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     clarifyingPromptPattern: /^(?:(?:great|thanks|thank you|sure|certainly|absolutely|of course|i can help with that)[^.!?]{0,120}[.!?—,:-]\s*)?(?:before i begin\b|could you (?:please )?(?:clarify|specify)\b)/i,
     progressResponsePattern: commonProgressResponse,
@@ -79,7 +84,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   },
   claude: {
     id: 'claude', label: 'Claude', version: 'claude@0.1.1', origin: 'https://claude.ai', entryUrl: 'https://claude.ai/new',
-    conversationPathPattern: /^\/chat\/[^/]+$/,
+    entryPathPatterns: [/^\/new$/],
+    conversationPathPatterns: [/^\/chat\/[^/]+$/],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     progressResponsePattern: commonProgressResponse,
     quotaResponsePattern: commonQuotaResponse,
@@ -99,7 +105,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   },
   gemini: {
     id: 'gemini', label: 'Gemini', version: 'gemini@0.1.2', origin: 'https://gemini.google.com', entryUrl: 'https://gemini.google.com/app',
-    conversationPathPattern: /^\/app\/(?!download$)[^/]+$/,
+    entryPathPatterns: [/^\/(?:u\/\d+\/)?app$/],
+    conversationPathPatterns: [/^\/(?:u\/\d+\/)?app\/(?!download$)[^/]+$/],
     authenticationOrigins: ['https://accounts.google.com'],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'superscript', urlResolution: 'follow_redirect',
     progressResponsePattern: commonProgressResponse,
@@ -110,7 +117,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /tools|deep research/i }, { kind: 'text', value: /deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deep research/i }, { kind: 'text', value: /^deep research$/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep research" i]' }, { kind: 'css', value: '[data-test-id="deep-research-chip"]' }, { kind: 'css', value: '[data-state="selected"][aria-label*="deep research" i]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: /^(?:researching|working on it)(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?\d+\s+sources?)?$/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop response|stop/i }, { kind: 'text', value: new RegExp(`^(?:researching|thinking|working on it)${streamingSuffix}$`, 'i') }],
       finalMessageRoot: [{ kind: 'css', value: 'model-response', pick: 'last' }, { kind: 'css', value: '[data-test-id="model-response"]', pick: 'last' }],
       copyButton: commonCopyButton,
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
@@ -122,7 +129,8 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
   },
   grok: {
     id: 'grok', label: 'Grok', version: 'grok@0.2.2', origin: 'https://grok.com', entryUrl: 'https://grok.com/',
-    conversationPathPattern: /^\/c\/[^/]+$/,
+    entryPathPatterns: [/^\/$/],
+    conversationPathPatterns: [/^\/c\/[^/]+$/],
     composerKind: 'contenteditable', submitStrategy: 'button', citationMarkerStyle: 'markdown_link', urlResolution: 'none',
     progressResponsePattern: commonProgressResponse,
     quotaResponsePattern: commonQuotaResponse,
@@ -132,7 +140,7 @@ export const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
       modeEntry: [{ kind: 'aria', role: 'button', name: /deepsearch|deep research|mode/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeOption: [{ kind: 'aria', role: 'menuitem', name: /deepsearch|deep research/i }, { kind: 'text', value: /deepsearch|deep research/i }],
       modeConfirmed: [{ kind: 'css', value: 'button[aria-pressed="true"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-state="on"][aria-label*="deep" i]' }, { kind: 'css', value: '[data-testid*="deep"][aria-pressed="true"]' }],
-      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: /^(?:searching|thinking|researching)(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?\d+\s+sources?)?$/i }],
+      streamingIndicator: [{ kind: 'aria', role: 'button', name: /stop/i }, { kind: 'text', value: new RegExp(`^(?:searching|thinking|researching)${streamingSuffix}$`, 'i') }],
       finalMessageRoot: [{ kind: 'css', value: '[data-testid="assistant-message"]', pick: 'last' }, { kind: 'css', value: 'article', pick: 'last' }],
       copyButton: [{ kind: 'aria', role: 'button', name: /^copy response$/i, pick: 'last' }],
       citationAnchors: [{ kind: 'css', value: 'a[href^="http"]' }],
@@ -175,9 +183,14 @@ export function classifyProviderPage(value: string | URL, provider: ProviderId):
     const adapter = ADAPTERS[provider];
     if (url.origin !== adapter.origin) return { kind: 'unsupported' };
     const pathname = canonicalPath(url.pathname);
-    if (pathname === canonicalPath(new URL(adapter.entryUrl).pathname)) return { kind: 'entry' };
-    adapter.conversationPathPattern.lastIndex = 0;
-    return adapter.conversationPathPattern.test(pathname)
+    if (adapter.entryPathPatterns.some((pattern) => {
+      pattern.lastIndex = 0;
+      return pattern.test(pathname);
+    })) return { kind: 'entry' };
+    return adapter.conversationPathPatterns.some((pattern) => {
+      pattern.lastIndex = 0;
+      return pattern.test(pathname);
+    })
       ? { kind: 'conversation', key: `${adapter.origin}${pathname}` }
       : { kind: 'unsupported' };
   } catch {

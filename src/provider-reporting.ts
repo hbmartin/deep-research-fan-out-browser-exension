@@ -73,7 +73,9 @@ export class ProviderReporter {
           } catch (error) {
             if (this.stopped) break;
             if (error instanceof ContentMessageError && error.code) {
-              this.rejected.set(item.key, error);
+              // Conversation identity can change while a provider SPA navigates.
+              // Let a later inspection retry after the page and local binding settle.
+              if (error.code !== 'conversation_mismatch') this.rejected.set(item.key, error);
               item.reject(error);
               this.rejectedReport(error);
               break;

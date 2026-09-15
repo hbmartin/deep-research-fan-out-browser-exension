@@ -6,6 +6,7 @@ import type { DomCitation } from './types';
 const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
 const DOM_ONLY_COMPLETION_MIN_MS = 30_000;
 const RESPONSE_CONTENT_EXCLUSIONS = 'button, script, style, svg, form, input, textarea';
+const ACTIVITY_CITATION_CONTENT = 'a[href], sup, [data-testid*="citation" i], [data-test-id*="citation" i], [aria-label*="citation" i]';
 
 export function normalizeVisibleText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
@@ -85,6 +86,7 @@ export interface ResponseSnapshot {
   content: HTMLElement;
   text: string;
   activityText: string;
+  activityTextWithoutCitations: string;
 }
 
 const DURATION = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
@@ -149,11 +151,14 @@ export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
   for (const element of Array.from(activityContent.querySelectorAll('*'))) {
     if (isElapsedTimerElement(element, false)) element.remove();
   }
+  const activityText = normalizeActivityText(structurallySeparatedText(activityContent));
+  activityContent.querySelectorAll(ACTIVITY_CITATION_CONTENT).forEach((element) => element.remove());
   return {
     root,
     content,
     text: structurallySeparatedText(content),
-    activityText: normalizeActivityText(structurallySeparatedText(activityContent)),
+    activityText,
+    activityTextWithoutCitations: normalizeActivityText(structurallySeparatedText(activityContent)),
   };
 }
 
@@ -176,12 +181,12 @@ export function isClarifyingResponse(root: HTMLElement | null, pattern?: RegExp,
 export function isProgressResponse(root: HTMLElement | null, pattern?: RegExp, copyAvailable = false, snapshot?: ResponseSnapshot): boolean {
   if (!root) return false;
   const response = snapshot?.root === root ? snapshot : createResponseSnapshot(root);
-  const { content, text } = response;
+  const { content, activityText } = response;
   const hasReportBody = Array.from(content.querySelectorAll('p, li, table'))
     .some((element) => normalizeVisibleText(element.textContent ?? '').length >= 80);
   if (copyAvailable && content.querySelector('h1, h2, h3') && hasReportBody) return false;
-  if (isTextMatch(text, pattern, 1000)) return true;
-  if (text.length >= 40) return false;
+  if (isTextMatch(activityText, pattern, 1000)) return true;
+  if (activityText.length >= 40) return false;
   return Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
     .filter((button) => !isEffectivelyHidden(button, { extractionRoot: root }))
     .some((button) => isTextMatch(normalizeVisibleText(button.innerText || button.textContent || ''), pattern, 1000));
@@ -196,9 +201,11 @@ export interface FinalResponseBaseline {
   signatures: ReadonlySet<string>;
 }
 
-function finalResponseSignature(root: HTMLElement): string {
+function finalResponseSignature(root: HTMLElement, snapshot?: ResponseSnapshot): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
-  return stableId ? `id:${stableId}` : `text:${createResponseSnapshot(root).activityText}`;
+  if (stableId) return `id:${stableId}`;
+  const text = snapshot?.root === root ? snapshot.activityText : createResponseSnapshot(root).activityText;
+  return `text:${text}`;
 }
 
 export function finalResponseFingerprint(root: HTMLElement, snapshot?: ResponseSnapshot): string {
@@ -234,10 +241,14 @@ export function evaluateStableResponse(
 export function createFinalResponseBaseline(roots: readonly HTMLElement[]): FinalResponseBaseline {
   return {
     roots: new Set(roots),
-    signatures: new Set(roots.map(finalResponseSignature)),
+    signatures: new Set(roots.map((root) => finalResponseSignature(root))),
   };
 }
 
-export function isNewFinalResponse(root: HTMLElement | null, baseline: FinalResponseBaseline): root is HTMLElement {
-  return Boolean(root && !baseline.roots.has(root) && !baseline.signatures.has(finalResponseSignature(root)));
+export function isNewFinalResponse(
+  root: HTMLElement | null,
+  baseline: FinalResponseBaseline,
+  snapshot?: ResponseSnapshot,
+): root is HTMLElement {
+  return Boolean(root && !baseline.roots.has(root) && !baseline.signatures.has(finalResponseSignature(root, snapshot)));
 }
