@@ -64,6 +64,7 @@ describe('side-panel rendering', () => {
 
     const copyCurrent = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Copy current');
     expect(copyCurrent).toBeInstanceOf(HTMLButtonElement);
+    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).toContain('End provider');
     copyCurrent!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:copy-current', runId: 'run', provider: 'chatgpt',
@@ -87,6 +88,7 @@ describe('side-panel rendering', () => {
     runtimeListener?.({ type: 'runs:changed', runs: [completed] });
     await vi.waitFor(() => expect(document.querySelector('.save-receipt')?.textContent).toContain('Downloads fallback'));
     const saveAgain = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Save again');
+    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('End provider');
     saveAgain!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:save', runId: 'run', provider: 'chatgpt',
@@ -97,6 +99,8 @@ describe('side-panel rendering', () => {
     } }] });
     const retryReport = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Retry report');
     expect(retryReport).toBeInstanceOf(HTMLButtonElement);
+    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('End provider');
+    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('Save again');
     retryReport!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:retry-capture', runId: 'run', provider: 'chatgpt',
