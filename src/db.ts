@@ -102,6 +102,16 @@ function validCaptureJob(value: unknown): value is CaptureJob {
     && (value.copyControlObserved === undefined || typeof value.copyControlObserved === 'boolean');
 }
 
+function normalizeCaptureJobRecord(value: unknown): { job?: CaptureJob; changed: boolean } {
+  if (validCaptureJob(value)) return { job: value, changed: false };
+  if (!record(value) || value.state !== 'leased' || finiteNumber(value.leasedAt)) {
+    return { changed: false };
+  }
+  const repaired: Record<string, unknown> = { ...value, state: 'queued' };
+  delete repaired.leasedAt;
+  return validCaptureJob(repaired) ? { job: repaired, changed: true } : { changed: false };
+}
+
 function normalizeRunRecord(value: unknown): { run?: Run; changed: boolean } {
   if (!record(value)
     || typeof value.id !== 'string' || !value.id
@@ -283,10 +293,16 @@ export async function getCapture(id?: string): Promise<Capture | undefined> {
   await transaction.done;
   return capture;
 }
-export async function putJob(job: CaptureJob): Promise<void> { await (await db()).put('jobs', job); }
+export async function putJob(job: CaptureJob): Promise<void> {
+  if (!validCaptureJob(job)) throw new Error('Cannot persist a malformed capture job.');
+  await (await db()).put('jobs', job);
+}
 export async function getJob(id: string): Promise<CaptureJob | undefined> {
-  const stored = await (await db()).get('jobs', id);
-  return validCaptureJob(stored) ? stored : undefined;
+  const transaction = (await db()).transaction('jobs', 'readwrite');
+  const normalized = normalizeCaptureJobRecord(await transaction.store.get(id));
+  if (normalized.changed) await transaction.store.put(normalized.job!);
+  await transaction.done;
+  return normalized.job;
 }
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
 
@@ -298,8 +314,14 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
     const normalized = stored ? normalizeRunRecord(stored) : { run: undefined, changed: false };
     if (stored && !normalized.run) warnInvalidRun(stored);
     const run = validate(normalized.run);
+    if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
+    if (!validCaptureJob(job)) throw new Error('Cannot persist a malformed capture job.');
     const existing = await transaction.objectStore('jobs').get(job.id);
-    if (!existing) await transaction.objectStore('jobs').put(job);
+    if (existing) {
+      const normalizedJob = normalizeCaptureJobRecord(existing);
+      if (!normalizedJob.job) throw new Error('Cannot accept capture over a malformed stored job.');
+      if (normalizedJob.changed) await transaction.objectStore('jobs').put(normalizedJob.job);
+    } else await transaction.objectStore('jobs').put(job);
     await transaction.objectStore('runs').put(run);
     await transaction.done;
     return run;
@@ -311,8 +333,16 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
 }
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();
-  const jobs = (await database.getAllFromIndex('jobs', 'by-created'))
-    .filter(validCaptureJob).sort((a, b) => a.createdAt - b.createdAt);
+  const transaction = database.transaction('jobs', 'readwrite');
+  const jobs: CaptureJob[] = [];
+  for (const stored of await transaction.store.index('by-created').getAll()) {
+    const normalized = normalizeCaptureJobRecord(stored);
+    if (!normalized.job) continue;
+    if (normalized.changed) await transaction.store.put(normalized.job);
+    jobs.push(normalized.job);
+  }
+  await transaction.done;
+  jobs.sort((a, b) => a.createdAt - b.createdAt);
   for (const job of jobs) {
     if (job.state === 'paused') continue;
     if (job.state === 'orphaned') {
@@ -323,7 +353,7 @@ export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
     }
     const run = await getRun(job.runId);
     if (run?.providerRuns[job.provider]?.captureRecoveryPending) continue;
-    if (job.state !== 'queued' && !(job.leasedAt && Date.now() - job.leasedAt > 60_000)) continue;
+    if (job.state !== 'queued' && !(job.leasedAt !== undefined && Date.now() - job.leasedAt > 60_000)) continue;
     if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) return job;
     if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) return job;
   }

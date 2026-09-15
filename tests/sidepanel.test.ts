@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BackgroundEvent } from '../src/messages';
 import type { Run } from '../src/types';
 
+function providerActionLabels(): string[] {
+  const row = document.querySelector('.provider-row');
+  expect(row).toBeInstanceOf(HTMLLIElement);
+  return Array.from(row!.querySelectorAll('button'), (node) => node.textContent ?? '');
+}
+
 describe('side-panel rendering', () => {
   afterEach(() => {
     vi.resetModules();
@@ -64,7 +70,7 @@ describe('side-panel rendering', () => {
 
     const copyCurrent = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Copy current');
     expect(copyCurrent).toBeInstanceOf(HTMLButtonElement);
-    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).toContain('End provider');
+    expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'End provider']);
     copyCurrent!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:copy-current', runId: 'run', provider: 'chatgpt',
@@ -77,7 +83,7 @@ describe('side-panel rendering', () => {
       completedAt: 20,
       providerRuns: {
         chatgpt: {
-          ...update.providerRuns.chatgpt!, status: 'complete', completedAt: 20,
+          ...update.providerRuns.chatgpt!, status: 'complete', completedAt: 20, captureId: 'run:chatgpt',
           saveReceipt: {
             destination: 'downloads', requestedRelativePath: 'deep-research/run/chatgpt.md', savedAt: 20,
             fallbackReason: 'permission_required', downloadId: 7,
@@ -88,22 +94,42 @@ describe('side-panel rendering', () => {
     runtimeListener?.({ type: 'runs:changed', runs: [completed] });
     await vi.waitFor(() => expect(document.querySelector('.save-receipt')?.textContent).toContain('Downloads fallback'));
     const saveAgain = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Save again');
-    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('End provider');
+    expect(providerActionLabels()).toEqual(['Open', 'Copy', 'Save again']);
     saveAgain!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:save', runId: 'run', provider: 'chatgpt',
     }));
 
     runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
-      chatgpt: { ...completed.providerRuns.chatgpt!, status: 'failed', captureRecoveryPending: true },
+      chatgpt: { ...completed.providerRuns.chatgpt!, status: 'interrupted' },
+    } }] });
+    expect(providerActionLabels()).toEqual(['Open', 'Copy', 'Save again']);
+    const copyStored = Array.from(document.querySelectorAll<HTMLButtonElement>('.provider-row button')).find((node) => node.textContent === 'Copy');
+    copyStored!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:copy', runId: 'run', provider: 'chatgpt',
+    }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
+      chatgpt: {
+        ...completed.providerRuns.chatgpt!, status: 'failed', captureId: undefined,
+        saveReceipt: undefined, captureRecoveryPending: true,
+      },
     } }] });
     const retryReport = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Retry report');
     expect(retryReport).toBeInstanceOf(HTMLButtonElement);
-    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('End provider');
-    expect(Array.from(document.querySelectorAll('.provider-row button')).map((node) => node.textContent)).not.toContain('Save again');
+    expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'Retry report']);
     retryReport!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:retry-capture', runId: 'run', provider: 'chatgpt',
     }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
+      chatgpt: {
+        ...completed.providerRuns.chatgpt!, status: 'failed', captureId: undefined,
+        saveReceipt: undefined, captureRecoveryPending: undefined,
+      },
+    } }] });
+    expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'Save again']);
   });
 });

@@ -1,5 +1,6 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
+import { openDB } from 'idb';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { captureId, deleteJob, deleteReportDirectoryConfig, getCapture, getJob, getRedirect, getReportDirectoryConfig, getRun, listRuns, nextCaptureJob, pruneExpiredRedirects, putCapture, putJob, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
 import type { Capture, CaptureJob, Run } from '../src/types';
@@ -8,6 +9,12 @@ const capture: Capture = {
   rawMarkdown: 'report', normalizedMarkdown: 'report', citations: [], captureMethod: 'dom_only',
   unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
 };
+
+async function putLegacyJob(job: CaptureJob): Promise<void> {
+  const database = await openDB('deep-research-fan-out', 2);
+  try { await database.put('jobs', job); }
+  finally { database.close(); }
+}
 
 describe('run history', () => {
   beforeAll(async () => {
@@ -55,33 +62,70 @@ describe('run history', () => {
       domMarkdown: 'A retained report with enough text to be recovered later.', domCitations: [],
     };
     const invalid = { ...valid, id: 'orphan-invalid', orphanedAt: 'yesterday' } as unknown as CaptureJob;
-    await putJob(valid);
-    await putJob(invalid);
-    expect(await getJob(valid.id)).toMatchObject({ orphanedAt: valid.orphanedAt });
-    expect(await getJob(invalid.id)).toBeUndefined();
-    expect(await nextCaptureJob()).toBeUndefined();
-    await deleteJob(valid.id);
-    await deleteJob(invalid.id);
+    try {
+      await putJob(valid);
+      await expect(putJob(invalid)).rejects.toThrow('malformed capture job');
+      await putLegacyJob(invalid);
+      expect(await getJob(valid.id)).toMatchObject({ orphanedAt: valid.orphanedAt });
+      expect(await getJob(invalid.id)).toBeUndefined();
+      expect(await nextCaptureJob()).toBeUndefined();
+    } finally {
+      await deleteJob(valid.id);
+      await deleteJob(invalid.id);
+    }
   });
 
-  it('requires a finite lease timestamp only for leased capture jobs', async () => {
+  it('repairs malformed legacy leases without losing their retained reports', async () => {
     const valid: CaptureJob = {
-      id: 'lease-valid', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      id: 'lease-valid', runId: 'missing-run', provider: 'chatgpt', conversationKey: 'https://chatgpt.com/c/retained', tabId: 1,
       state: 'leased', createdAt: Date.now(), leasedAt: Date.now(), attempts: 1,
       domMarkdown: 'Report', domCitations: [],
     };
     const jobs = [
       valid,
-      { ...valid, id: 'lease-missing', leasedAt: undefined },
-      { ...valid, id: 'lease-string', leasedAt: 'yesterday' },
-      { ...valid, id: 'lease-infinite', leasedAt: Infinity },
-      { ...valid, id: 'queued-without-lease', state: 'queued', leasedAt: undefined },
+      { ...valid, id: 'lease-missing', createdAt: valid.createdAt + 1, leasedAt: undefined },
+      { ...valid, id: 'lease-string', createdAt: valid.createdAt + 2, leasedAt: 'yesterday' },
+      { ...valid, id: 'lease-infinite', createdAt: valid.createdAt + 3, leasedAt: Infinity },
+      { ...valid, id: 'queued-without-lease', createdAt: valid.createdAt + 4, state: 'queued', leasedAt: undefined },
     ] as CaptureJob[];
-    for (const job of jobs) await putJob(job);
-    expect(await getJob(valid.id)).toMatchObject({ leasedAt: valid.leasedAt });
-    for (const job of jobs.slice(1, 4)) expect(await getJob(job.id)).toBeUndefined();
-    expect(await getJob('queued-without-lease')).toMatchObject({ state: 'queued' });
-    for (const job of jobs) await deleteJob(job.id);
+    try {
+      await putJob(valid);
+      for (const job of jobs.slice(1, 4)) {
+        await expect(putJob(job)).rejects.toThrow('malformed capture job');
+        await putLegacyJob(job);
+      }
+      await putJob(jobs[4]!);
+      expect(await getJob(valid.id)).toMatchObject({ leasedAt: valid.leasedAt });
+      for (const job of jobs.slice(1, 4)) {
+        expect(await getJob(job.id)).toMatchObject({
+          state: 'queued', domMarkdown: 'Report', conversationKey: valid.conversationKey,
+        });
+      }
+      expect(await getJob('queued-without-lease')).toMatchObject({ state: 'queued' });
+      expect((await nextCaptureJob())?.id).toBe('lease-missing');
+    } finally {
+      for (const job of jobs) await deleteJob(job.id);
+    }
+  });
+
+  it('reclaims zero leases and normalizes malformed leases directly from the queue', async () => {
+    const zeroLease: CaptureJob = {
+      id: 'lease-zero', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      state: 'leased', createdAt: 1, leasedAt: 0, attempts: 1,
+      domMarkdown: 'A retained report', domCitations: [],
+    };
+    const missingLease = { ...zeroLease, id: 'lease-from-queue', createdAt: 2, leasedAt: undefined };
+    try {
+      await putJob(zeroLease);
+      await putLegacyJob(missingLease);
+      expect((await nextCaptureJob())?.id).toBe(zeroLease.id);
+      await deleteJob(zeroLease.id);
+      expect(await nextCaptureJob()).toMatchObject({ id: missingLease.id, state: 'queued', domMarkdown: 'A retained report' });
+      expect(await getJob(missingLease.id)).toMatchObject({ state: 'queued' });
+    } finally {
+      await deleteJob(zeroLease.id);
+      await deleteJob(missingLease.id);
+    }
   });
 
   it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {

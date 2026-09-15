@@ -55,6 +55,12 @@ function run(providerRuns: Run['providerRuns'], status: Run['status'] = 'active'
   return { id, browserSessionId: 'current-session', query: 'query', createdAt: Date.now(), windowId: 1, providerRuns, status, slug: 'query', reportFolder, downloadFolder: `deep-research/${reportFolder}` };
 }
 
+async function putLegacyJob(job: CaptureJob): Promise<void> {
+  const database = await openDB('deep-research-fan-out', 2);
+  try { await database.put('jobs', job); }
+  finally { database.close(); }
+}
+
 function contentSender(tabId = 1, url = 'https://chatgpt.com/'): Browser.runtime.MessageSender {
   return { tab: { id: tabId, url } as Browser.tabs.Tab, url };
 }
@@ -101,6 +107,57 @@ afterEach(() => {
 });
 
 describe('coordinator run guards', () => {
+  it('rejects End provider for a finished provider without touching its job or tab', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 3001, 'complete') }, 'complete');
+    const id = `${stored.id}:chatgpt`;
+    const job: CaptureJob = {
+      id, runId: stored.id, provider: 'chatgpt', tabId: 3001, state: 'queued',
+      createdAt: Date.now(), attempts: 0, domMarkdown: 'A retained report.', domCitations: [],
+    };
+    try {
+      await putRun(stored);
+      await putJob(job);
+      await expect(coordinatorTestHooks.handleRequest({
+        type: 'provider:end', runId: stored.id, provider: 'chatgpt',
+      }, {})).resolves.toMatchObject({ ok: false, code: 'provider_terminal' });
+      expect(await getJob(id)).toEqual(job);
+      expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('complete');
+      expect(platform.sendTabEvent).not.toHaveBeenCalled();
+    } finally { await deleteJob(id); }
+  });
+
+  it('ends active providers in a mixed run while skipping finished providers', async () => {
+    const stored = run({
+      chatgpt: provider('chatgpt', 3002, 'complete'),
+      claude: provider('claude', 3003, 'researching'),
+    });
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({ type: 'run:end', runId: stored.id }, {}))
+      .resolves.toMatchObject({ ok: true });
+    expect((await getRun(stored.id))?.providerRuns).toMatchObject({
+      chatgpt: { status: 'complete' }, claude: { status: 'abandoned' },
+    });
+    expect(platform.sendTabEvent).toHaveBeenCalledWith(3003, { type: 'content:stop', runId: stored.id });
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(3002, expect.anything());
+  });
+
+  it('copies a stored capture after its provider was interrupted', async () => {
+    const chatgpt = provider('chatgpt', 3004, 'interrupted');
+    const stored = run({ chatgpt }, 'complete');
+    const id = `${stored.id}:chatgpt`;
+    chatgpt.captureId = id;
+    await putRun(stored);
+    await putCapture(id, {
+      rawMarkdown: 'The retained interrupted report.', normalizedMarkdown: 'The retained interrupted report.',
+      citations: [], captureMethod: 'dom_only', unplacedCitationCount: 0,
+      capturedAt: Date.now(), urlsResolved: 0, urlsUnresolved: 0,
+    });
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'provider:copy', runId: stored.id, provider: 'chatgpt',
+    }, {})).resolves.toMatchObject({ ok: true });
+    expect(platform.writeClipboard).toHaveBeenCalledWith(expect.stringContaining('The retained interrupted report.'));
+  });
+
   it('serializes capture acceptance for the same capture ID', async () => {
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -796,6 +853,37 @@ describe('coordinator run guards', () => {
     });
   });
 
+  it('clears unavailable recovery after Retry report and allows saving failed details', async () => {
+    const chatgpt = provider('chatgpt', 90911, 'failed');
+    chatgpt.captureRecoveryPending = true;
+    const stored = run({ chatgpt }, 'complete');
+    stored.completedAt = Date.now();
+    await putRun(stored);
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'provider:retry-capture', runId: stored.id, provider: 'chatgpt',
+    }, {})).resolves.toMatchObject({ ok: false, code: 'invalid_transition' });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'failed' });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.captureRecoveryPending).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.statusDetail).toContain('No retained report');
+    expect(browser.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'runs:changed' }));
+    await expect(coordinatorTestHooks.handleRequest({
+      type: 'provider:save', runId: stored.id, provider: 'chatgpt',
+    }, {})).resolves.toMatchObject({ ok: true });
+    expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/FAILED-chatgpt.md`, expect.any(String));
+  });
+
+  it('clears unavailable recovery during reconciliation', async () => {
+    const chatgpt = provider('chatgpt', 90912, 'failed');
+    chatgpt.captureRecoveryPending = true;
+    const stored = run({ chatgpt }, 'complete');
+    stored.completedAt = Date.now();
+    await putRun(stored);
+    await coordinatorTestHooks.reconcileRuns();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'failed' });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.captureRecoveryPending).toBeUndefined();
+    expect(browser.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'runs:changed' }));
+  });
+
   it('reconciles a paused storage failure when its first state write failed', async () => {
     const stored = run({ claude: provider('claude', 9092, 'capturing') });
     const id = `${stored.id}:claude`;
@@ -859,6 +947,24 @@ describe('coordinator run guards', () => {
       domMarkdown: expect.stringContaining('verified report') });
     expect(await nextCaptureJob()).toBeUndefined();
     await deleteJob(id);
+  });
+
+  it('moves a legacy job with a missing lease into orphan cleanup without losing its report', async () => {
+    const runId = `missing-${crypto.randomUUID()}`;
+    const id = `${runId}:chatgpt`;
+    const report = 'A verified legacy DOM report remains retained while its missing run is recovered.';
+    try {
+      await putLegacyJob({
+        id, runId, provider: 'chatgpt', tabId: 91021, state: 'leased',
+        createdAt: Date.now(), attempts: 1, domMarkdown: report, domCitations: [],
+      });
+      await coordinatorTestHooks.processCaptureQueue();
+      const orphan = await getJob(id);
+      expect(orphan).toMatchObject({ state: 'orphaned', domMarkdown: report });
+      await putJob({ ...orphan!, orphanedAt: Date.now() - ORPHAN_JOB_RETENTION_MS - 1 });
+      await coordinatorTestHooks.processCaptureQueue();
+      expect(await getJob(id)).toBeUndefined();
+    } finally { await deleteJob(id); }
   });
 
   it('resumes an orphan when its run reappears and expires one after seven days', async () => {
@@ -1438,6 +1544,50 @@ describe('coordinator run guards', () => {
     await putRun(stored);
   });
 
+  it('repairs an existing malformed lease atomically while accepting capture', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 9311, 'researching') });
+    const id = `${stored.id}:chatgpt`;
+    const retained = 'The original complete research report remains durable after a malformed lease is repaired.';
+    const legacy = {
+      id, runId: stored.id, provider: 'chatgpt', tabId: 9311, state: 'leased',
+      createdAt: Date.now(), attempts: 1, domMarkdown: retained, domCitations: [],
+      conversationKey: 'https://chatgpt.com/c/retained',
+    } as CaptureJob;
+    const incoming: CaptureJob = {
+      ...legacy, state: 'queued', domMarkdown: 'A later delivery must not replace the retained report.',
+    };
+    try {
+      await putRun(stored);
+      await putLegacyJob(legacy);
+      await acceptCaptureJob(incoming, (current) => {
+        current!.providerRuns.chatgpt!.status = 'capturing';
+        return current!;
+      });
+      expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('capturing');
+      expect(await getJob(id)).toMatchObject({
+        state: 'queued', domMarkdown: retained, conversationKey: legacy.conversationKey,
+      });
+    } finally { await deleteJob(id); }
+  });
+
+  it('rejects an irreparably malformed existing job without changing provider state', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 9312, 'researching') });
+    const id = `${stored.id}:chatgpt`;
+    const incoming: CaptureJob = {
+      id, runId: stored.id, provider: 'chatgpt', tabId: 9312, state: 'queued',
+      createdAt: Date.now(), attempts: 0, domMarkdown: 'A new valid report.', domCitations: [],
+    };
+    try {
+      await putRun(stored);
+      await putLegacyJob({ ...incoming, state: 'leased', domMarkdown: 42 as unknown as string });
+      await expect(acceptCaptureJob(incoming, (current) => {
+        current!.providerRuns.chatgpt!.status = 'capturing';
+        return current!;
+      })).rejects.toThrow('malformed stored job');
+      expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('researching');
+    } finally { await deleteJob(id); }
+  });
+
   it('restores capturing before accepting a duplicate delivery for an existing job', async () => {
     const stored = run({ chatgpt: provider('chatgpt', 932, 'researching') });
     const id = `${stored.id}:chatgpt`;
@@ -1488,6 +1638,25 @@ describe('coordinator run guards', () => {
     await coordinatorTestHooks.interruptRemovedTab(912);
     expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', degraded: true });
     expect(await getCapture(`${stored.id}:chatgpt`)).toMatchObject({ captureMethod: 'dom_only' });
+  });
+
+  it('finishes a retained report with a missing lease timestamp after its tab closes', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 9121, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    const report = 'A complete original DOM report survives a missing lease timestamp and tab closure.';
+    try {
+      await putRun(stored);
+      await putLegacyJob({
+        id, runId: stored.id, provider: 'chatgpt', tabId: 9121,
+        state: 'leased', createdAt: Date.now(), attempts: 1,
+        domMarkdown: report, domCitations: [],
+      });
+      await coordinatorTestHooks.interruptRemovedTab(9121);
+      expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', captureId: id });
+      expect(await getCapture(id)).toMatchObject({ captureMethod: 'dom_only', rawMarkdown: report });
+      expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/chatgpt.md`, expect.stringContaining(report));
+      expect(await getJob(id)).toBeUndefined();
+    } finally { await deleteJob(id); }
   });
 
   it('links a capture persisted before an exhausted job could update the run', async () => {
@@ -1633,6 +1802,26 @@ describe('coordinator run guards', () => {
       saveReceipt: { destination: 'downloads', requestedRelativePath: `${stored.downloadFolder}/FAILED-chatgpt.md` },
     });
     expect(platform.sendTabEvent).not.toHaveBeenCalledWith(916, expect.objectContaining({ type: 'content:start' }));
+  });
+
+  it('restores a retained report with a malformed lease after browser restart', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 9161, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    const report = 'A complete DOM report remains available for fallback capture after a browser restart.';
+    stored.browserSessionId = 'prior-session';
+    try {
+      await putRun(stored);
+      await putLegacyJob({
+        id, runId: stored.id, provider: 'chatgpt', tabId: 9161,
+        state: 'leased', createdAt: Date.now(), attempts: 1,
+        domMarkdown: report, domCitations: [],
+      });
+      await coordinatorTestHooks.reconcileRuns();
+      expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({ status: 'complete', captureId: id });
+      expect(await getCapture(id)).toMatchObject({ captureMethod: 'dom_only', rawMarkdown: report });
+      expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/chatgpt.md`, expect.stringContaining(report));
+      expect(await getJob(id)).toBeUndefined();
+    } finally { await deleteJob(id); }
   });
 
   it('links a prior-session persisted capture through the serialized completion path', async () => {
@@ -1877,23 +2066,34 @@ describe('durable acceptance and state recovery regressions', () => {
     expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
     expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe(status);
   });
-  it('rolls back the job when the run write fails after the job write', async () => {
+  it('rejects a malformed run before committing its capture job', async () => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});
     await putRun(stored);
     await expect(acceptCaptureJob(jobFor(stored),(current) => {
       current!.providerRuns.chatgpt!.status='capturing';
       current!.query = (() => undefined) as unknown as string;
       return current!;
-    })).rejects.toThrow();
+    })).rejects.toThrow('malformed research run');
     expect(await getJob(`${stored.id}:chatgpt`)).toBeUndefined();
     expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('researching');
   });
-  it('rolls back state when the payload cannot be stored', async () => {
+  it('rejects a malformed capture payload without changing provider state', async () => {
     const stored = run({chatgpt:provider('chatgpt',1,'researching')});
     await putRun(stored);
     const job = jobFor(stored);
     job.domMarkdown = (() => undefined) as unknown as string;
-    await expect(acceptCaptureJob(job,(current) => {current!.providerRuns.chatgpt!.status='capturing'; return current!;})).rejects.toThrow();
+    await expect(acceptCaptureJob(job,(current) => {current!.providerRuns.chatgpt!.status='capturing'; return current!;})).rejects.toThrow('malformed capture job');
+    expect(await getJob(job.id)).toBeUndefined();
+    expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('researching');
+  });
+  it('rejects a cloneable malformed lease before committing either record', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    await putRun(stored);
+    const job = { ...jobFor(stored), state: 'leased', leasedAt: undefined } as CaptureJob;
+    await expect(acceptCaptureJob(job,(current) => {
+      current!.providerRuns.chatgpt!.status='capturing';
+      return current!;
+    })).rejects.toThrow('malformed capture job');
     expect(await getJob(job.id)).toBeUndefined();
     expect((await getRun(stored.id))!.providerRuns.chatgpt!.status).toBe('researching');
   });
