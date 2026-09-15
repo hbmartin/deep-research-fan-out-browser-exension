@@ -122,19 +122,14 @@ export async function writeUniqueMarkdown(
 ): Promise<{ requestedRelativePath: string; actualRelativePath: string }> {
   const directory = await createNestedDirectory(root, relativeFolder);
   const filename = await uniqueFilename(directory, requestedFilename);
-  let created = false;
   let writable: FileSystemWritableFileStream | undefined;
   try {
     const file = await directory.getFileHandle(filename, { create: true });
-    created = true;
     writable = await file.createWritable();
     await writable.write(markdown);
     await writable.close();
   } catch (error) {
     if (writable && typeof writable.abort === 'function') await writable.abort().catch(() => undefined);
-    if (created && typeof directory.removeEntry === 'function') {
-      await directory.removeEntry(filename).catch(() => undefined);
-    }
     throw error;
   }
   return {

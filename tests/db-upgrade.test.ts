@@ -102,7 +102,15 @@ describe('research database v2 upgrade', () => {
 
     const raw = await openDB('deep-research-fan-out', 2);
     expect(await raw.get('runs', 'malformed-v1')).toEqual(malformedRun);
+    expect((await raw.get('runs', legacyRun.id))?.recordVersion).toBeUndefined();
+    const newer = await raw.get('runs', legacyRun.id);
+    newer!.status = 'finalizing';
+    await raw.put('runs', newer!);
+    await Promise.all([database.getRun(legacyRun.id), database.listRuns()]);
+    expect((await raw.get('runs', legacyRun.id))?.status).toBe('finalizing');
+    expect((await raw.get('runs', legacyRun.id))?.recordVersion).toBeUndefined();
     raw.close();
     expect(await database.getReportDirectoryConfig()).toBeUndefined();
   });
+
 });

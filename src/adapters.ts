@@ -1,4 +1,5 @@
 import type { ProviderId } from './types';
+import { DURATION_PATTERN } from './durations';
 
 export type Selector =
   | { kind: 'aria'; role: string; name?: string | RegExp; pick?: 'first' | 'last' }
@@ -52,7 +53,7 @@ const progressFollowup = String.raw`(?:(?:(?:this|that|it|the (?:research|search
 const commonProgressResponse = new RegExp(`^${progressOpening}(?:\\s+[^.!?…]{0,200})?\\s*[.!?…]*(?:\\s+${progressFollowup})?$`, 'i');
 const commonQuotaResponse = /^(?:(?:sorry|unfortunately)[,.!]?\s*)?(?:(?:you(?:'ve| have)?|your account has)\s+)?(?:reached|hit|exceeded)\s+(?:your\s+)?(?:(?:deepsearch|deep research|research|usage)\s+)?limit\b|^(?:your\s+)?(?:deepsearch|deep research|research|usage)\s+limit\s+(?:has been\s+)?(?:reached|exceeded)\b|^(?:deepsearch|deep research|research)\s+(?:is\s+)?unavailable\b|^upgrade\b.{0,80}\b(?:deepsearch|deep research|research)\b/i;
 const commonCopyButton: SelectorChain = [{ kind: 'aria', role: 'button', name: /^(?:copy|copy response)$/i, pick: 'last' }];
-const streamingDuration = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
+const streamingDuration = DURATION_PATTERN;
 const streamingActivity = String.raw`(?:(?:reading|searching|reviewing|analy[sz]ing|browsing|checking|visiting|summari[sz]ing|collecting|consulting)\s+(?:the\s+)?(?:web|sites?|sources?|pages?|results?|documents?))`;
 const streamingSuffix = String.raw`(?:\s*(?:…|\.{1,3})|\s+(?:[·•—-]\s*)?(?:\d+\s+sources?|${streamingDuration}|${streamingActivity}))?`;
 

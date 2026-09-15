@@ -1,6 +1,7 @@
 import type { ProviderAdapter } from './adapters';
 import { normalizeUrl } from './citations';
 import { cloneVisibleContent, findAll, isEffectivelyHidden } from './selectors';
+import { DURATION_PATTERN } from './durations';
 import type { DomCitation } from './types';
 
 const DOM_ONLY_COMPLETION_MIN_CHARS = 1000;
@@ -89,7 +90,7 @@ export interface ResponseSnapshot {
   activityTextWithoutCitations: string;
 }
 
-const DURATION = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})`;
+const DURATION = DURATION_PATTERN;
 const BARE_DURATION = new RegExp(`^${DURATION}$`, 'i');
 const EXPLICIT_ELAPSED_DURATION = new RegExp(`^(?:elapsed(?: time)?[:\\s]+${DURATION}|${DURATION}\\s+elapsed)$`, 'i');
 const REPORT_BEARING_ELEMENT = 'p, li, h1, h2, h3, h4, h5, h6, table, thead, tbody, tfoot, tr, th, td';

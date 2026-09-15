@@ -189,6 +189,8 @@ export interface CaptureJob {
   tabUnavailable?: boolean;
   /** Clipboard capture waits until the run-owned conversation is visible again. */
   deferredForNavigation?: boolean;
+  /** First navigation deferral, used for the bounded DOM fallback deadline. */
+  deferredAt?: number;
   domMarkdown: string;
   domCitations: DomCitation[];
   copyControlObserved?: boolean;
