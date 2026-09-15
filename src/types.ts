@@ -31,6 +31,8 @@ export interface ArtifactSaveReceipt {
   savedAt: number;
   downloadId?: number;
   fallbackReason?: ArtifactSaveFallbackReason;
+  /** Exact artifact content generation persisted by this receipt. */
+  artifactRevision?: string;
 }
 
 export interface ReportDirectoryConfig {
@@ -38,6 +40,8 @@ export interface ReportDirectoryConfig {
   displayName: string;
   configuredAt: number;
   needsReconnect: boolean;
+  /** A granted directory can still reject writes for reasons reconnecting cannot fix. */
+  lastWriteFailureAt?: number;
 }
 
 export interface Citation {
@@ -112,6 +116,8 @@ export interface ResearchTrail {
 }
 
 export interface Capture {
+  /** Changes whenever capture content at the stable capture key is replaced. */
+  revision?: string;
   rawMarkdown: string;
   normalizedMarkdown: string;
   citations: Citation[];
@@ -137,6 +143,8 @@ export interface ProviderRun {
   conversationKey?: string;
   completedAt?: number;
   captureId?: string;
+  /** Revision of the report or failure artifact that should be saved. */
+  artifactRevision?: string;
   attempts: number;
   degraded: boolean;
   adapterVersion: string;
@@ -147,9 +155,13 @@ export interface ProviderRun {
   downloadedAt?: number;
   copiedAt?: number;
   reconcileFailureCount?: number;
+  /** The run-owned tab is temporarily on an auxiliary page for this provider. */
+  detachedAt?: number;
 }
 
 export interface Run {
+  /** Data-record version, independent of the IndexedDB object-store version. */
+  recordVersion?: 2;
   id: RunId;
   browserSessionId?: string;
   query: string;
@@ -175,6 +187,8 @@ export interface CaptureJob {
   leasedAt?: number;
   attempts: number;
   tabUnavailable?: boolean;
+  /** Clipboard capture waits until the run-owned conversation is visible again. */
+  deferredForNavigation?: boolean;
   domMarkdown: string;
   domCitations: DomCitation[];
   copyControlObserved?: boolean;

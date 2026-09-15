@@ -101,6 +101,69 @@ describe('options validation', () => {
     await vi.waitFor(() => expect(document.querySelector('.destination')?.textContent).toContain('Folder selection canceled'));
     expect(document.querySelector('.destination')?.textContent).toContain('Reports');
   });
+
+  it('refreshes only destination state on focus and preserves unsaved form interaction', async () => {
+    const config = { handle: { name: 'Reports' } as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    let permission: PermissionState = 'granted';
+    vi.doMock('../src/report-storage', () => ({
+      chooseReportDirectory: vi.fn(async () => config),
+      disconnectReportDirectory: vi.fn(async () => undefined),
+      getReportDirectoryConfig: vi.fn(async () => config),
+      isDirectoryPickerSupported: () => true,
+      queryDirectoryPermission: vi.fn(async () => permission),
+      reconnectReportDirectory: vi.fn(async () => permission),
+    }));
+    vi.stubGlobal('browser', { storage: { sync: { get: vi.fn(async () => ({})), set: vi.fn(async () => undefined) } } });
+    document.body.innerHTML = '<main id="app"></main>';
+    await import('../entrypoints/options/main');
+    await vi.waitFor(() => expect(buttonNamed('Change')).toBeInstanceOf(HTMLButtonElement));
+
+    const json = document.querySelector<HTMLTextAreaElement>('#settings-json')!;
+    const debounce = document.querySelector<HTMLInputElement>('#debounce-chatgpt')!;
+    const advanced = debounce.closest('details')!;
+    json.value = '{ "unfinished": true }';
+    json.focus();
+    json.setSelectionRange(2, 15);
+    debounce.value = '1234';
+    debounce.dispatchEvent(new Event('input', { bubbles: true }));
+    advanced.open = true;
+    const originalJson = json;
+
+    permission = 'prompt';
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => expect(document.querySelector('.destination')?.textContent).toContain('Permission is prompt'));
+
+    expect(document.querySelector('#settings-json')).toBe(originalJson);
+    expect(json.value).toBe('{ "unfinished": true }');
+    expect(json.selectionStart).toBe(2);
+    expect(json.selectionEnd).toBe(15);
+    expect(document.activeElement).toBe(json);
+    expect(debounce.value).toBe('1234');
+    expect(advanced.open).toBe(true);
+  });
+
+  it('explains non-permission write failures without suggesting reconnect', async () => {
+    const config = {
+      handle: { name: 'Reports' } as FileSystemDirectoryHandle,
+      displayName: 'Reports', configuredAt: 1, needsReconnect: false, lastWriteFailureAt: 2,
+    };
+    vi.doMock('../src/report-storage', () => ({
+      chooseReportDirectory: vi.fn(async () => config),
+      disconnectReportDirectory: vi.fn(async () => undefined),
+      getReportDirectoryConfig: vi.fn(async () => config),
+      isDirectoryPickerSupported: () => true,
+      queryDirectoryPermission: vi.fn(async () => 'granted'),
+      reconnectReportDirectory: vi.fn(async () => 'granted'),
+    }));
+    vi.stubGlobal('browser', { storage: { sync: { get: vi.fn(async () => ({})), set: vi.fn(async () => undefined) } } });
+    document.body.innerHTML = '<main id="app"></main>';
+    await import('../entrypoints/options/main');
+    await vi.waitFor(() => expect(document.querySelector('.destination')?.textContent).toContain('last write failed'));
+
+    expect(buttonNamed('Reconnect')).toBeUndefined();
+    expect(document.querySelector('.destination')?.textContent).toContain('Check free space');
+    expect(buttonNamed('Change')).toBeInstanceOf(HTMLButtonElement);
+  });
 });
 
 function buttonNamed(name: string): HTMLButtonElement | undefined {

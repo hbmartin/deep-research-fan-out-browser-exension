@@ -17,6 +17,7 @@ class MemoryDirectory {
   readonly directories = new Map<string, MemoryDirectory>();
   readonly files = new Map<string, string>();
   closeCount = 0;
+  failWrites = false;
 
   async getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<FileSystemDirectoryHandle> {
     let directory = this.directories.get(name);
@@ -38,12 +39,19 @@ class MemoryDirectory {
       kind: 'file',
       async createWritable() {
         return {
-          async write(value: FileSystemWriteChunkType) { pending = String(value); },
+          async write(value: FileSystemWriteChunkType) {
+            if (directory.failWrites) throw new Error('disk full');
+            pending = String(value);
+          },
           async close() { directory.files.set(name, pending); directory.closeCount += 1; },
           async abort() { return undefined; },
         } as FileSystemWritableFileStream;
       },
     } as FileSystemFileHandle;
+  }
+
+  async removeEntry(name: string): Promise<void> {
+    if (!this.files.delete(name)) throw notFound();
   }
 }
 
@@ -75,6 +83,25 @@ describe('chosen-folder report storage', () => {
     });
     expect(runDirectory.files.get('chatgpt (2).md')).toBe('# report');
     expect(runDirectory.closeCount).toBe(1);
+  });
+
+  it('removes a newly created empty file after a failed write so retry uses the base name', async () => {
+    const root = new MemoryDirectory();
+    const runDirectory = await createNestedDirectory(
+      root as unknown as FileSystemDirectoryHandle, 'year/run-folder',
+    ) as unknown as MemoryDirectory;
+    runDirectory.failWrites = true;
+
+    await expect(writeUniqueMarkdown(
+      root as unknown as FileSystemDirectoryHandle, 'year/run-folder', 'chatgpt.md', '# report',
+    )).rejects.toThrow('disk full');
+    expect(runDirectory.files.has('chatgpt.md')).toBe(false);
+
+    runDirectory.failWrites = false;
+    await expect(writeUniqueMarkdown(
+      root as unknown as FileSystemDirectoryHandle, 'year/run-folder', 'chatgpt.md', '# report',
+    )).resolves.toMatchObject({ actualRelativePath: 'year/run-folder/chatgpt.md' });
+    expect(runDirectory.files.get('chatgpt.md')).toBe('# report');
   });
 
   it('classifies permission, missing-handle, and general write failures', () => {

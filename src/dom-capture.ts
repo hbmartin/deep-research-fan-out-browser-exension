@@ -152,14 +152,24 @@ export function createResponseSnapshot(root: HTMLElement): ResponseSnapshot {
     if (isElapsedTimerElement(element, false)) element.remove();
   }
   const activityText = normalizeActivityText(structurallySeparatedText(activityContent));
-  activityContent.querySelectorAll(ACTIVITY_CITATION_CONTENT).forEach((element) => element.remove());
-  return {
+  let activityTextWithoutCitations: string | undefined;
+  const snapshot = {
     root,
     content,
     text: structurallySeparatedText(content),
     activityText,
-    activityTextWithoutCitations: normalizeActivityText(structurallySeparatedText(activityContent)),
-  };
+  } as ResponseSnapshot;
+  Object.defineProperty(snapshot, 'activityTextWithoutCitations', {
+    enumerable: true,
+    get() {
+      if (activityTextWithoutCitations === undefined) {
+        activityContent.querySelectorAll(ACTIVITY_CITATION_CONTENT).forEach((element) => element.remove());
+        activityTextWithoutCitations = normalizeActivityText(structurallySeparatedText(activityContent));
+      }
+      return activityTextWithoutCitations;
+    },
+  });
+  return snapshot;
 }
 
 function isTextMatch(text: string, pattern?: RegExp, maximumLength?: number): boolean {
@@ -208,9 +218,8 @@ function finalResponseSignature(root: HTMLElement, snapshot?: ResponseSnapshot):
   return `text:${text}`;
 }
 
-export function finalResponseFingerprint(root: HTMLElement, snapshot?: ResponseSnapshot): string {
+export function responseFingerprint(root: HTMLElement, text: string): string {
   const stableId = root.getAttribute('data-message-id') || root.id;
-  const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).activityText;
   return `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${text}`;
 }
 
@@ -230,7 +239,7 @@ export function evaluateStableResponse(
   if (!root) return { ready: false };
   const text = (snapshot?.root === root ? snapshot : createResponseSnapshot(root)).activityText;
   if (text.length < (copyAvailable ? 1 : DOM_ONLY_COMPLETION_MIN_CHARS)) return { ready: false };
-  const fingerprint = `${root.getAttribute('data-message-id') || root.id}\u0000${text}`;
+  const fingerprint = responseFingerprint(root, text);
   if (candidate?.fingerprint !== fingerprint) {
     return { candidate: { fingerprint, since: now }, ready: false };
   }

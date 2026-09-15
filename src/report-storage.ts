@@ -33,7 +33,11 @@ export async function reconnectReportDirectory(config: ReportDirectoryConfig): P
   const permission = typeof config.handle.requestPermission === 'function'
     ? await config.handle.requestPermission(WRITE_PERMISSION)
     : await queryDirectoryPermission(config.handle);
-  await putReportDirectoryConfig({ ...config, needsReconnect: permission !== 'granted' });
+  await putReportDirectoryConfig({
+    ...config,
+    needsReconnect: permission !== 'granted',
+    ...(permission === 'granted' ? { lastWriteFailureAt: undefined } : {}),
+  });
   return permission;
 }
 
@@ -44,8 +48,21 @@ export async function disconnectReportDirectory(): Promise<void> {
 export async function markReportDirectoryNeedsReconnect(config: ReportDirectoryConfig, needsReconnect: boolean): Promise<void> {
   const current = await getReportDirectoryConfig();
   if (!current || current.configuredAt !== config.configuredAt || current.displayName !== config.displayName) return;
-  if (current.needsReconnect === needsReconnect) return;
-  await putReportDirectoryConfig({ ...current, needsReconnect });
+  if (current.needsReconnect === needsReconnect && (needsReconnect || current.lastWriteFailureAt === undefined)) return;
+  await putReportDirectoryConfig({
+    ...current,
+    needsReconnect,
+    ...(!needsReconnect ? { lastWriteFailureAt: undefined } : {}),
+  });
+}
+
+export async function markReportDirectoryWriteFailure(
+  config: ReportDirectoryConfig,
+  failedAt = Date.now(),
+): Promise<void> {
+  const current = await getReportDirectoryConfig();
+  if (!current || current.configuredAt !== config.configuredAt || current.displayName !== config.displayName) return;
+  await putReportDirectoryConfig({ ...current, needsReconnect: false, lastWriteFailureAt: failedAt });
 }
 
 export function classifyDirectoryError(error: unknown): ArtifactSaveFallbackReason {
@@ -105,13 +122,19 @@ export async function writeUniqueMarkdown(
 ): Promise<{ requestedRelativePath: string; actualRelativePath: string }> {
   const directory = await createNestedDirectory(root, relativeFolder);
   const filename = await uniqueFilename(directory, requestedFilename);
-  const file = await directory.getFileHandle(filename, { create: true });
-  const writable = await file.createWritable();
+  let created = false;
+  let writable: FileSystemWritableFileStream | undefined;
   try {
+    const file = await directory.getFileHandle(filename, { create: true });
+    created = true;
+    writable = await file.createWritable();
     await writable.write(markdown);
     await writable.close();
   } catch (error) {
-    if (typeof writable.abort === 'function') await writable.abort().catch(() => undefined);
+    if (writable && typeof writable.abort === 'function') await writable.abort().catch(() => undefined);
+    if (created && typeof directory.removeEntry === 'function') {
+      await directory.removeEntry(filename).catch(() => undefined);
+    }
     throw error;
   }
   return {
