@@ -85,7 +85,7 @@ describe('chosen-folder report storage', () => {
     expect(runDirectory.closeCount).toBe(1);
   });
 
-  it('removes a newly created empty file after a failed write so retry uses the base name', async () => {
+  it('leaves an unproven failed-write filename alone and numbers the retry', async () => {
     const root = new MemoryDirectory();
     const runDirectory = await createNestedDirectory(
       root as unknown as FileSystemDirectoryHandle, 'year/run-folder',
@@ -95,13 +95,31 @@ describe('chosen-folder report storage', () => {
     await expect(writeUniqueMarkdown(
       root as unknown as FileSystemDirectoryHandle, 'year/run-folder', 'chatgpt.md', '# report',
     )).rejects.toThrow('disk full');
-    expect(runDirectory.files.has('chatgpt.md')).toBe(false);
+    expect(runDirectory.files.get('chatgpt.md')).toBe('');
 
     runDirectory.failWrites = false;
     await expect(writeUniqueMarkdown(
       root as unknown as FileSystemDirectoryHandle, 'year/run-folder', 'chatgpt.md', '# report',
-    )).resolves.toMatchObject({ actualRelativePath: 'year/run-folder/chatgpt.md' });
-    expect(runDirectory.files.get('chatgpt.md')).toBe('# report');
+    )).resolves.toMatchObject({ actualRelativePath: 'year/run-folder/chatgpt (1).md' });
+    expect(runDirectory.files.get('chatgpt (1).md')).toBe('# report');
+  });
+
+  it('never deletes a colliding user file that appears between name selection and a failed write', async () => {
+    const root = new MemoryDirectory();
+    const runDirectory = await createNestedDirectory(
+      root as unknown as FileSystemDirectoryHandle, 'year/run-folder',
+    ) as unknown as MemoryDirectory;
+    const getFileHandle = runDirectory.getFileHandle.bind(runDirectory);
+    runDirectory.getFileHandle = async (name, options) => {
+      if (options?.create) runDirectory.files.set(name, 'user content');
+      return getFileHandle(name, options);
+    };
+    runDirectory.failWrites = true;
+
+    await expect(writeUniqueMarkdown(
+      root as unknown as FileSystemDirectoryHandle, 'year/run-folder', 'chatgpt.md', '# report',
+    )).rejects.toThrow('disk full');
+    expect(runDirectory.files.get('chatgpt.md')).toBe('user content');
   });
 
   it('classifies permission, missing-handle, and general write failures', () => {

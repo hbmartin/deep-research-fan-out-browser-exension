@@ -201,6 +201,28 @@ describe('provider content-script recovery', () => {
     expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
   });
 
+  it('reports each timeout-latched library detachment once and rearms after returning', async () => {
+    storedStatus = 'manual_required';
+    await listener({
+      type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '',
+      geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true,
+      status: 'manual_required', submittedAt: Date.now() - 46 * 60 * 1000,
+      researchTimedOutAt: Date.now() - 60_000, conversationKey: 'https://chatgpt.com/c/review',
+    });
+    vi.stubGlobal('location', new URL('https://chatgpt.com/library'));
+    await vi.advanceTimersByTimeAsync(10_000);
+    const navigationMessages = () => messages.filter((message) => message.type === 'content:state' && message.reason === 'provider_navigation');
+    expect(navigationMessages()).toHaveLength(1);
+    expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
+
+    vi.stubGlobal('location', new URL('https://chatgpt.com/c/review'));
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.stubGlobal('location', new URL('https://chatgpt.com/library'));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(navigationMessages()).toHaveLength(2);
+    expect(storedStatus).toBe('manual_required');
+  });
+
   it('retries a rejected state update without committing it locally', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const sendMessage = vi.mocked(browser.runtime.sendMessage);
@@ -285,9 +307,9 @@ describe('provider content-script recovery', () => {
   });
 
   it.each([
-    '<div style="position:fixed">You\'ve reached your deep research limit.</div>',
-    '<form style="position:fixed"><div style="position:fixed">You\'ve reached your deep research limit.</div></form>',
-  ])('detects a short plain quota banner outside response roots: %s', async (markup) => {
+    '<div role="alert" style="position:fixed">You\'ve reached your deep research limit.</div>',
+    '<form role="dialog" style="position:fixed"><div style="position:fixed">You\'ve reached your deep research limit.</div></form>',
+  ])('detects a reached quota notice in a semantic region: %s', async (markup) => {
     document.body.innerHTML = `${markup}<button style="position:fixed" aria-label="Stop generating"></button>`;
     await resume('researching');
     await vi.advanceTimersByTimeAsync(2000);
@@ -296,6 +318,29 @@ describe('provider content-script recovery', () => {
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'content:state', status: 'quota_exhausted',
     }));
+  });
+
+  it('ignores a standalone upsell and non-semantic limit text while a response streams', async () => {
+    document.body.innerHTML = `
+      <aside style="position:fixed">Upgrade to SuperGrok for more DeepSearch.</aside>
+      <div style="position:fixed">You've reached your deep research limit.</div>
+      <div style="position:fixed" data-message-author-role="assistant">The report is still streaming.</div>
+      <button style="position:fixed" aria-label="Stop generating"></button>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('researching');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
+  });
+
+  it('still accepts a completed assistant quota response without a page-level alert', async () => {
+    await resume('researching');
+    answer("You've reached your deep research limit. Please try again later.");
+    await vi.advanceTimersByTimeAsync(4000);
+
+    expect(storedStatus).toBe('quota_exhausted');
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
   });
 
   it('ignores an exact quota sentence inside the composer', async () => {

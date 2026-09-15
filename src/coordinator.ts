@@ -87,8 +87,9 @@ async function mutateStoredRun<T>(runId: string, mutation: (run: Run) => T): Pro
   return withRunLock(runId, async () => {
     const run = await getRun(runId);
     if (!run) throw new CoordinatorRequestError('Run not found.', 'run_not_found');
+    const before = JSON.stringify(run);
     const value = mutation(run);
-    await putRun(run);
+    if (JSON.stringify(run) !== before) await putRun(run);
     return { run, value };
   });
 }
@@ -352,6 +353,7 @@ async function mutateProvider(
     const verifiedPage = verifyContentPage(providerRun, sender ?? {}, conversationKey, navigationMode);
     validateProviderTransition(providerRun, status);
     const previousConversationKey = normalizeConversationKey(providerRun.conversationKey, provider);
+    const previouslyDetached = providerRun.detachedAt !== undefined;
     const conversationBound = providerRun.conversationKey === undefined && verifiedPage.conversationKey !== undefined;
     if (verifiedPage.kind !== 'interrupted' && verifiedPage.kind !== 'detached') {
       providerRun.conversationKey = verifiedPage.conversationKey ?? previousConversationKey;
@@ -375,7 +377,8 @@ async function mutateProvider(
     if (firstTimeout) providerRun.researchTimedOutAt = Date.now();
     if (isTerminalProviderStatus(status)) providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
-    return timeout ? firstTimeout : changed || refreshedResearchInterval || conversationBound;
+    return timeout ? firstTimeout : changed || refreshedResearchInterval || conversationBound
+      || previouslyDetached !== (providerRun.detachedAt !== undefined);
   });
   // The state is durable. UI side effects must not invalidate its acknowledgement.
   try {
@@ -386,7 +389,7 @@ async function mutateProvider(
     if (changed && (status === 'awaiting_user' || status === 'manual_required')) {
       await createPlatform().notify(`attention:${runId}:${provider}`, `${ADAPTERS[provider].label} needs your input`, detail || 'Open the provider tab to continue.');
     }
-    await broadcastRuns();
+    if (changed) await broadcastRuns();
   } catch (error) { console.error('Could not update UI after persisting provider state.', error); }
   return run;
 }
@@ -651,20 +654,41 @@ async function persistCaptureJob(
   if (!rawMarkdown.trim() || (rawMarkdown.trim().length < 40 && !shortDomBacked)) {
     throw new Error('Clipboard and DOM capture did not contain a usable report.');
   }
-  const resolved = await resolveCitationUrls(job.provider, job.domCitations);
-  const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
-  const researchTrail = job.researchTrail
-    ? normalizeResearchTrail(job.researchTrail, reconciled.citations)
-    : undefined;
+  let normalizedMarkdown = rawMarkdown;
+  let citations: Capture['citations'] = [];
+  let unplacedCitationCount = 0;
+  let urlsResolved = 0;
+  let urlsUnresolved = 0;
+  let researchTrail: Capture['researchTrail'];
+  let captureMethod: Capture['captureMethod'] = copied ? (job.domCitations.length ? 'copy+dom' : 'copy_only') : 'dom_only';
+  try {
+    const resolved = await resolveCitationUrls(job.provider, job.domCitations);
+    const reconciled = reconcileCitations(rawMarkdown, resolved.citations, ADAPTERS[job.provider].citationMarkerStyle);
+    normalizedMarkdown = reconciled.markdown;
+    citations = reconciled.citations;
+    unplacedCitationCount = reconciled.unplacedCitationCount;
+    urlsResolved = resolved.resolved;
+    urlsUnresolved = resolved.unresolved;
+    researchTrail = job.researchTrail
+      ? normalizeResearchTrail(job.researchTrail, reconciled.citations)
+      : undefined;
+  } catch (error) {
+    if (!job.domMarkdown.trim() || (job.domMarkdown.trim().length < 40 && !shortDomBacked)) throw error;
+    // Malformed citation/trail metadata must not destroy the already-verified
+    // report. Keep its plain DOM text as a degraded, citation-free artifact.
+    normalizedMarkdown = job.domMarkdown;
+    captureMethod = 'dom_only';
+    urlsUnresolved = job.domCitations.length;
+  }
   const capture: Capture = {
-    rawMarkdown,
-    normalizedMarkdown: reconciled.markdown,
-    citations: reconciled.citations,
-    captureMethod: copied ? (job.domCitations.length ? 'copy+dom' : 'copy_only') : 'dom_only',
-    unplacedCitationCount: reconciled.unplacedCitationCount,
+    rawMarkdown: captureMethod === 'dom_only' && copied ? job.domMarkdown : rawMarkdown,
+    normalizedMarkdown,
+    citations,
+    captureMethod,
+    unplacedCitationCount,
     capturedAt: Date.now(),
-    urlsResolved: resolved.resolved,
-    urlsUnresolved: resolved.unresolved,
+    urlsResolved,
+    urlsUnresolved,
     title: job.title,
     researchTrail,
   };
@@ -704,14 +728,15 @@ async function completeProviderCapture(
       storedRun.status = deriveRunStatus(storedRun);
       return { completed: false, attached: true };
     }
-    assertTransition(providerRun.status, 'complete');
+    // The saved capture is stronger evidence than a late timeout or navigation
+    // attention state. Only an already-terminal status keeps its outcome.
     providerRun.status = 'complete';
     providerRun.statusDetail = undefined;
     providerRun.completedAt ??= Date.now();
     storedRun.status = deriveRunStatus(storedRun);
     return { completed: true, attached: true };
   });
-  if (!value.attached) return false;
+  if (!value.attached) throw new Error(`Could not link ${provider} capture to its provider run.`);
   await settleProvider(runId, provider, value.completed);
   return value.completed;
 }
@@ -773,6 +798,26 @@ async function containCaptureJobFailure(
   }
 }
 
+type OwnedProviderTabKind = 'original' | 'recoverable' | 'different_conversation' | 'external' | 'unavailable';
+
+async function classifyOwnedProviderTab(providerRun: ProviderRun): Promise<{ kind: OwnedProviderTabKind }> {
+  let url: string | undefined;
+  try { url = (await browser.tabs.get(providerRun.tabId)).url; }
+  catch { return { kind: 'unavailable' }; }
+  if (!url) return { kind: 'unavailable' };
+  if (isProviderAuthenticationUrl(url, providerRun.provider)) return { kind: 'recoverable' };
+  if (!isProviderUrl(url, providerRun.provider)) return { kind: 'external' };
+  const page = classifyProviderPage(url, providerRun.provider);
+  const boundKey = normalizeConversationKey(providerRun.conversationKey, providerRun.provider);
+  if (providerRun.conversationKey !== undefined && boundKey === undefined) return { kind: 'different_conversation' };
+  if (page.kind === 'conversation') {
+    return boundKey && !conversationKeysMatch(boundKey, page.key, providerRun.provider)
+      ? { kind: 'different_conversation' } : { kind: 'original' };
+  }
+  return page.kind === 'entry' && boundKey === undefined
+    ? { kind: 'original' } : { kind: 'recoverable' };
+}
+
 async function processCaptureQueue(): Promise<void> {
   if (captureWorkerRunning) return;
   captureWorkerRunning = true;
@@ -784,59 +829,12 @@ async function processCaptureQueue(): Promise<void> {
       const run = await getRun(job.runId);
       const providerRun = run?.providerRuns[job.provider];
       if (!run || !providerRun) {
-        await deleteJob(job.id);
+        // The report may outlive a temporarily unavailable run record. Keep it
+        // leased for a later recovery pass instead of discarding verified DOM.
+        job.state = 'leased';
+        job.leasedAt = Date.now();
+        await putJob(job);
         continue;
-      }
-      if (!isTerminalProviderStatus(providerRun.status) && providerRun.conversationKey && !job.tabUnavailable) {
-        let detached = false;
-        let terminalNavigation = false;
-        try {
-          const tab = await browser.tabs.get(providerRun.tabId);
-          if (tab.url) {
-            const page = classifyProviderPage(tab.url, providerRun.provider);
-            const providerUrl = isProviderUrl(tab.url, providerRun.provider);
-            detached = providerUrl && page.kind !== 'conversation';
-            terminalNavigation = !providerUrl || (page.kind === 'conversation'
-              && !conversationKeysMatch(providerRun.conversationKey, page.key, providerRun.provider));
-          }
-        } catch {
-          detached = false;
-        }
-        if (terminalNavigation) {
-          await deleteJob(job.id);
-          const { value: interrupted } = await mutateStoredRun(run.id, (storedRun) => {
-            const current = storedRun.providerRuns[job.provider];
-            if (!current || isTerminalProviderStatus(current.status)) return false;
-            assertTransition(current.status, 'interrupted');
-            current.status = 'interrupted';
-            current.statusDetail = 'Provider tab navigated away before clipboard capture completed.';
-            current.completedAt ??= Date.now();
-            storedRun.status = deriveRunStatus(storedRun);
-            return true;
-          });
-          if (interrupted) await settleProvider(run.id, job.provider);
-          continue;
-        }
-        if (detached) {
-          job.deferredForNavigation = true;
-          job.state = 'queued';
-          job.leasedAt = undefined;
-          await putJob(job);
-          const { run: detachedRun } = await mutateStoredRun(run.id, (storedRun) => {
-            const current = storedRun.providerRuns[job.provider];
-            if (!current || isTerminalProviderStatus(current.status)) return;
-            current.status = 'manual_required';
-            current.statusDetail = `Return to the original ${ADAPTERS[job.provider].label} conversation to finish saving.`;
-            current.detachedAt ??= Date.now();
-            storedRun.status = deriveRunStatus(storedRun);
-          });
-          await platform.notify(
-            `attention:${run.id}:${job.provider}`,
-            `${ADAPTERS[job.provider].label} needs your input`,
-            detachedRun.providerRuns[job.provider]!.statusDetail!,
-          ).catch(() => undefined);
-          continue;
-        }
       }
       const existingCapture = await getCapture(job.id);
       if (existingCapture) {
@@ -851,6 +849,52 @@ async function processCaptureQueue(): Promise<void> {
         }
         continue;
       }
+      const page = await classifyOwnedProviderTab(providerRun);
+      let forceDomFallback = job.tabUnavailable
+        || isTerminalProviderStatus(providerRun.status)
+        || job.attempts >= MAX_CAPTURE_ATTEMPTS
+        || (job.deferredForNavigation && Date.now() - (job.deferredAt ?? job.createdAt) >= 120_000);
+      if (page.kind === 'unavailable') {
+        job.tabUnavailable = true;
+        forceDomFallback = true;
+      } else if (page.kind === 'different_conversation' || page.kind === 'external') {
+        forceDomFallback = true;
+        await mutateStoredRun(run.id, (storedRun) => {
+          const current = storedRun.providerRuns[job.provider];
+          if (!current || isTerminalProviderStatus(current.status)) return false;
+          current.status = 'interrupted';
+          current.statusDetail = 'Provider tab navigated away before clipboard capture completed.';
+          current.completedAt ??= Date.now();
+          storedRun.status = deriveRunStatus(storedRun);
+          return true;
+        });
+      } else if (page.kind === 'recoverable' && !forceDomFallback) {
+        job.deferredForNavigation = true;
+        job.deferredAt ??= Date.now();
+        job.state = 'queued';
+        job.leasedAt = undefined;
+        await putJob(job);
+        const { run: detachedRun, value: newlyDetached } = await mutateStoredRun(run.id, (storedRun) => {
+          const current = storedRun.providerRuns[job.provider];
+          if (!current || isTerminalProviderStatus(current.status)) return false;
+          const first = current.detachedAt === undefined;
+          current.status = 'manual_required';
+          current.statusDetail = `Return to the original ${ADAPTERS[job.provider].label} conversation to finish saving.`;
+          current.detachedAt ??= Date.now();
+          storedRun.status = deriveRunStatus(storedRun);
+          return first;
+        });
+        if (newlyDetached) await platform.notify(
+          `attention:${run.id}:${job.provider}`,
+          `${ADAPTERS[job.provider].label} needs your input`,
+          detachedRun.providerRuns[job.provider]!.statusDetail!,
+        ).catch(() => undefined);
+        continue;
+      } else if (page.kind === 'original' && job.deferredForNavigation) {
+        job.deferredForNavigation = undefined;
+        job.deferredAt = undefined;
+        await putJob(job);
+      }
       if (!isTerminalProviderStatus(providerRun.status) && providerRun.status !== 'capturing') {
         try {
           await ensureProviderCapturing(run.id, job.provider);
@@ -862,9 +906,6 @@ async function processCaptureQueue(): Promise<void> {
           if (!(error instanceof CoordinatorRequestError && error.code === 'provider_terminal')) throw error;
         }
       }
-      const forceDomFallback = job.tabUnavailable
-        || isTerminalProviderStatus(providerRun.status)
-        || job.attempts >= MAX_CAPTURE_ATTEMPTS;
       job.state = 'leased';
       job.leasedAt = Date.now();
       if (job.attempts < MAX_CAPTURE_ATTEMPTS) job.attempts += 1;
@@ -877,16 +918,25 @@ async function processCaptureQueue(): Promise<void> {
           await completeProviderCapture(run.id, job.provider, persisted.id, persisted.degraded, persisted.revision);
           await deleteJob(job.id);
         } catch (error) {
-          await containCaptureJobFailure(run.id, job.provider, error, persisted);
+          console.error(`Could not link the persisted ${job.provider} report; retaining its recovery job.`, error);
         }
       } catch (error) {
         if (persisted) {
-          await containCaptureJobFailure(run.id, job.provider, error, persisted);
+          console.error(`Could not finish the persisted ${job.provider} report; retaining its recovery job.`, error);
           continue;
         }
         if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
-          await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
-          await containCaptureJobFailure(run.id, job.provider, error);
+          const usableDom = job.domMarkdown.trim().length >= 40
+            || Boolean(job.copyControlObserved && job.domMarkdown.trim());
+          if (usableDom) {
+            console.error(`Could not persist the verified ${job.provider} DOM report; retaining its recovery job.`, error);
+            job.state = 'leased';
+            job.leasedAt = Date.now();
+            await putJob(job);
+          } else {
+            await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
+            await containCaptureJobFailure(run.id, job.provider, error);
+          }
           continue;
         }
         console.error(`Capture job attempt failed for ${job.provider}; retaining its DOM fallback.`, error);
@@ -1142,6 +1192,7 @@ async function markCaptureJobTabUnavailable(runId: string, provider: ProviderId)
   if (!job) return false;
   job.tabUnavailable = true;
   job.deferredForNavigation = undefined;
+  job.deferredAt = undefined;
   job.state = 'queued';
   job.leasedAt = undefined;
   await putJob(job);
@@ -1152,6 +1203,7 @@ async function unblockNavigationDeferredCapture(runId: string, provider: Provide
   const job = await getJob(captureId(runId, provider));
   if (!job?.deferredForNavigation) return false;
   job.deferredForNavigation = undefined;
+  job.deferredAt = undefined;
   job.state = 'queued';
   job.leasedAt = undefined;
   await putJob(job);
@@ -1213,7 +1265,7 @@ async function reconcileRuns(): Promise<void> {
     const browserSessionId = await getBrowserSessionId();
     const runs = await listRuns();
     setKnownRunTabs(runs);
-    for (const snapshot of runs.filter((item) => item.status !== 'complete')) {
+    for (const snapshot of runs.filter((item) => item.status !== 'complete' || item.completedAt === undefined)) {
       if (snapshot.browserSessionId !== browserSessionId) {
         for (const providerRun of Object.values(snapshot.providerRuns)) {
           if (isTerminalProviderStatus(providerRun.status)) continue;
@@ -1254,32 +1306,24 @@ async function reconcileRuns(): Promise<void> {
       }
       for (const providerRun of Object.values(snapshot.providerRuns)) {
         if (isTerminalProviderStatus(providerRun.status)) continue;
-        let providerPage = false;
-        let valid = false;
-        let tabUnavailable = false;
-        try {
-          const tab = await browser.tabs.get(providerRun.tabId);
-          tabUnavailable = !tab.url;
-          const page = tab.url
-            ? classifyProviderPage(tab.url, providerRun.provider)
-            : { kind: 'unsupported' } as const;
-          const storedConversationKey = normalizeConversationKey(providerRun.conversationKey, providerRun.provider);
-          const malformedStoredKey = providerRun.conversationKey !== undefined && storedConversationKey === undefined;
-          const detachedProviderPage = providerRun.detachedAt !== undefined
-            && isProviderUrl(tab.url, providerRun.provider)
-            && page.kind !== 'conversation';
-          providerPage = !malformedStoredKey && (page.kind === 'entry'
-            ? providerRun.conversationKey === undefined
-            : page.kind === 'conversation' && (storedConversationKey === undefined
-              || conversationKeysMatch(storedConversationKey, page.key, providerRun.provider)));
-          valid = !malformedStoredKey
-            && (providerPage || detachedProviderPage || isProviderAuthenticationUrl(tab.url, providerRun.provider));
-        } catch {
-          valid = false;
-          tabUnavailable = true;
+        const page = await classifyOwnedProviderTab(providerRun);
+        const providerPage = page.kind === 'original';
+        const valid = providerPage || page.kind === 'recoverable';
+        if (page.kind === 'recoverable' && providerRun.detachedAt === undefined) {
+          await mutateStoredRun(snapshot.id, (storedRun) => {
+            const current = storedRun.providerRuns[providerRun.provider];
+            if (!current || isTerminalProviderStatus(current.status)) return;
+            current.status = 'manual_required';
+            current.statusDetail = `Return to the original ${ADAPTERS[providerRun.provider].label} conversation to continue monitoring.`;
+            current.detachedAt = Date.now();
+            storedRun.status = deriveRunStatus(storedRun);
+          });
         }
-        if (!valid && tabUnavailable
+        if (!valid && page.kind === 'unavailable'
           && await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider)) continue;
+        if (page.kind === 'different_conversation' || page.kind === 'external') {
+          await unblockNavigationDeferredCapture(snapshot.id, providerRun.provider);
+        }
         const checkedRun = await recordReconcileCheck(snapshot.id, providerRun.provider, valid);
         const checkedProviderRun = checkedRun.providerRuns[providerRun.provider];
         if (checkedProviderRun && isTerminalProviderStatus(checkedProviderRun.status)) {
@@ -1302,7 +1346,11 @@ async function reconcileRuns(): Promise<void> {
       }
     }
     await processCaptureQueue();
-    await broadcastRuns();
+    for (const snapshot of runs) {
+      const latest = await getRun(snapshot.id);
+      if (latest && latest.completedAt === undefined) await maybeFinalize(latest);
+    }
+    if (JSON.stringify(await listRuns()) !== JSON.stringify(runs)) await broadcastRuns();
   } finally {
     reconcileWorkerRunning = false;
   }

@@ -3,6 +3,7 @@ import { ADAPTERS, classifyProviderPage, conversationKeysMatch, normalizeConvers
 import { tokenContainment } from '@/src/citations';
 import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, responseFingerprint, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
+import { PROGRESS_TRAILING_DURATION } from '@/src/durations';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent, ContentStateReason, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
@@ -38,6 +39,7 @@ interface ActiveRun {
   manualSetupRequired: boolean;
   timeoutActivity: TimeoutActivity;
   planApproval: PlanApprovalState;
+  navigationReported: boolean;
 }
 
 interface PlanApprovalState {
@@ -51,6 +53,9 @@ interface PlanApprovalEpisode {
   lastAttemptAt: number;
   confirmed: boolean;
   approvalIntent: boolean;
+  autoApproveAllowed: boolean;
+  absentSince?: number;
+  rawText: string;
   element?: HTMLElement;
   responseGuard: PlanResponseGuard;
   progressBaseline?: string;
@@ -79,15 +84,16 @@ let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
 let sweepTimer: number | undefined;
 let inspectionTimer: number | undefined;
+let planSnapshotBuildCount = 0;
 let lastInspectionAt = 0;
 const RESEARCH_TIMEOUT_MS = 45 * 60 * 1000;
 const INSPECTION_THROTTLE_MS = 250;
 const RESPONSE_VISIBILITY = { ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 const HOVER_COPY_VISIBILITY = { allowTransparent: true, ignoreAncestorOpacity: true } as const;
 const PAGE_QUOTA_REGION = '[role="alert"], [role="dialog"], dialog, [role="status"], [aria-live="assertive"], [aria-live="polite"]';
+const PAGE_QUOTA_TERMINAL = /(?:\b(?:reached|hit|exceeded)\b.{0,120}\b(?:limit|quota)\b|\b(?:limit|quota)\b.{0,60}\b(?:reached|exceeded)\b)/i;
 const PAGE_QUOTA_EXCLUDED_REGION = 'nav, aside, [role="navigation"], [contenteditable="true"], textarea, [data-message-author-role="user"], user-query, [data-test-id="user-query"], [data-testid*="user-message" i]';
 const PLAN_APPENDED_REPORT_MIN_CHARS = 1000;
-const PROGRESS_TRAILING_DURATION = /\s*(?:[·•—-]\s*)?(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})\s*$/i;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -123,6 +129,11 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
     type: 'content:state', runId: run.id, provider: run.adapter.id,
     status, detail, submittedAt: reportSubmittedAt, reason, conversationKey: run.conversationKey,
   });
+  if (reason === 'provider_navigation') {
+    const page = classifyProviderPage(location.href, run.adapter.id);
+    run.navigationReported = page.kind !== 'conversation'
+      || Boolean(run.conversationKey && !conversationKeysMatch(run.conversationKey, page.key, run.adapter.id));
+  } else if (status === 'researching') run.navigationReported = false;
   if (!isTerminalProviderStatus(status)) assertCurrent(run);
 }
 
@@ -321,7 +332,8 @@ function findTrustedPageQuotaNotice(
     !responseRoots.some((root) => root.contains(element))
     && !element.closest(PAGE_QUOTA_EXCLUDED_REGION)
     && normalizeActivityText(element.textContent ?? '').length <= 500
-    && (Boolean(element.closest(PAGE_QUOTA_REGION)) || element.children.length === 0)
+    && PAGE_QUOTA_TERMINAL.test(normalizeActivityText(element.textContent ?? ''))
+    && Boolean(element.closest(PAGE_QUOTA_REGION))
   )) ?? null;
 }
 
@@ -638,7 +650,7 @@ function inspectPage(): void {
       return;
     }
     if (pageIdentity.kind !== 'conversation') {
-      if (active.researchTimedOutAt === undefined) {
+      if (!active.navigationReported) {
         reportEventually(
           'manual_required',
           `Return to the original ${adapter.label} conversation to continue monitoring.`,
@@ -652,7 +664,7 @@ function inspectPage(): void {
     active.conversationKey = pageIdentity.key;
   }
   if (pageIdentity.kind === 'unsupported') {
-    if (active.researchTimedOutAt === undefined) {
+    if (!active.navigationReported) {
       reportEventually(
         'manual_required',
         `Return to the ${adapter.label} conversation to continue monitoring.`,
@@ -662,12 +674,13 @@ function inspectPage(): void {
     }
     return;
   }
+  active.navigationReported = false;
 
   const candidateRoots = candidateResponseRoots(adapter);
   const finalRoots = completedResponseRootsForCandidates(adapter, candidateRoots);
   const latestResponse = candidateRoots.at(-1) ?? null;
   const latestFinalResponse = latestResponse && finalRoots.includes(latestResponse) ? latestResponse : null;
-  const plan = adapter.selectors.planApproval ? findElement(adapter.selectors.planApproval) : null;
+  let plan = adapter.selectors.planApproval ? findAll(adapter.selectors.planApproval).at(-1) ?? null : null;
   const streaming = findStreamingIndicator(adapter, latestResponse);
   let latestSnapshot: ResponseSnapshot | undefined;
   const getLatestSnapshot = () => {
@@ -675,39 +688,61 @@ function inspectPage(): void {
     return latestSnapshot;
   };
   const planState = active.planApproval;
+  if (latestResponse) planState.guards = planState.guards.filter((guard) => guard.root === latestResponse);
+  else planState.guards = [];
+  if (planState.current && !planState.current.autoApproveAllowed && latestResponse
+    && findElement(adapter.selectors.copyButton, latestResponse)) {
+    // A completed response is stronger evidence than a stale control carried
+    // forward from a manually reviewed plan.
+    plan = null;
+  }
   if (plan) {
     const guardRoot = latestResponse ?? plan;
-    const snapshot = latestResponse ? getLatestSnapshot()! : createResponseSnapshot(plan);
-    const responseGuard = {
+    const rawText = guardRoot.textContent ?? '';
+    let episode = planState.current;
+    const responseChanged = Boolean(latestResponse && episode && episode.responseGuard.root !== latestResponse
+      && (episode.confirmed || (episode.responseGuard.root !== episode.element && episode.responseGuard.root.isConnected)));
+    const controlChanged = Boolean(episode?.element && episode.element !== plan);
+    const newEpisode = !episode || (responseChanged && controlChanged);
+    const manualRevisedPlan = Boolean(episode && responseChanged && !controlChanged
+      && (episode.confirmed || rawText !== episode.rawText)
+      && /\b(?:research plan|proposed research steps?|plan for (?:this|the) research)\b/i.test(rawText)
+      && !(latestResponse && findElement(adapter.selectors.copyButton, latestResponse)));
+    const needsSnapshot = newEpisode || manualRevisedPlan || !episode
+      || (!episode.confirmed && (episode.responseGuard.root !== guardRoot || episode.rawText !== rawText));
+    const snapshot = needsSnapshot ? latestResponse ? getLatestSnapshot()! : createResponseSnapshot(plan) : undefined;
+    if (snapshot) planSnapshotBuildCount += 1;
+    const responseGuard = snapshot ? {
       root: guardRoot,
       activityText: responseActivityTextWithoutCitations(snapshot),
-    };
-    const key = responseFingerprint(guardRoot, responseGuard.activityText);
-    let episode = planState.current;
-    const newEpisode = !episode
-      || episode.responseGuard.root !== guardRoot
-      || (episode.confirmed && episode.key !== key && episode.element !== plan);
-    if (newEpisode) {
+    } : episode!.responseGuard;
+    const key = snapshot ? responseFingerprint(guardRoot, responseGuard.activityText) : episode!.key;
+    if (newEpisode || manualRevisedPlan) {
       episode = {
         key,
         attempts: 0,
         lastAttemptAt: 0,
         confirmed: false,
         approvalIntent: false,
+        autoApproveAllowed: newEpisode,
+        rawText,
         responseGuard,
         progressBaseline: progressActivitySignature(streaming),
       };
       planState.current = episode;
-      planState.guards.push(responseGuard);
+      planState.guards = [responseGuard];
     }
     if (!episode) throw new Error('Could not initialize Gemini plan state.');
-    if (!episode.confirmed && episode.key !== key) {
-      // A plan may hydrate in place. Keep its retry budget, but guard every
-      // observed version so a long expansion cannot become report content.
+    episode.absentSince = undefined;
+    if (!episode.confirmed && (episode.key !== key || episode.responseGuard.root !== guardRoot)) {
+      // Keep the first and latest observed version of the current plan root.
       episode.key = key;
       episode.responseGuard = responseGuard;
-      planState.guards.push(responseGuard);
+      if (planState.guards[0]?.root !== guardRoot) planState.guards = [responseGuard];
+      else if (planState.guards.length === 1) planState.guards.push(responseGuard);
+      else planState.guards[1] = responseGuard;
     }
+    episode.rawText = rawText;
     observePlanActivation(active, episode, plan);
   }
 
@@ -738,14 +773,14 @@ function inspectPage(): void {
       else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
         reportEventually('researching', undefined, active.submittedAt);
       }
-      if (active.geminiAutoApprove && episode.attempts < 3
+      if (active.geminiAutoApprove && episode.autoApproveAllowed && episode.attempts < 3
         && now - episode.lastAttemptAt >= 1000) {
         episode.attempts += 1;
         episode.lastAttemptAt = now;
         episode.approvalIntent = true;
         plan.click();
       }
-      if ((!active.geminiAutoApprove || episode.attempts >= 3) && active.status !== 'awaiting_user') {
+      if ((!active.geminiAutoApprove || !episode.autoApproveAllowed || episode.attempts >= 3) && active.status !== 'awaiting_user') {
         reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
       }
       return;
@@ -755,9 +790,8 @@ function inspectPage(): void {
   if (!plan && episode && !episode.confirmed) {
     const progressChanged = streaming
       && progressActivitySignature(streaming) !== episode.progressBaseline;
-    const approvalControlBecameInactive = episode.approvalIntent && episode.element
-      && (!episode.element.isConnected || !isVisible(episode.element));
-    if (approvalControlBecameInactive || progressChanged) {
+    if (episode.approvalIntent) episode.absentSince ??= now;
+    if (progressChanged || (episode.absentSince !== undefined && now - episode.absentSince >= 5000)) {
       episode.confirmed = true;
       approvedPlan = true;
     }
@@ -962,6 +996,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     manualSetupRequired: false,
     timeoutActivity: { phase: 'hydrating' },
     planApproval: { guards: [] },
+    navigationReported: false,
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? {
         status: request.status,
@@ -988,6 +1023,11 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   }
   await runAutomation(run);
 }
+
+export const providerContentTestHooks = {
+  planGuardCount: () => active?.planApproval.guards.length ?? 0,
+  planSnapshotBuildCount: () => planSnapshotBuildCount,
+};
 
 export default defineContentScript({
   matches: ['https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*', 'https://grok.com/*'],

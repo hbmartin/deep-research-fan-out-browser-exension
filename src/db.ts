@@ -1,6 +1,6 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import { createReportFolder, slugify } from './state';
-import { PROVIDERS, type Capture, type CaptureJob, type ProviderId, type ProviderRun, type ReportDirectoryConfig, type Run, type RunId } from './types';
+import { PROVIDERS, isTerminalProviderStatus, type Capture, type CaptureJob, type ProviderId, type ProviderRun, type ReportDirectoryConfig, type Run, type RunId } from './types';
 
 interface ResearchDb extends DBSchema {
   runs: { key: string; value: Run; indexes: { 'by-created': number; 'by-status': string } };
@@ -219,14 +219,12 @@ export async function getRun(id: RunId): Promise<Run | undefined> {
     warnInvalidRun(stored);
     return undefined;
   }
-  if (normalized.changed) await database.put('runs', normalized.run);
   return normalized.run;
 }
 export async function listRuns(): Promise<Run[]> {
   const database = await db();
   const storedRuns = await database.getAllFromIndex('runs', 'by-created');
   const runs: Run[] = [];
-  const migrated: Run[] = [];
   for (const stored of storedRuns) {
     const normalized = normalizeRunRecord(stored);
     if (!normalized.run) {
@@ -234,31 +232,31 @@ export async function listRuns(): Promise<Run[]> {
       continue;
     }
     runs.push(normalized.run);
-    if (normalized.changed) migrated.push(normalized.run);
-  }
-  if (migrated.length) {
-    const transaction = database.transaction('runs', 'readwrite');
-    for (const run of migrated) await transaction.store.put(run);
-    await transaction.done;
   }
   return runs.sort((a, b) => b.createdAt - a.createdAt);
 }
 export async function putCapture(id: string, capture: Capture): Promise<void> {
   const database = await db();
-  const existing = await database.get('captures', id);
+  const transaction = database.transaction('captures', 'readwrite');
+  const existing = await transaction.store.get(id);
   capture.revision = existing && captureContentSignature(existing) === captureContentSignature(capture)
     ? existing.revision ?? legacyCaptureRevision(existing)
     : crypto.randomUUID();
-  await database.put('captures', capture, id);
+  await transaction.store.put(capture, id);
+  await transaction.done;
 }
 export async function getCapture(id?: string): Promise<Capture | undefined> {
   if (!id) return undefined;
   const database = await db();
-  const capture = await database.get('captures', id);
+  const current = await database.get('captures', id);
+  if (!current || current.revision) return current;
+  const transaction = database.transaction('captures', 'readwrite');
+  const capture = await transaction.store.get(id);
   if (capture && !capture.revision) {
     capture.revision = legacyCaptureRevision(capture);
-    await database.put('captures', capture, id);
+    await transaction.store.put(capture, id);
   }
+  await transaction.done;
   return capture;
 }
 export async function putJob(job: CaptureJob): Promise<void> { await (await db()).put('jobs', job); }
@@ -287,8 +285,13 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();
   const jobs = (await database.getAllFromIndex('jobs', 'by-created')).sort((a, b) => a.createdAt - b.createdAt);
-  return jobs.find((job) => !job.deferredForNavigation
-    && (job.state === 'queued' || (job.leasedAt && Date.now() - job.leasedAt > 60_000)));
+  for (const job of jobs) {
+    if (job.state !== 'queued' && !(job.leasedAt && Date.now() - job.leasedAt > 60_000)) continue;
+    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= 120_000) return job;
+    const run = await getRun(job.runId);
+    if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) return job;
+  }
+  return undefined;
 }
 export async function getRedirect(wrapper: string): Promise<string | undefined> { return (await db()).get('redirects', wrapper).then((item) => item?.canonical); }
 export async function putRedirect(wrapper: string, canonical: string, resolvedAt = Date.now()): Promise<void> {

@@ -9,6 +9,7 @@ let storedStatus: ProviderRunStatus;
 let submittedAt: number | undefined;
 let researchTimedOutAt: number | undefined;
 let invalidTransitions: string[];
+let planDebug: { planGuardCount(): number; planSnapshotBuildCount(): number };
 
 beforeEach(async () => {
   vi.resetModules();
@@ -40,6 +41,7 @@ beforeEach(async () => {
     }),
   } });
   const module = await import('../entrypoints/providers.content');
+  planDebug = module.providerContentTestHooks;
   (module.default as unknown as { main(): void }).main();
 });
 
@@ -102,7 +104,7 @@ describe('Gemini plan timeout recovery', () => {
 
     plan.remove();
     document.querySelector('[aria-label="Stop response"]')!.remove();
-    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(storedStatus).toBe('researching');
   });
 
@@ -141,6 +143,62 @@ describe('Gemini plan timeout recovery', () => {
     expect(replacementClick).toHaveBeenCalledTimes(2);
   });
 
+  it('carries the three-click budget across repeated re-renders without a response root', async () => {
+    const first = planButton();
+    const clicks = vi.fn();
+    first.addEventListener('click', clicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    for (let index = 0; index < 12; index += 1) {
+      document.querySelector('[aria-label="Start research"]')!.remove();
+      const replacement = planButton();
+      replacement.addEventListener('click', clicks);
+      await vi.advanceTimersByTimeAsync(1100);
+    }
+
+    expect(clicks).toHaveBeenCalledTimes(3);
+    expect(storedStatus).toBe('awaiting_user');
+  });
+
+  it('does not confirm approval after a transient hidden plan control', async () => {
+    response('A research plan is ready for approval.');
+    const plan = planButton();
+    const clicks = vi.fn();
+    plan.addEventListener('click', clicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(clicks).toHaveBeenCalledTimes(1);
+
+    plan.style.display = 'none';
+    await vi.advanceTimersByTimeAsync(2000);
+    plan.style.display = 'block';
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
+
+    plan.remove();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(storedStatus).toBe('researching');
+  });
+
+  it('keeps only initial and latest guards without rebuilding unchanged plan snapshots', async () => {
+    response('A research plan is ready for approval.');
+    planButton();
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    const initialBuilds = planDebug.planSnapshotBuildCount();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(planDebug.planSnapshotBuildCount()).toBe(initialBuilds);
+
+    for (let index = 0; index < 30; index += 1) {
+      document.querySelector('p')!.textContent = `A research plan is ready for approval. Step ${index}.`;
+      await vi.advanceTimersByTimeAsync(300);
+      expect(planDebug.planGuardCount()).toBeLessThanOrEqual(2);
+    }
+    expect(planDebug.planSnapshotBuildCount()).toBeGreaterThan(initialBuilds);
+    expect(planDebug.planGuardCount()).toBeLessThanOrEqual(2);
+  });
+
   it('grants a fresh interval only after the plan disappears and verified progress begins', async () => {
     response('A research plan is ready for approval.');
     const plan = planButton();
@@ -167,7 +225,7 @@ describe('Gemini plan timeout recovery', () => {
 
     const resumedAt = Date.now();
     plan.remove();
-    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(10_000);
 
     const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
     expect(resumed).toMatchObject({ submittedAt: expect.any(Number) });
@@ -248,6 +306,99 @@ describe('Gemini plan timeout recovery', () => {
     expect(captures()).toHaveLength(0);
   });
 
+  it('selects a newly mounted approval control when the old control remains beside a revised response', async () => {
+    response('First research plan is ready for approval.');
+    const oldPlan = planButton();
+    const oldClicks = vi.fn();
+    oldPlan.addEventListener('click', oldClicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    document.body.insertAdjacentHTML('beforeend', '<span id="progress" style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    document.querySelector('#progress')!.remove();
+
+    document.body.insertAdjacentHTML('beforeend', '<model-response style="position:fixed"><p>Revised research plan with new proposed steps.</p></model-response>');
+    const newPlan = planButton();
+    const newClicks = vi.fn();
+    newPlan.addEventListener('click', newClicks);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(oldPlan.isConnected).toBe(true);
+    expect(oldClicks).toHaveBeenCalledTimes(1);
+    expect(newClicks).toHaveBeenCalled();
+    expect(captures()).toHaveLength(0);
+  });
+
+  it('starts a new logical episode for a new response and control before the old plan confirms', async () => {
+    response('First research plan is ready for approval.');
+    const first = planButton();
+    const firstClicks = vi.fn();
+    first.addEventListener('click', firstClicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(firstClicks).toHaveBeenCalledTimes(1);
+
+    document.body.insertAdjacentHTML('beforeend', '<model-response style="position:fixed"><p>Revised research plan with new proposed steps.</p></model-response>');
+    const revised = planButton();
+    const revisedClicks = vi.fn();
+    revised.addEventListener('click', revisedClicks);
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(firstClicks).toHaveBeenCalledTimes(1);
+    expect(revisedClicks).toHaveBeenCalled();
+    expect(captures()).toHaveLength(0);
+  });
+
+  it('requires manual approval for a revised plan that reuses the old control', async () => {
+    response('First research plan is ready for approval.');
+    const stalePlan = planButton();
+    const clicks = vi.fn();
+    stalePlan.addEventListener('click', clicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    document.body.insertAdjacentHTML('beforeend', '<span style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+
+    document.body.insertAdjacentHTML('beforeend', '<model-response style="position:fixed"><p>Revised research plan with changed proposed research steps.</p></model-response>');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(stalePlan.isConnected).toBe(true);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(captures()).toHaveLength(0);
+
+    document.querySelector('span')!.remove();
+    const revisedResponse = document.querySelectorAll('model-response').item(1);
+    revisedResponse.querySelector('p')!.textContent = `Completed report. ${'Evidence and analysis support the conclusion. '.repeat(35)}`;
+    revisedResponse.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Copy response">Copy</button>');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    expect(captures()).toContainEqual(expect.objectContaining({ type: 'content:capture', domMarkdown: expect.stringContaining('Completed report.') }));
+  });
+
+  it('captures a new report beside a stale plan control without another approval click', async () => {
+    response('First research plan is ready for approval.');
+    const stalePlan = planButton();
+    const clicks = vi.fn();
+    stalePlan.addEventListener('click', clicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    document.body.insertAdjacentHTML('beforeend', '<span id="progress" style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    document.querySelector('#progress')!.remove();
+
+    document.body.insertAdjacentHTML('beforeend', `<model-response style="position:fixed"><p>Completed report. ${'Evidence and analysis support the conclusion. '.repeat(35)}</p><button style="position:fixed" aria-label="Copy response">Copy</button></model-response>`);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(stalePlan.isConnected).toBe(true);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    expect(captures()).toContainEqual(expect.objectContaining({
+      type: 'content:capture', domMarkdown: expect.stringContaining('Completed report.'),
+    }));
+  });
+
   it('still times out when an observed plan control becomes hidden but remains connected', async () => {
     response('A research plan is ready for approval.');
     const plan = planButton();
@@ -255,7 +406,7 @@ describe('Gemini plan timeout recovery', () => {
     await vi.advanceTimersByTimeAsync(500);
     plan.style.display = 'none';
 
-    await vi.advanceTimersByTimeAsync(45 * 60 * 1000 + 2000);
+    await vi.advanceTimersByTimeAsync(45 * 60 * 1000 + 8000);
 
     expect(plan.isConnected).toBe(true);
     expect(storedStatus).toBe('manual_required');
