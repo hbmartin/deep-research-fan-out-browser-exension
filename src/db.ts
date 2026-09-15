@@ -1,4 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { NAVIGATION_DEFERRAL_MS } from './durations';
 import { createReportFolder, slugify } from './state';
 import { PROVIDERS, isTerminalProviderStatus, type Capture, type CaptureJob, type ProviderId, type ProviderRun, type ReportDirectoryConfig, type Run, type RunId } from './types';
 
@@ -14,6 +15,7 @@ let databasePromise: Promise<IDBPDatabase<ResearchDb>> | undefined;
 
 export const MAX_CAPTURE_ATTEMPTS = 3;
 export const REDIRECT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const ORPHAN_JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const REPORT_DIRECTORY_KEY = 'report-directory';
 const invalidRunWarnings = new Set<string>();
 const PROVIDER_STATUSES = new Set([
@@ -75,7 +77,29 @@ function validProviderRun(value: unknown, provider: ProviderId): value is Provid
     && optionalNumber(value.copiedAt)
     && optionalNumber(value.reconcileFailureCount)
     && optionalNumber(value.detachedAt)
+    && (value.detachedSetupStatus === undefined || ['opening', 'awaiting_ready', 'setting_mode'].includes(String(value.detachedSetupStatus)))
+    && (value.captureRecoveryPending === undefined || typeof value.captureRecoveryPending === 'boolean')
     && validSaveReceipt(value.saveReceipt);
+}
+
+function validCaptureJob(value: unknown): value is CaptureJob {
+  if (!record(value)) return false;
+  return typeof value.id === 'string' && typeof value.runId === 'string'
+    && PROVIDERS.includes(value.provider as ProviderId)
+    && finiteNumber(value.tabId)
+    && ['queued', 'leased', 'paused', 'orphaned'].includes(String(value.state))
+    && finiteNumber(value.createdAt)
+    && finiteNumber(value.attempts)
+    && typeof value.domMarkdown === 'string'
+    && Array.isArray(value.domCitations)
+    && optionalNumber(value.leasedAt)
+    && optionalNumber(value.orphanedAt)
+    && optionalNumber(value.deferredAt)
+    && optionalString(value.conversationKey)
+    && optionalString(value.title)
+    && (value.tabUnavailable === undefined || typeof value.tabUnavailable === 'boolean')
+    && (value.deferredForNavigation === undefined || typeof value.deferredForNavigation === 'boolean')
+    && (value.copyControlObserved === undefined || typeof value.copyControlObserved === 'boolean');
 }
 
 function normalizeRunRecord(value: unknown): { run?: Run; changed: boolean } {
@@ -260,7 +284,10 @@ export async function getCapture(id?: string): Promise<Capture | undefined> {
   return capture;
 }
 export async function putJob(job: CaptureJob): Promise<void> { await (await db()).put('jobs', job); }
-export async function getJob(id: string): Promise<CaptureJob | undefined> { return (await db()).get('jobs', id); }
+export async function getJob(id: string): Promise<CaptureJob | undefined> {
+  const stored = await (await db()).get('jobs', id);
+  return validCaptureJob(stored) ? stored : undefined;
+}
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
 
 /** Caller holds the run lock. Validation and both writes share one commit. */
@@ -284,11 +311,20 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
 }
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();
-  const jobs = (await database.getAllFromIndex('jobs', 'by-created')).sort((a, b) => a.createdAt - b.createdAt);
+  const jobs = (await database.getAllFromIndex('jobs', 'by-created'))
+    .filter(validCaptureJob).sort((a, b) => a.createdAt - b.createdAt);
   for (const job of jobs) {
-    if (job.state !== 'queued' && !(job.leasedAt && Date.now() - job.leasedAt > 60_000)) continue;
-    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= 120_000) return job;
+    if (job.state === 'paused') continue;
+    if (job.state === 'orphaned') {
+      if (Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) return job;
+      const run = await getRun(job.runId);
+      if (run?.providerRuns[job.provider]) return job;
+      continue;
+    }
     const run = await getRun(job.runId);
+    if (run?.providerRuns[job.provider]?.captureRecoveryPending) continue;
+    if (job.state !== 'queued' && !(job.leasedAt && Date.now() - job.leasedAt > 60_000)) continue;
+    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) return job;
     if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) return job;
   }
   return undefined;
@@ -310,27 +346,12 @@ export async function deleteReportDirectoryConfig(): Promise<void> {
   await (await db()).delete('configuration', REPORT_DIRECTORY_KEY);
 }
 
-export async function evictHistory(limit = 20): Promise<void> {
+export async function pruneExpiredRedirects(): Promise<void> {
   const database = await db();
-  const completed = (await database.getAllFromIndex('runs', 'by-created')).flatMap((stored) => {
-    const normalized = normalizeRunRecord(stored);
-    if (!normalized.run) {
-      warnInvalidRun(stored);
-      return [];
-    }
-    return normalized.run.status === 'complete' ? [normalized.run] : [];
-  });
-  const evicted = completed.slice(0, Math.max(0, completed.length - limit));
   const expiredRedirects = (await database.getAll('redirects'))
     .filter((redirect) => Date.now() - redirect.resolvedAt > REDIRECT_RETENTION_MS);
-  if (!evicted.length && !expiredRedirects.length) return;
-  const transaction = database.transaction(['runs', 'captures', 'redirects'], 'readwrite');
-  for (const run of evicted) {
-    await transaction.objectStore('runs').delete(run.id);
-    for (const providerRun of Object.values(run.providerRuns)) {
-      if (providerRun.captureId) await transaction.objectStore('captures').delete(providerRun.captureId);
-    }
-  }
+  if (!expiredRedirects.length) return;
+  const transaction = database.transaction('redirects', 'readwrite');
   for (const redirect of expiredRedirects) await transaction.objectStore('redirects').delete(redirect.wrapper);
   await transaction.done;
 }

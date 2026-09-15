@@ -14,7 +14,7 @@ const transitions: Record<ProviderRunStatus, ReadonlySet<ProviderRunStatus>> = {
   submitting: new Set(['researching', 'manual_required', 'unauthenticated', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   researching: new Set(['awaiting_user', 'capturing', 'manual_required', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   awaiting_user: new Set(['researching', 'capturing', 'manual_required', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
-  manual_required: new Set(['researching', 'awaiting_user', 'capturing', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
+  manual_required: new Set(['opening', 'awaiting_ready', 'setting_mode', 'researching', 'awaiting_user', 'capturing', 'quota_exhausted', 'interrupted', 'abandoned', 'failed']),
   capturing: new Set(['complete', 'researching', 'manual_required', 'interrupted', 'abandoned', 'failed']),
   complete: new Set(),
   unauthenticated: new Set(),

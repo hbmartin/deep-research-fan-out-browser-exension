@@ -263,6 +263,25 @@ describe('Gemini plan timeout recovery', () => {
     expect(captures()).toHaveLength(0);
   });
 
+  it('keeps the plan guard when its response is briefly hidden and then shown again', async () => {
+    response(`A research plan is ready for approval. ${'Detailed proposed research step. '.repeat(45)}`);
+    const plan = planButton();
+    await start('manual_required');
+    await vi.advanceTimersByTimeAsync(500);
+    document.body.insertAdjacentHTML('beforeend', '<span id="progress" style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    document.querySelector('#progress')!.remove();
+
+    const root = document.querySelector<HTMLElement>('model-response')!;
+    root.style.display = 'none';
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(planDebug.planGuardCount()).toBeGreaterThan(0);
+    plan.remove();
+    root.style.display = '';
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(captures()).toHaveLength(0);
+  });
+
   it('captures a report that replaces a guarded plan in the same response root', async () => {
     response(`A research plan is ready for approval. ${'Detailed proposed research step. '.repeat(45)}`);
     planButton();
@@ -397,6 +416,26 @@ describe('Gemini plan timeout recovery', () => {
     expect(captures()).toContainEqual(expect.objectContaining({
       type: 'content:capture', domMarkdown: expect.stringContaining('Completed report.'),
     }));
+  });
+
+  it('captures a long stable report that mentions a research plan beside a stale control', async () => {
+    response('First research plan is ready for approval.');
+    const stalePlan = planButton();
+    const clicks = vi.fn();
+    stalePlan.addEventListener('click', clicks);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    document.body.insertAdjacentHTML('beforeend', '<span id="progress" style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    document.querySelector('#progress')!.remove();
+
+    document.body.insertAdjacentHTML('beforeend', `<model-response style="position:fixed"><p>The research plan informed this completed report. ${'Evidence and analysis support the conclusion. '.repeat(35)}</p></model-response>`);
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(stalePlan.isConnected).toBe(true);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    expect(storedStatus).not.toBe('awaiting_user');
+    expect(captures()).toContainEqual(expect.objectContaining({ type: 'content:capture',
+      domMarkdown: expect.stringContaining('completed report.') }));
   });
 
   it('still times out when an observed plan control becomes hidden but remains connected', async () => {

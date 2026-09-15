@@ -39,6 +39,7 @@ function frontMatter(run: Run, providerRun: ProviderRun, capture?: Capture, opti
     unplaced_citations: capture?.unplacedCitationCount ?? 0,
     urls_resolved: capture?.urlsResolved ?? 0,
     urls_unresolved: capture?.urlsUnresolved ?? 0,
+    metadata_degraded: capture?.metadataDegraded ?? false,
     degraded: providerRun.degraded,
     adapter_version: providerRun.adapterVersion,
     ...(capture?.researchTrail ? {

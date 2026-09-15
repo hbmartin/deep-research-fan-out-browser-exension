@@ -126,6 +126,8 @@ export interface Capture {
   capturedAt: number;
   urlsResolved: number;
   urlsUnresolved: number;
+  /** Citation or research-trail metadata could not be normalized. */
+  metadataDegraded?: boolean;
   title?: string;
   researchTrail?: ResearchTrail;
 }
@@ -157,6 +159,10 @@ export interface ProviderRun {
   reconcileFailureCount?: number;
   /** The run-owned tab is temporarily on an auxiliary page for this provider. */
   detachedAt?: number;
+  /** Setup phase to restore after a pre-submission provider redirect. */
+  detachedSetupStatus?: 'opening' | 'awaiting_ready' | 'setting_mode';
+  /** A verified DOM report is retained for an explicit capture-storage retry. */
+  captureRecoveryPending?: boolean;
 }
 
 export interface Run {
@@ -182,9 +188,10 @@ export interface CaptureJob {
   provider: ProviderId;
   conversationKey?: string;
   tabId: number;
-  state: 'queued' | 'leased';
+  state: 'queued' | 'leased' | 'paused' | 'orphaned';
   createdAt: number;
   leasedAt?: number;
+  orphanedAt?: number;
   attempts: number;
   tabUnavailable?: boolean;
   /** Clipboard capture waits until the run-owned conversation is visible again. */
