@@ -880,6 +880,21 @@ async function pauseCaptureForStorageFailure(job: CaptureJob, error: unknown): P
   console.error(`Could not persist the verified ${job.provider} DOM report.`, error);
 }
 
+async function clearUnavailableCaptureRecovery(runId: string, provider: ProviderId): Promise<boolean> {
+  const id = captureId(runId, provider);
+  const [capture, job] = await Promise.all([getCapture(id), getJob(id)]);
+  if (capture || (job && isUsableDomReport(job))) return false;
+  const { value: cleared } = await mutateStoredRun(runId, (storedRun) => {
+    const current = storedRun.providerRuns[provider];
+    if (current?.status !== 'failed' || !current.captureRecoveryPending) return false;
+    current.captureRecoveryPending = undefined;
+    current.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
+    return true;
+  });
+  if (cleared) await broadcastRuns();
+  return cleared;
+}
+
 async function retryPausedCapture(runId: string, provider: ProviderId): Promise<void> {
   const id = captureId(runId, provider);
   await serializeCapture(id, async () => {
@@ -887,8 +902,11 @@ async function retryPausedCapture(runId: string, provider: ProviderId): Promise<
     const providerRun = run?.providerRuns[provider];
     const job = await getJob(id);
     const existingCapture = await getCapture(id);
-    if (!providerRun || providerRun.status !== 'failed' || !providerRun.captureRecoveryPending
-      || (!existingCapture && (!job || !isUsableDomReport(job)))) {
+    if (!providerRun || providerRun.status !== 'failed' || !providerRun.captureRecoveryPending) {
+      throw new CoordinatorRequestError('No retained report is available for capture retry.', 'invalid_transition');
+    }
+    if (!existingCapture && (!job || !isUsableDomReport(job))) {
+      await clearUnavailableCaptureRecovery(runId, provider);
       throw new CoordinatorRequestError('No retained report is available for capture retry.', 'invalid_transition');
     }
     const persisted = existingCapture
@@ -1306,10 +1324,14 @@ async function unblockNavigationDeferredCapture(runId: string, provider: Provide
   return true;
 }
 
-async function endProvider(runId: string, provider: ProviderId): Promise<void> {
+async function endProvider(runId: string, provider: ProviderId, allowFinished = false): Promise<void> {
   const existing = await getRun(runId);
   const existingProvider = existing?.providerRuns[provider];
   if (!existing || !existingProvider) throw new Error('Provider run not found.');
+  if (isTerminalProviderStatus(existingProvider.status)) {
+    if (allowFinished) return;
+    throw new CoordinatorRequestError('Provider run has ended.', 'provider_terminal', providerSnapshot(existingProvider));
+  }
   await sendTabEvent(existingProvider.tabId, { type: 'content:stop', runId }).catch(() => undefined);
   if (await markCaptureJobTabUnavailable(runId, provider)) {
     await processCaptureQueue();
@@ -1361,6 +1383,11 @@ async function reconcileRuns(): Promise<void> {
     const browserSessionId = await getBrowserSessionId();
     const pendingRuns = await listRuns();
     for (const snapshot of pendingRuns) for (const providerRun of Object.values(snapshot.providerRuns)) {
+      if (providerRun.status === 'failed' && providerRun.captureRecoveryPending) {
+        try { await clearUnavailableCaptureRecovery(snapshot.id, providerRun.provider); }
+        catch (error) { console.error('Could not reconcile unavailable capture recovery.', error); }
+        continue;
+      }
       if (isTerminalProviderStatus(providerRun.status)) continue;
       const job = await getJob(captureId(snapshot.id, providerRun.provider));
       if (job?.state === 'paused') {
@@ -1503,7 +1530,9 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
       case 'run:end': {
         const run = await getRun(message.runId);
         if (!run) throw new Error('Run not found.');
-        for (const provider of Object.keys(run.providerRuns) as ProviderId[]) await endProvider(run.id, provider);
+        for (const providerRun of Object.values(run.providerRuns)) {
+          if (!isTerminalProviderStatus(providerRun.status)) await endProvider(run.id, providerRun.provider, true);
+        }
         return { ok: true };
       }
       case 'provider:end': await endProvider(message.runId, message.provider); return { ok: true };
