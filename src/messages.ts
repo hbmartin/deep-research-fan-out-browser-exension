@@ -10,6 +10,7 @@ export interface CurrentResponseSnapshot {
 }
 
 export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found' | 'conversation_mismatch';
+export type ContentStateReason = 'research_timeout' | 'provider_navigation';
 
 export interface ProviderSnapshot {
   status: ProviderRunStatus;
@@ -29,7 +30,7 @@ export type RuntimeRequest =
   | { type: 'provider:copy-current'; runId: RunId; provider: ProviderId }
   | { type: 'provider:save'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
-  | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: 'research_timeout'; conversationKey?: string }
+  | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: ContentStateReason; conversationKey?: string }
   | { type: 'content:capture'; runId: RunId; provider: ProviderId; conversationKey?: string; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }
   | { type: 'capture:clipboard-read'; requestId: string }
   | { type: 'capture:clipboard-write'; requestId: string; text: string }

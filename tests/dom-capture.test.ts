@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, responseFingerprint, shouldOpenSourceToggle, sourceToggleState } from '../src/dom-capture';
 import { findElement } from '../src/selectors';
 
 function visible(element: HTMLElement): HTMLElement {
@@ -195,12 +195,12 @@ describe('provider DOM capture', () => {
       <p><span aria-label="Elapsed time">00:31</span></p>
       <li>Progress details — elapsed time: 1m 31s</li>
     `;
-    const first = finalResponseFingerprint(response);
+    const first = responseFingerprint(response, createResponseSnapshot(response).activityText);
     response.querySelector('span')!.textContent = '00:32';
     response.querySelector('li')!.textContent = 'Progress details — elapsed time: 1m 32s';
-    expect(finalResponseFingerprint(response)).toBe(first);
+    expect(responseFingerprint(response, createResponseSnapshot(response).activityText)).toBe(first);
     response.querySelector('li')!.textContent = 'Different progress details — elapsed time: 1m 33s';
-    expect(finalResponseFingerprint(response)).not.toBe(first);
+    expect(responseFingerprint(response, createResponseSnapshot(response).activityText)).not.toBe(first);
   });
 
   it('classifies progress using timer-stripped text while preserving the exported timer', () => {

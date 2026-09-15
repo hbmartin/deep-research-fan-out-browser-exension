@@ -79,6 +79,15 @@ function render(): void {
   app.append(title, intro, form, transfer);
 }
 
+function renderDestination(): void {
+  const current = app.querySelector<HTMLElement>('.destination');
+  if (!current) {
+    render();
+    return;
+  }
+  current.replaceWith(destinationSection());
+}
+
 function destinationSection(): HTMLElement {
   const section = field('section', { class: 'destination' });
   const heading = field('h2'); heading.textContent = 'Report destination';
@@ -105,10 +114,17 @@ function destinationSection(): HTMLElement {
     }));
   } else {
     const granted = directoryPermission === 'granted';
-    const detail = granted && !directoryConfig.needsReconnect
-      ? `Connected ${new Date(directoryConfig.configuredAt).toLocaleString()}`
-      : `Permission is ${directoryPermission ?? 'unavailable'}; Downloads fallback is active.`;
-    section.append(destinationState(directoryConfig.displayName, detail, granted && !directoryConfig.needsReconnect ? 'connected' : 'warning'));
+    const writeFailed = granted && !directoryConfig.needsReconnect && directoryConfig.lastWriteFailureAt !== undefined;
+    const detail = writeFailed
+      ? `The last write failed ${new Date(directoryConfig.lastWriteFailureAt!).toLocaleString()}. Check free space and the folder, or choose a different folder.`
+      : granted && !directoryConfig.needsReconnect
+        ? `Connected ${new Date(directoryConfig.configuredAt).toLocaleString()}`
+        : `Permission is ${directoryPermission ?? 'unavailable'}; Downloads fallback is active.`;
+    section.append(destinationState(
+      directoryConfig.displayName,
+      detail,
+      granted && !directoryConfig.needsReconnect && !writeFailed ? 'connected' : 'warning',
+    ));
     const actions = field('div', { class: 'actions destination-actions' });
     if (!granted || directoryConfig.needsReconnect) {
       actions.append(destinationButton('Reconnect', async () => {
@@ -173,7 +189,7 @@ function destinationButton(label: string, action: () => Promise<void>, className
 async function refreshDestinationState(): Promise<void> {
   directoryConfig = await getReportDirectoryConfig().catch(() => undefined);
   directoryPermission = directoryConfig ? await queryDirectoryPermission(directoryConfig.handle) : undefined;
-  render();
+  renderDestination();
 }
 
 function providerSection(provider: ProviderId): HTMLElement {

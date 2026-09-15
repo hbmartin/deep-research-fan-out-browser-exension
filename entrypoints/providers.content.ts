@@ -1,10 +1,10 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, classifyProviderPage, conversationKeysMatch, normalizeConversationKey, providerFromLocation, type ProviderAdapter, type ProviderPageIdentity, type SelectorChain } from '@/src/adapters';
 import { tokenContainment } from '@/src/citations';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, responseFingerprint, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
-import type { BackgroundEvent, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
+import type { BackgroundEvent, ContentStateReason, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
 import { findAll, findElement, isVisible } from '@/src/selectors';
 import { captureGrokResearchTrail } from '@/src/sources';
 import { isSetupProviderStatus } from '@/src/state';
@@ -41,12 +41,19 @@ interface ActiveRun {
 }
 
 interface PlanApprovalState {
-  seen: boolean;
+  current?: PlanApprovalEpisode;
+  guards: PlanResponseGuard[];
+}
+
+interface PlanApprovalEpisode {
+  key: string;
   attempts: number;
   lastAttemptAt: number;
   confirmed: boolean;
+  approvalIntent: boolean;
   element?: HTMLElement;
-  responseGuard?: PlanResponseGuard;
+  responseGuard: PlanResponseGuard;
+  progressBaseline?: string;
 }
 
 interface PlanResponseGuard {
@@ -78,8 +85,9 @@ const INSPECTION_THROTTLE_MS = 250;
 const RESPONSE_VISIBILITY = { ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 const HOVER_COPY_VISIBILITY = { allowTransparent: true, ignoreAncestorOpacity: true } as const;
 const PAGE_QUOTA_REGION = '[role="alert"], [role="dialog"], dialog, [role="status"], [aria-live="assertive"], [aria-live="polite"]';
-const PAGE_QUOTA_EXCLUDED_REGION = 'nav, aside, [role="navigation"], form, [contenteditable="true"], textarea, [data-message-author-role="user"], user-query, [data-test-id="user-query"], [data-testid*="user-message" i]';
+const PAGE_QUOTA_EXCLUDED_REGION = 'nav, aside, [role="navigation"], [contenteditable="true"], textarea, [data-message-author-role="user"], user-query, [data-test-id="user-query"], [data-testid*="user-message" i]';
 const PLAN_APPENDED_REPORT_MIN_CHARS = 1000;
+const PROGRESS_TRAILING_DURATION = /\s*(?:[·•—-]\s*)?(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*(?:h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\s*){1,3})\s*$/i;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,7 +110,7 @@ function applyProviderState(run: ActiveRun, snapshot: ProviderSnapshot): void {
   if (isTerminalProviderStatus(snapshot.status)) stopRun(run);
 }
 
-async function report(status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: 'research_timeout'): Promise<void> {
+async function report(status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: ContentStateReason): Promise<void> {
   if (!active) return;
   const run = active;
   assertCurrent(run);
@@ -118,7 +126,7 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
   if (!isTerminalProviderStatus(status)) assertCurrent(run);
 }
 
-function reportEventually(status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: 'research_timeout'): void {
+function reportEventually(status: ProviderRunStatus, detail?: string, submittedAt?: number, reason?: ContentStateReason): void {
   if (!active || active.stopped || active.captureSent) return;
   // Errors are reconciled by the per-run reporter; inspections don't log a
   // permanently rejected transition on every DOM mutation.
@@ -297,6 +305,14 @@ function planResponseStillGuarded(
   return appendedLength < PLAN_APPENDED_REPORT_MIN_CHARS;
 }
 
+function responseStillGuardedByPlan(
+  root: HTMLElement,
+  snapshot: ResponseSnapshot,
+  guards: readonly PlanResponseGuard[],
+): boolean {
+  return guards.some((guard) => planResponseStillGuarded(root, snapshot, guard));
+}
+
 function findTrustedPageQuotaNotice(
   adapter: ProviderAdapter,
   responseRoots: readonly HTMLElement[],
@@ -304,7 +320,8 @@ function findTrustedPageQuotaNotice(
   return findAll(adapter.selectors.quotaNotice, document).find((element) => (
     !responseRoots.some((root) => root.contains(element))
     && !element.closest(PAGE_QUOTA_EXCLUDED_REGION)
-    && Boolean(element.closest(PAGE_QUOTA_REGION))
+    && normalizeActivityText(element.textContent ?? '').length <= 500
+    && (Boolean(element.closest(PAGE_QUOTA_REGION)) || element.children.length === 0)
   )) ?? null;
 }
 
@@ -385,7 +402,7 @@ function progressActivitySignature(element: HTMLElement | null): string | undefi
   if (!element) return undefined;
   return [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-state'),
     element.textContent]
-    .map((value) => normalizeActivityText(value ?? ''))
+    .map((value) => normalizeActivityText(value ?? '').replace(PROGRESS_TRAILING_DURATION, '').trim())
     .join('\u0000');
 }
 
@@ -394,12 +411,23 @@ function activitySignature(
   snapshot: ResponseSnapshot | undefined,
   progress: HTMLElement | null,
 ): ActivitySignature {
-  const stableId = root?.getAttribute('data-message-id') || root?.id;
   const responseText = root && snapshot ? responseActivityTextWithoutCitations(snapshot) : undefined;
   return {
-    response: responseText === undefined ? undefined : `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${responseText}`,
+    response: root && responseText !== undefined ? responseFingerprint(root, responseText) : undefined,
     progress: progressActivitySignature(progress),
   };
+}
+
+function observePlanActivation(run: ActiveRun, episode: PlanApprovalEpisode, element: HTMLElement): void {
+  if (episode.element === element) return;
+  episode.element = element;
+  const markIntent = (event: Event) => {
+    if (event.isTrusted && active === run && run.planApproval.current === episode) episode.approvalIntent = true;
+  };
+  element.addEventListener('click', markIntent, { capture: true });
+  element.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') markIntent(event);
+  }, { capture: true });
 }
 
 function timedOutActivityResumed(run: ActiveRun, signature: ActivitySignature, now = Date.now()): boolean {
@@ -604,21 +632,43 @@ function inspectPage(): void {
   const pageIdentity = classifyProviderPage(location.href, adapter.id);
   const conversationWasBound = active.conversationKey !== undefined;
   if (active.conversationKey) {
-    if (pageIdentity.kind !== 'conversation'
-      || !conversationKeysMatch(active.conversationKey, pageIdentity.key, adapter.id)) {
+    if (pageIdentity.kind === 'conversation'
+      && !conversationKeysMatch(active.conversationKey, pageIdentity.key, adapter.id)) {
       reportEventually('interrupted', 'Provider tab navigated to a different conversation.');
+      return;
+    }
+    if (pageIdentity.kind !== 'conversation') {
+      if (active.researchTimedOutAt === undefined) {
+        reportEventually(
+          'manual_required',
+          `Return to the original ${adapter.label} conversation to continue monitoring.`,
+          undefined,
+          'provider_navigation',
+        );
+      }
       return;
     }
   } else if (pageIdentity.kind === 'conversation') {
     active.conversationKey = pageIdentity.key;
   }
-  if (pageIdentity.kind === 'unsupported') return;
+  if (pageIdentity.kind === 'unsupported') {
+    if (active.researchTimedOutAt === undefined) {
+      reportEventually(
+        'manual_required',
+        `Return to the ${adapter.label} conversation to continue monitoring.`,
+        undefined,
+        'provider_navigation',
+      );
+    }
+    return;
+  }
 
   const candidateRoots = candidateResponseRoots(adapter);
   const finalRoots = completedResponseRootsForCandidates(adapter, candidateRoots);
   const latestResponse = candidateRoots.at(-1) ?? null;
   const latestFinalResponse = latestResponse && finalRoots.includes(latestResponse) ? latestResponse : null;
   const plan = adapter.selectors.planApproval ? findElement(adapter.selectors.planApproval) : null;
+  const streaming = findStreamingIndicator(adapter, latestResponse);
   let latestSnapshot: ResponseSnapshot | undefined;
   const getLatestSnapshot = () => {
     if (latestResponse && !latestSnapshot) latestSnapshot = createResponseSnapshot(latestResponse);
@@ -626,17 +676,39 @@ function inspectPage(): void {
   };
   const planState = active.planApproval;
   if (plan) {
-    planState.element = plan;
-    if (!planState.seen) {
-      planState.seen = true;
-      const snapshot = getLatestSnapshot();
-      if (latestResponse && snapshot) {
-        planState.responseGuard = {
-          root: latestResponse,
-          activityText: responseActivityTextWithoutCitations(snapshot),
-        };
-      }
+    const guardRoot = latestResponse ?? plan;
+    const snapshot = latestResponse ? getLatestSnapshot()! : createResponseSnapshot(plan);
+    const responseGuard = {
+      root: guardRoot,
+      activityText: responseActivityTextWithoutCitations(snapshot),
+    };
+    const key = responseFingerprint(guardRoot, responseGuard.activityText);
+    let episode = planState.current;
+    const newEpisode = !episode
+      || episode.responseGuard.root !== guardRoot
+      || (episode.confirmed && episode.key !== key && episode.element !== plan);
+    if (newEpisode) {
+      episode = {
+        key,
+        attempts: 0,
+        lastAttemptAt: 0,
+        confirmed: false,
+        approvalIntent: false,
+        responseGuard,
+        progressBaseline: progressActivitySignature(streaming),
+      };
+      planState.current = episode;
+      planState.guards.push(responseGuard);
     }
+    if (!episode) throw new Error('Could not initialize Gemini plan state.');
+    if (!episode.confirmed && episode.key !== key) {
+      // A plan may hydrate in place. Keep its retry budget, but guard every
+      // observed version so a long expansion cannot become report content.
+      episode.key = key;
+      episode.responseGuard = responseGuard;
+      planState.guards.push(responseGuard);
+    }
+    observePlanActivation(active, episode, plan);
   }
 
   // Only semantic page-level notices preempt streaming. Generic matching text in
@@ -647,16 +719,57 @@ function inspectPage(): void {
     return;
   }
 
-  const streaming = findStreamingIndicator(adapter, latestResponse);
+  const episode = planState.current;
+  let approvedPlan = false;
+  if (plan && episode && !episode.confirmed) {
+    const progressChanged = streaming
+      && progressActivitySignature(streaming) !== episode.progressBaseline;
+    if (progressChanged) {
+      episode.confirmed = true;
+      approvedPlan = true;
+    } else {
+      active.completionCandidate = undefined;
+      const activitySnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
+        ? getLatestSnapshot()
+        : undefined;
+      const signature = activitySignature(latestResponse, activitySnapshot, plan);
+      if (researchTimeoutDue) reportTimeout(signature);
+      else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature, now);
+      else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
+        reportEventually('researching', undefined, active.submittedAt);
+      }
+      if (active.geminiAutoApprove && episode.attempts < 3
+        && now - episode.lastAttemptAt >= 1000) {
+        episode.attempts += 1;
+        episode.lastAttemptAt = now;
+        episode.approvalIntent = true;
+        plan.click();
+      }
+      if ((!active.geminiAutoApprove || episode.attempts >= 3) && active.status !== 'awaiting_user') {
+        reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
+      }
+      return;
+    }
+  }
+
+  if (!plan && episode && !episode.confirmed) {
+    const progressChanged = streaming
+      && progressActivitySignature(streaming) !== episode.progressBaseline;
+    const approvalControlBecameInactive = episode.approvalIntent && episode.element
+      && (!episode.element.isConnected || !isVisible(episode.element));
+    if (approvalControlBecameInactive || progressChanged) {
+      episode.confirmed = true;
+      approvedPlan = true;
+    }
+  }
+
   if (streaming) {
-    const approvedPlan = planState.seen && !planState.confirmed;
-    if (approvedPlan) planState.confirmed = true;
     const activitySnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
       ? getLatestSnapshot()
       : undefined;
     const signature = activitySignature(latestResponse, activitySnapshot, streaming);
     active.completionCandidate = undefined;
-    if (approvedPlan || (active.researchTimedOutAt !== undefined
+    if (approvedPlan || (!episode || episode.confirmed) && (active.researchTimedOutAt !== undefined
       ? timedOutActivityResumed(active, signature, now)
       : !researchTimeoutDue && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
       reportEventually('researching', undefined, Date.now());
@@ -668,36 +781,7 @@ function inspectPage(): void {
     return;
   }
 
-  if (plan && !planState.confirmed) {
-    active.completionCandidate = undefined;
-    const activitySnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
-      ? getLatestSnapshot()
-      : undefined;
-    const signature = activitySignature(latestResponse, activitySnapshot, plan);
-    if (researchTimeoutDue) reportTimeout(signature);
-    else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature, now);
-    else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
-      reportEventually('researching', undefined, active.submittedAt);
-    }
-    if (active.geminiAutoApprove && planState.attempts < 3
-      && now - planState.lastAttemptAt >= 1000) {
-      planState.attempts += 1;
-      planState.lastAttemptAt = now;
-      plan.click();
-    }
-    if ((!active.geminiAutoApprove || planState.attempts >= 3) && active.status !== 'awaiting_user') {
-      reportEventually('awaiting_user', 'Approve the Gemini research plan to continue.');
-    }
-    return;
-  }
-
-  if (!plan && planState.seen && !planState.confirmed) {
-    active.completionCandidate = undefined;
-    if (planState.element?.isConnected) return;
-    planState.confirmed = true;
-    reportEventually('researching', undefined, now);
-    return;
-  }
+  if (approvedPlan) reportEventually('researching', undefined, now);
 
   latestSnapshot = getLatestSnapshot();
   const baselineAllowsResponse = isNewFinalResponse(
@@ -707,11 +791,12 @@ function inspectPage(): void {
   );
   const responseSnapshot = baselineAllowsResponse ? latestSnapshot : undefined;
   const root = baselineAllowsResponse && latestFinalResponse && responseSnapshot
-    && !planResponseStillGuarded(latestFinalResponse, responseSnapshot, planState.responseGuard)
+    && !responseStillGuardedByPlan(latestFinalResponse, responseSnapshot, planState.guards)
     ? latestFinalResponse
     : null;
   const newResponse = root;
-  const signature = activitySignature(latestResponse, latestSnapshot, null);
+  let signature: ActivitySignature | undefined;
+  const getSignature = () => (signature ??= activitySignature(latestResponse, latestSnapshot, null));
   if (!conversationWasBound && active.conversationKey && active.status === 'researching'
     && !researchTimeoutDue && active.researchTimedOutAt === undefined) {
     reportEventually('researching', undefined, active.submittedAt);
@@ -727,8 +812,8 @@ function inspectPage(): void {
   }
   if (isProgressResponse(newResponse, adapter.progressResponsePattern, false, responseSnapshot)) {
     active.completionCandidate = undefined;
-    if (researchTimeoutDue) reportTimeout(signature);
-    else if (active.researchTimedOutAt !== undefined ? timedOutActivityResumed(active, signature)
+    if (researchTimeoutDue) reportTimeout(getSignature());
+    else if (active.researchTimedOutAt !== undefined ? timedOutActivityResumed(active, getSignature())
       : ['awaiting_user', 'manual_required', 'submitting'].includes(active.status)) {
       reportEventually('researching', undefined, Date.now());
     }
@@ -749,9 +834,9 @@ function inspectPage(): void {
   active.completionCandidate = completion.candidate;
   if (researchTimeoutDue && !completion.ready) {
     active.timeoutGraceUntil ??= now + (copy ? active.completionDebounceMs : Math.max(30_000, active.completionDebounceMs * 3));
-    if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout(signature);
+    if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout(getSignature());
   } else if (active.researchTimedOutAt !== undefined && !completion.ready
-    && timedOutActivityResumed(active, signature, now)) {
+    && timedOutActivityResumed(active, getSignature(), now)) {
     reportEventually('researching', undefined, Date.now());
     return;
   }
@@ -763,7 +848,7 @@ function inspectPage(): void {
       if (possibleToggle?.isConnected
         && !isResponseControlActionable(possibleToggle, true, root)
         && isModalBlockedControl(possibleToggle, root)) {
-        if (researchTimeoutDue) reportTimeout(signature);
+        if (researchTimeoutDue) reportTimeout(getSignature());
         return;
       }
     }
@@ -876,7 +961,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     submissionAttempted: !setup,
     manualSetupRequired: false,
     timeoutActivity: { phase: 'hydrating' },
-    planApproval: { seen: false, attempts: 0, lastAttemptAt: 0, confirmed: false },
+    planApproval: { guards: [] },
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? {
         status: request.status,

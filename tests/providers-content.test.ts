@@ -165,15 +165,39 @@ describe('provider content-script recovery', () => {
 
   it.each([
     'https://chatgpt.com/',
-    'https://chatgpt.com/c/other',
     'https://chatgpt.com/library',
-  ])('interrupts a bound run after provider navigation to %s', async (url) => {
+  ])('defers a bound run after recoverable provider navigation to %s', async (url) => {
     await resume('researching');
     vi.stubGlobal('location', new URL(url));
 
     await vi.advanceTimersByTimeAsync(2000);
 
+    expect(storedStatus).toBe('manual_required');
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'content:state', status: 'manual_required', reason: 'provider_navigation',
+      conversationKey: 'https://chatgpt.com/c/review',
+    }));
+    expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
+  });
+
+  it('interrupts a bound run after navigation to a different conversation', async () => {
+    await resume('researching');
+    vi.stubGlobal('location', new URL('https://chatgpt.com/c/other'));
+
+    await vi.advanceTimersByTimeAsync(2000);
+
     expect(storedStatus).toBe('interrupted');
+    expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'provider_navigation' }));
+  });
+
+  it('keeps overdue research recoverable when navigation hides provider progress', async () => {
+    await resume('researching', false, Date.now() - 45 * 60 * 1000);
+    vi.stubGlobal('location', new URL('https://chatgpt.com/settings'));
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('manual_required');
+    expect(messages).toContainEqual(expect.objectContaining({ reason: 'provider_navigation' }));
     expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
   });
 
@@ -255,6 +279,32 @@ describe('provider content-script recovery', () => {
     `;
     await resume('researching');
     await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(storedStatus).toBe('researching');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
+  });
+
+  it.each([
+    '<div style="position:fixed">You\'ve reached your deep research limit.</div>',
+    '<form style="position:fixed"><div style="position:fixed">You\'ve reached your deep research limit.</div></form>',
+  ])('detects a short plain quota banner outside response roots: %s', async (markup) => {
+    document.body.innerHTML = `${markup}<button style="position:fixed" aria-label="Stop generating"></button>`;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('quota_exhausted');
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'content:state', status: 'quota_exhausted',
+    }));
+  });
+
+  it('ignores an exact quota sentence inside the composer', async () => {
+    document.body.innerHTML = `
+      <div id="prompt-textarea" contenteditable="true">You've reached your deep research limit.</div>
+      <button style="position:fixed" aria-label="Stop generating"></button>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(2000);
 
     expect(storedStatus).toBe('researching');
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));

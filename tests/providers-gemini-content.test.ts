@@ -69,18 +69,43 @@ function captures(): RuntimeRequest[] {
   return messages.filter((message) => message.type === 'content:capture');
 }
 
-async function start(status: 'researching' | 'manual_required' | 'awaiting_user', timedOut = false): Promise<void> {
+async function start(
+  status: 'researching' | 'manual_required' | 'awaiting_user',
+  timedOut = false,
+  startedAt = Date.now() - 45 * 60 * 1000,
+  autoApprove = true,
+): Promise<void> {
   storedStatus = status;
-  submittedAt = Date.now() - 45 * 60 * 1000;
+  submittedAt = startedAt;
   researchTimedOutAt = timedOut ? Date.now() - 60_000 : undefined;
   await listener({
     type: 'content:start', runId: 'gemini-run', provider: 'gemini', query: 'Research topic', appendString: '',
-    geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true,
+    geminiAutoApprove: autoApprove, completionDebounceMs: 3000, resumeOnly: true,
     status, submittedAt, researchTimedOutAt, conversationKey: 'https://gemini.google.com/app/review',
   });
 }
 
 describe('Gemini plan timeout recovery', () => {
+  it('handles a visible plan before a simultaneous Stop control', async () => {
+    response('A research plan is ready for approval.');
+    const plan = planButton();
+    const click = vi.fn();
+    plan.addEventListener('click', click);
+    document.body.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Stop response"></button>');
+
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(storedStatus).toBe('awaiting_user');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
+
+    plan.remove();
+    document.querySelector('[aria-label="Stop response"]')!.remove();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+  });
+
   it('times out, retries a persistent plan three times, then asks the user', async () => {
     response('A research plan is ready for approval.');
     const plan = planButton();
@@ -98,7 +123,7 @@ describe('Gemini plan timeout recovery', () => {
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
   });
 
-  it('preserves the run-wide retry limit across visibility gaps and replacement elements', async () => {
+  it('preserves the per-plan retry limit across replacement elements', async () => {
     response('A research plan is ready for approval.');
     const firstPlan = planButton();
     const firstClick = vi.fn();
@@ -107,18 +132,13 @@ describe('Gemini plan timeout recovery', () => {
     await vi.advanceTimersByTimeAsync(500);
     expect(firstClick).toHaveBeenCalledTimes(1);
 
-    firstPlan.style.display = 'none';
-    await vi.advanceTimersByTimeAsync(3000);
-    firstPlan.style.display = '';
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(firstClick).toHaveBeenCalledTimes(3);
-
     firstPlan.remove();
     const replacementPlan = planButton();
     const replacementClick = vi.fn();
     replacementPlan.addEventListener('click', replacementClick);
     await vi.advanceTimersByTimeAsync(6000);
-    expect(replacementClick).not.toHaveBeenCalled();
+    expect(firstClick).toHaveBeenCalledTimes(1);
+    expect(replacementClick).toHaveBeenCalledTimes(2);
   });
 
   it('grants a fresh interval only after the plan disappears and verified progress begins', async () => {
@@ -202,6 +222,46 @@ describe('Gemini plan timeout recovery', () => {
     }));
   });
 
+  it('treats a revised plan in a new response as a fresh approval episode and guards it', async () => {
+    response(`First research plan. ${'Proposed first research step. '.repeat(45)}`);
+    const firstPlan = planButton();
+    const firstClick = vi.fn();
+    firstPlan.addEventListener('click', firstClick);
+    await start('awaiting_user');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(firstClick).toHaveBeenCalledTimes(1);
+
+    document.body.insertAdjacentHTML('beforeend', '<span id="progress" style="position:fixed">Researching · 1 source</span>');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+
+    document.body.innerHTML = `<model-response style="position:fixed"><p>Revised research plan. ${'Changed proposed research step. '.repeat(45)}</p></model-response>`;
+    const revisedPlan = planButton();
+    const revisedClick = vi.fn();
+    revisedPlan.addEventListener('click', revisedClick);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(revisedClick).toHaveBeenCalled();
+    expect(captures()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(revisedClick).toHaveBeenCalledTimes(3);
+    expect(captures()).toHaveLength(0);
+  });
+
+  it('still times out when an observed plan control becomes hidden but remains connected', async () => {
+    response('A research plan is ready for approval.');
+    const plan = planButton();
+    await start('researching', false, Date.now());
+    await vi.advanceTimersByTimeAsync(500);
+    plan.style.display = 'none';
+
+    await vi.advanceTimersByTimeAsync(45 * 60 * 1000 + 2000);
+
+    expect(plan.isConnected).toBe(true);
+    expect(storedStatus).toBe('manual_required');
+    expect(messages.filter((message) => message.type === 'content:state' && message.reason === 'research_timeout')).toHaveLength(1);
+  });
+
   it('prioritizes a page-level quota notice over simultaneous streaming and plan controls', async () => {
     response('A partial response that must not hide the terminal page notice.');
     const plan = planButton();
@@ -239,5 +299,20 @@ describe('Gemini plan timeout recovery', () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(storedStatus).toBe('researching');
     expect(submittedAt).toBeGreaterThanOrEqual(resumedAt);
+  });
+
+  it('does not treat a ticking plain duration suffix as resumed activity', async () => {
+    document.body.innerHTML = '<button style="position:fixed">Researching 44m 59s</button>';
+    await start('manual_required', true);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    for (let second = 58; second >= 50; second -= 1) {
+      document.querySelector('button')!.textContent = `Researching 44m ${second}s`;
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+
+    expect(storedStatus).toBe('manual_required');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'researching' }));
+    expect(messages.filter((message) => message.type === 'content:state' && message.reason === 'research_timeout')).toHaveLength(0);
   });
 });

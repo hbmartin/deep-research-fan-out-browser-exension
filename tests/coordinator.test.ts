@@ -1,9 +1,10 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
+import { openDB } from 'idb';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
 import { acceptCaptureJob, deleteJob, getCapture, getJob, getRun, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, putCapture, putJob, putRun } from '../src/db';
-import type { CaptureJob, ProviderId, ProviderRun, Run } from '../src/types';
+import type { Capture, CaptureJob, ProviderId, ProviderRun, Run } from '../src/types';
 
 const platform = vi.hoisted(() => ({
   configurePanelAction: vi.fn(async () => undefined),
@@ -19,11 +20,12 @@ const tabsGet = vi.hoisted(() => vi.fn<(_tabId: number) => Promise<Browser.tabs.
 const reportStorage = vi.hoisted(() => ({
   config: undefined as { handle: FileSystemDirectoryHandle; displayName: string; configuredAt: number; needsReconnect: boolean } | undefined,
   permission: 'granted' as PermissionState,
-  writeUniqueMarkdown: vi.fn(async (_handle: FileSystemDirectoryHandle, folder: string, filename: string) => ({
+  writeUniqueMarkdown: vi.fn(async (_handle: FileSystemDirectoryHandle, folder: string, filename: string, _artifact: string) => ({
     requestedRelativePath: `${folder}/${filename}`,
     actualRelativePath: `${folder}/${filename}`,
   })),
   markNeedsReconnect: vi.fn(async () => undefined),
+  markWriteFailure: vi.fn(async () => undefined),
 }));
 
 vi.mock('../src/platform', () => ({
@@ -36,6 +38,7 @@ vi.mock('../src/report-storage', () => ({
   classifyDirectoryError: () => 'write_failed',
   getReportDirectoryConfig: async () => reportStorage.config,
   markReportDirectoryNeedsReconnect: reportStorage.markNeedsReconnect,
+  markReportDirectoryWriteFailure: reportStorage.markWriteFailure,
   queryDirectoryPermission: async () => reportStorage.permission,
   writeUniqueMarkdown: reportStorage.writeUniqueMarkdown,
 }));
@@ -67,11 +70,12 @@ beforeEach(() => {
   tabsGet.mockReset();
   reportStorage.config = undefined;
   reportStorage.permission = 'granted';
-  reportStorage.writeUniqueMarkdown.mockReset().mockImplementation(async (_handle, folder, filename) => ({
+  reportStorage.writeUniqueMarkdown.mockReset().mockImplementation(async (_handle, folder, filename, _artifact) => ({
     requestedRelativePath: `${folder}/${filename}`,
     actualRelativePath: `${folder}/${filename}`,
   }));
   reportStorage.markNeedsReconnect.mockReset().mockResolvedValue(undefined);
+  reportStorage.markWriteFailure.mockReset().mockResolvedValue(undefined);
   vi.stubGlobal('browser', {
     runtime: { sendMessage: vi.fn(async () => undefined), getURL: vi.fn((path: string) => path) },
     storage: {
@@ -181,6 +185,28 @@ describe('coordinator run guards', () => {
     });
   });
 
+  it('does not fall back or request reconnect when receipt persistence fails after a directory write', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    const stored = run({ chatgpt: provider('chatgpt', 621, 'failed') });
+    await putRun(stored);
+    reportStorage.writeUniqueMarkdown.mockImplementationOnce(async (_handle, folder, filename) => {
+      const raw = await openDB('deep-research-fan-out', 2);
+      await raw.delete('runs', stored.id);
+      raw.close();
+      return {
+        requestedRelativePath: `${folder}/${filename}`,
+        actualRelativePath: `${folder}/${filename}`,
+      };
+    });
+
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt')).rejects.toThrow('Run not found');
+
+    expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledTimes(1);
+    expect(platform.downloadText).not.toHaveBeenCalled();
+    expect(reportStorage.markNeedsReconnect).not.toHaveBeenCalled();
+    expect(reportStorage.markWriteFailure).not.toHaveBeenCalled();
+  });
+
   it('falls back immediately when directory permission is no longer granted', async () => {
     reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
     reportStorage.permission = 'prompt';
@@ -192,6 +218,7 @@ describe('coordinator run guards', () => {
     expect(reportStorage.writeUniqueMarkdown).not.toHaveBeenCalled();
     expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/FAILED-gemini.md`, expect.any(String));
     expect(reportStorage.markNeedsReconnect).toHaveBeenCalledWith(reportStorage.config, true);
+    expect(reportStorage.markWriteFailure).not.toHaveBeenCalled();
     expect((await getRun(stored.id))?.providerRuns.gemini?.saveReceipt).toMatchObject({
       destination: 'downloads', fallbackReason: 'permission_required',
     });
@@ -206,7 +233,8 @@ describe('coordinator run guards', () => {
 
     await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'grok')).rejects.toThrow('downloads unavailable');
     expect((await getRun(stored.id))?.providerRuns.grok?.saveReceipt).toBeUndefined();
-    expect(reportStorage.markNeedsReconnect).toHaveBeenCalledWith(reportStorage.config, true);
+    expect(reportStorage.markNeedsReconnect).not.toHaveBeenCalledWith(reportStorage.config, true);
+    expect(reportStorage.markWriteFailure).toHaveBeenCalledWith(reportStorage.config);
   });
 
   it('reports unsaved retryable providers in the run-complete notification', async () => {
@@ -235,9 +263,9 @@ describe('coordinator run guards', () => {
     reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
     await putRun(stored);
 
-    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt')).resolves.toBe(false);
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt')).resolves.toMatchObject({ saved: false });
     expect(reportStorage.writeUniqueMarkdown).not.toHaveBeenCalled();
-    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt', true)).resolves.toBe(true);
+    await expect(coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt', true)).resolves.toMatchObject({ saved: true });
     expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledTimes(1);
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt?.destination).toBe('directory');
   });
@@ -260,6 +288,69 @@ describe('coordinator run guards', () => {
       `${stored.downloadFolder}/chatgpt.md`,
     ]);
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt?.requestedRelativePath).toBe(`${stored.downloadFolder}/chatgpt.md`);
+  });
+
+  it('assigns a new revision when capture content changes under the same key', async () => {
+    const id = `revision:${crypto.randomUUID()}`;
+    const capture: Capture = {
+      rawMarkdown: 'First report', normalizedMarkdown: 'First report', citations: [], captureMethod: 'copy_only',
+      unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    };
+    await putCapture(id, capture);
+    const firstRevision = (await getCapture(id))!.revision;
+    await putCapture(id, { ...capture, normalizedMarkdown: 'Revised report' });
+    const secondRevision = (await getCapture(id))!.revision;
+
+    expect(secondRevision).toBeTypeOf('string');
+    expect(secondRevision).not.toBe(firstRevision);
+  });
+
+  it('preserves a stale in-flight file and commits a second file for the latest capture revision', async () => {
+    reportStorage.config = { handle: {} as FileSystemDirectoryHandle, displayName: 'Reports', configuredAt: 1, needsReconnect: false };
+    const chatgpt = provider('chatgpt', 651, 'complete');
+    const stored = run({ chatgpt });
+    const id = `${stored.id}:chatgpt`;
+    const firstCapture: Capture = {
+      rawMarkdown: 'First report', normalizedMarkdown: 'First report', citations: [], captureMethod: 'copy_only' as const,
+      unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,
+    };
+    await putCapture(id, firstCapture);
+    chatgpt.captureId = id;
+    chatgpt.artifactRevision = firstCapture.revision;
+    await putRun(stored);
+
+    let releaseFirst!: () => void;
+    const firstWriteBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let writeCount = 0;
+    reportStorage.writeUniqueMarkdown.mockImplementation(async (_handle, folder, filename) => {
+      writeCount += 1;
+      if (writeCount === 1) await firstWriteBlocked;
+      const suffix = writeCount === 1 ? filename : filename.replace('.md', ' (1).md');
+      return { requestedRelativePath: `${folder}/${filename}`, actualRelativePath: `${folder}/${suffix}` };
+    });
+
+    const firstSave = coordinatorTestHooks.saveProviderArtifact(stored.id, 'chatgpt');
+    await vi.waitFor(() => expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledTimes(1));
+    const revisedCapture: Capture = {
+      rawMarkdown: 'Revised report', normalizedMarkdown: 'Revised report', citations: [], captureMethod: 'copy_only' as const,
+      unplacedCitationCount: 0, capturedAt: 2, urlsResolved: 0, urlsUnresolved: 0,
+    };
+    await putCapture(id, revisedCapture);
+    const attachment = coordinatorTestHooks.completeProviderCapture(
+      stored.id, 'chatgpt', id, false, revisedCapture.revision,
+    );
+    await vi.waitFor(async () => expect((await getRun(stored.id))?.providerRuns.chatgpt?.artifactRevision)
+      .toBe(revisedCapture.revision));
+    releaseFirst();
+    await Promise.all([firstSave, attachment]);
+
+    expect(reportStorage.writeUniqueMarkdown).toHaveBeenCalledTimes(2);
+    expect(reportStorage.writeUniqueMarkdown.mock.calls[0]?.[3]).toContain('First report');
+    expect(reportStorage.writeUniqueMarkdown.mock.calls[1]?.[3]).toContain('Revised report');
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.saveReceipt).toMatchObject({
+      artifactRevision: revisedCapture.revision,
+      actualRelativePath: `${stored.reportFolder}/chatgpt (1).md`,
+    });
   });
 
   it('interrupts only after three consecutive reconciliation failures and resets on success', async () => {
@@ -305,6 +396,72 @@ describe('coordinator run guards', () => {
       `${stored.downloadFolder}/FAILED-chatgpt.md`, expect.any(String),
     );
     expect(platform.sendTabEvent).not.toHaveBeenCalledWith(9, expect.anything());
+  });
+
+  it('defers a queued capture on an auxiliary provider page and resumes it on the original conversation', async () => {
+    const chatgpt = provider('chatgpt', 91, 'capturing');
+    chatgpt.conversationKey = 'https://chatgpt.com/c/bound';
+    const stored = run({ chatgpt });
+    const id = `${stored.id}:chatgpt`;
+    const report = 'A complete visible report retained while the user visits the library.';
+    await putRun(stored);
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 91, state: 'queued',
+      createdAt: Date.now(), attempts: 0,
+      domMarkdown: report, domCitations: [],
+    });
+    tabsGet.mockResolvedValue({ id: 91, url: 'https://chatgpt.com/library' } as Browser.tabs.Tab);
+
+    await coordinatorTestHooks.processCaptureQueue();
+    expect(await getJob(id)).toMatchObject({ state: 'queued', attempts: 0, deferredForNavigation: true });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'manual_required', detachedAt: expect.any(Number), conversationKey: 'https://chatgpt.com/c/bound',
+    });
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(91, expect.objectContaining({ type: 'capture:copy' }));
+
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+    await coordinatorTestHooks.reconcileRuns();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('manual_required');
+    expect((await getJob(id))?.attempts).toBe(0);
+
+    let clipboard = 'private clipboard';
+    platform.readClipboard.mockImplementation(async () => clipboard);
+    platform.writeClipboard.mockImplementation(async (text: string) => { clipboard = text; });
+    platform.sendTabEvent.mockImplementation(async (_tabId, event) => {
+      if ((event as { type?: string }).type === 'capture:copy-now') clipboard = report;
+      return { ok: true, copyConfirmed: true };
+    });
+    tabsGet.mockResolvedValue({ id: 91, url: 'https://chatgpt.com/c/bound' } as Browser.tabs.Tab);
+    await coordinatorTestHooks.reconcileRuns();
+
+    expect(await getJob(id)).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'complete', detachedAt: undefined,
+    });
+    expect(await getCapture(id)).toMatchObject({ captureMethod: 'copy_only' });
+  });
+
+  it('terminalizes a queued capture instead of consuming retries in a different conversation', async () => {
+    const chatgpt = provider('chatgpt', 92, 'capturing');
+    chatgpt.conversationKey = 'https://chatgpt.com/c/bound';
+    const stored = run({ chatgpt });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 92, state: 'queued', createdAt: Date.now(), attempts: 0,
+      domMarkdown: 'A report from the original conversation must not be copied from a different conversation.', domCitations: [],
+    });
+    tabsGet.mockResolvedValue({ id: 92, url: 'https://chatgpt.com/c/other' } as Browser.tabs.Tab);
+
+    await coordinatorTestHooks.processCaptureQueue();
+
+    expect(await getJob(id)).toBeUndefined();
+    expect(await getCapture(id)).toBeUndefined();
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'interrupted', saveReceipt: { requestedRelativePath: `${stored.downloadFolder}/FAILED-chatgpt.md` },
+    });
+    expect(platform.sendTabEvent).not.toHaveBeenCalledWith(92, expect.objectContaining({ type: 'capture:copy-now' }));
   });
 
   it('interrupts an invalid legacy binding instead of rebinding it during reconciliation', async () => {
@@ -1253,6 +1410,31 @@ describe('durable acceptance and state recovery regressions', () => {
     });
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.conversationKey)
       .toBe('https://chatgpt.com/c/bound');
+  });
+  it('preserves the bound conversation through recoverable navigation and clears detachment on return', async () => {
+    const stored = run({chatgpt:provider('chatgpt',1,'researching')});
+    stored.providerRuns.chatgpt!.conversationKey = 'https://chatgpt.com/c/bound';
+    await putRun(stored);
+
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'manual_required',
+      reason:'provider_navigation',detail:'Return to the original conversation.',
+      conversationKey:'https://chatgpt.com/c/bound',
+    },contentSender(1, 'https://chatgpt.com/library'))).resolves.toMatchObject({
+      ok:true,providerState:{status:'manual_required',conversationKey:'https://chatgpt.com/c/bound'},
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      conversationKey:'https://chatgpt.com/c/bound',detachedAt:expect.any(Number),
+    });
+
+    const returnedAt = Date.now();
+    await expect(coordinatorTestHooks.handleRequest({
+      type:'content:state',runId:stored.id,provider:'chatgpt',status:'researching',
+      submittedAt:returnedAt,conversationKey:'https://chatgpt.com/c/bound',
+    },contentSender(1, 'https://chatgpt.com/c/bound'))).resolves.toMatchObject({
+      ok:true,providerState:{status:'researching',conversationKey:'https://chatgpt.com/c/bound'},
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.detachedAt).toBeUndefined();
   });
   it.each([
     'https://chatgpt.com/',
