@@ -8,6 +8,7 @@ const TURN = 'section, article, [data-message-id], [data-testid^="conversation-t
 const DISCOVERY = { allowTransparent: true, ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 
 interface Container { roots: HTMLElement[] }
+interface ResponseControlIndexOptions { rootsAreNormalized?: boolean }
 
 /** Short-lived index: ancestry is built once, never once per response/control pair. */
 export class ResponseControlIndex {
@@ -19,11 +20,13 @@ export class ResponseControlIndex {
   private candidates = new Map<SelectorChain, HTMLElement[]>();
   ancestorVisits = 0;
 
-  constructor(roots: readonly HTMLElement[]) {
+  constructor(roots: readonly HTMLElement[], options: ResponseControlIndexOptions = {}) {
     const uniqueRoots = Array.from(new Set(roots));
-    const normalizedRoots = uniqueRoots.filter((candidate) => !uniqueRoots.some(
-      (other) => other !== candidate && other.contains(candidate),
-    ));
+    const normalizedRoots = options.rootsAreNormalized
+      ? uniqueRoots
+      : uniqueRoots.filter((candidate) => !uniqueRoots.some(
+        (other) => other !== candidate && other.contains(candidate),
+      ));
     this.roots = new Set(normalizedRoots);
     for (const root of normalizedRoots) {
       for (let node: HTMLElement | null = root; node; node = node.parentElement) {

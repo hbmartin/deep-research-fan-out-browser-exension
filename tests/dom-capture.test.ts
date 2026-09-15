@@ -203,6 +203,16 @@ describe('provider DOM capture', () => {
     expect(finalResponseFingerprint(response)).not.toBe(first);
   });
 
+  it('classifies progress using timer-stripped text while preserving the exported timer', () => {
+    const response = document.createElement('article');
+    response.innerHTML = '<p>Searching… <span aria-label="Elapsed time">00:30</span></p>';
+    const snapshot = createResponseSnapshot(response);
+
+    expect(snapshot.text).toContain('00:30');
+    expect(snapshot.activityText).toBe('Searching…');
+    expect(isProgressResponse(response, ADAPTERS.chatgpt.progressResponsePattern, false, snapshot)).toBe(true);
+  });
+
   it('requires an interactive Gemini plan approval control', () => {
     const prose = visible(document.createElement('span'));
     prose.textContent = 'Begin research';

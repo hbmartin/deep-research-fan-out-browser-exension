@@ -44,8 +44,9 @@ button.danger { border: 1px solid #fecdca; background: #fff6f5; color: #b42318; 
 .status-awaiting_user, .status-manual_required { background: #fffaeb; color: #b54708; }
 .status-failed, .status-interrupted, .status-quota_exhausted, .status-unauthenticated { background: #fef3f2; color: #b42318; }
 .elapsed { color: #667085; font-variant-numeric: tabular-nums; font-size: 11px; }
-.detail, .warning { margin: 7px 0 0; color: #667085; font-size: 12px; }
+.detail, .warning, .save-receipt { margin: 7px 0 0; color: #667085; font-size: 12px; }
 .warning { color: #b54708; }
+.save-receipt { color: #027a48; }
 .actions, .run-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .run-actions { margin: 0; padding: 10px 14px; }
 .empty { color: #667085; }
@@ -55,4 +56,5 @@ button.danger { border: 1px solid #fecdca; background: #fff6f5; color: #b42318; 
   .launch, .run-card, textarea, button.secondary { border-color: #344054; background: #1d2939; color: #f2f4f7; }
   .provider-row, .providers { border-color: #344054; }
   .preview strong, .run-meta, .hint, .preview, .elapsed, .detail, button.ghost { color: #98a2b3; }
+  .save-receipt { color: #6ce9a6; }
 }

@@ -1,6 +1,7 @@
 import TurndownService from 'turndown';
 import { ADAPTERS, classifyProviderPage, conversationKeysMatch, normalizeConversationKey, providerFromLocation, type ProviderAdapter, type ProviderPageIdentity, type SelectorChain } from '@/src/adapters';
-import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, finalResponseFingerprint, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
+import { tokenContainment } from '@/src/citations';
+import { createFinalResponseBaseline, createResponseSnapshot, domCitationCount, domCitationInventory, evaluateStableResponse, isClarifyingResponse, isNewFinalResponse, isProgressResponse, isQuotaResponse, mergeCitationInventories, normalizeActivityText, shouldOpenSourceToggle, sourceToggleState, type FinalResponseBaseline, type ResponseSnapshot, type StableResponseCandidate } from '@/src/dom-capture';
 import { ContentMessageError, sendContentMessage } from '@/src/content-messaging';
 import { injectQuery, submitWithEnter } from '@/src/injection';
 import type { BackgroundEvent, CurrentResponseSnapshot, ProviderSnapshot } from '@/src/messages';
@@ -36,14 +37,21 @@ interface ActiveRun {
   submissionAttempted: boolean;
   manualSetupRequired: boolean;
   timeoutActivity: TimeoutActivity;
-  planApprovals: WeakMap<HTMLElement, PlanApprovalState>;
-  pendingPlanApproval?: PlanApprovalState;
+  planApproval: PlanApprovalState;
 }
 
 interface PlanApprovalState {
+  seen: boolean;
   attempts: number;
   lastAttemptAt: number;
   confirmed: boolean;
+  element?: HTMLElement;
+  responseGuard?: PlanResponseGuard;
+}
+
+interface PlanResponseGuard {
+  root: HTMLElement;
+  activityText: string;
 }
 
 interface ActivitySignature {
@@ -53,7 +61,12 @@ interface ActivitySignature {
 
 type TimeoutActivity =
   | { phase: 'hydrating' }
-  | { phase: 'baseline'; signature: ActivitySignature };
+  | {
+    phase: 'baseline';
+    signature: ActivitySignature;
+    responseArmed: boolean;
+    responseStableSince: number;
+  };
 
 let active: ActiveRun | undefined;
 let observer: MutationObserver | undefined;
@@ -64,6 +77,9 @@ const RESEARCH_TIMEOUT_MS = 45 * 60 * 1000;
 const INSPECTION_THROTTLE_MS = 250;
 const RESPONSE_VISIBILITY = { ignoreAncestorAriaHidden: true, ignoreAncestorOpacity: true } as const;
 const HOVER_COPY_VISIBILITY = { allowTransparent: true, ignoreAncestorOpacity: true } as const;
+const PAGE_QUOTA_REGION = '[role="alert"], [role="dialog"], dialog, [role="status"], [aria-live="assertive"], [aria-live="polite"]';
+const PAGE_QUOTA_EXCLUDED_REGION = 'nav, aside, [role="navigation"], form, [contenteditable="true"], textarea, [data-message-author-role="user"], user-query, [data-test-id="user-query"], [data-testid*="user-message" i]';
+const PLAN_APPENDED_REPORT_MIN_CHARS = 1000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -90,6 +106,7 @@ async function report(status: ProviderRunStatus, detail?: string, submittedAt?: 
   if (!active) return;
   const run = active;
   assertCurrent(run);
+  observeConversation(run);
   const continuingResearch = run.status === 'researching' && run.researchTimedOutAt === undefined;
   const reportSubmittedAt = status === 'researching'
     ? submittedAt ?? (continuingResearch ? run.submittedAt : Date.now())
@@ -110,10 +127,11 @@ function reportEventually(status: ProviderRunStatus, detail?: string, submittedA
 
 function reportTimeout(signature: ActivitySignature = {}): void {
   if (!active || active.researchTimedOutAt !== undefined) return;
-  active.researchTimedOutAt = Date.now();
+  const now = Date.now();
+  active.researchTimedOutAt = now;
   active.timeoutActivity = signature.response === undefined && signature.progress === undefined
     ? { phase: 'hydrating' }
-    : { phase: 'baseline', signature };
+    : { phase: 'baseline', signature, responseArmed: false, responseStableSince: now };
   reportEventually('manual_required', `${active.adapter.label} has not completed after 45 minutes. Check the provider tab.`, undefined, 'research_timeout');
 }
 
@@ -166,7 +184,7 @@ async function automate(): Promise<void> {
   let composer: HTMLElement | null = null;
   for (let attempt = 0; attempt < 2 && !composer; attempt += 1) {
     if (findElement(adapter.selectors.loginWall)) return report('unauthenticated', `Not signed in to ${adapter.label}.`);
-    if (findElement(adapter.selectors.quotaNotice, document, candidateResponseRoots(adapter))) {
+    if (findTrustedPageQuotaNotice(adapter, candidateResponseRoots(adapter))) {
       return report('quota_exhausted', `${adapter.label} deep research limit reached.`);
     }
     composer = await waitFor(() => findElement(adapter.selectors.composer), 15_000);
@@ -242,7 +260,52 @@ function candidateResponseRoots(adapter: ProviderAdapter): HTMLElement[] {
 }
 
 function completedResponseRoots(adapter: ProviderAdapter): HTMLElement[] {
-  return normalizeResponseRoots(findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY));
+  const candidates = candidateResponseRoots(adapter);
+  return completedResponseRootsForCandidates(adapter, candidates);
+}
+
+function completedResponseRootsForCandidates(
+  adapter: ProviderAdapter,
+  candidates: readonly HTMLElement[],
+): HTMLElement[] {
+  const completed = findAll(adapter.selectors.finalMessageRoot, document, RESPONSE_VISIBILITY);
+  return normalizeResponseRoots(completed.map((root) => (
+    candidates.find((candidate) => candidate === root || candidate.contains(root)) ?? root
+  )));
+}
+
+function responseActivityTextWithoutCitations(snapshot: ResponseSnapshot): string {
+  return snapshot.activityTextWithoutCitations;
+}
+
+function planResponseStillGuarded(
+  root: HTMLElement,
+  snapshot: ResponseSnapshot,
+  guard: PlanResponseGuard | undefined,
+): boolean {
+  if (!guard || guard.root !== root) return false;
+  const currentText = responseActivityTextWithoutCitations(snapshot);
+  if (currentText === guard.activityText) return true;
+  const planIndex = currentText.indexOf(guard.activityText);
+  const planRemains = planIndex >= 0 || tokenContainment(currentText, guard.activityText) >= 0.8;
+  if (!planRemains) return false;
+  const appendedLength = planIndex >= 0
+    ? normalizeActivityText(
+      `${currentText.slice(0, planIndex)} ${currentText.slice(planIndex + guard.activityText.length)}`,
+    ).length
+    : Math.max(0, currentText.length - guard.activityText.length);
+  return appendedLength < PLAN_APPENDED_REPORT_MIN_CHARS;
+}
+
+function findTrustedPageQuotaNotice(
+  adapter: ProviderAdapter,
+  responseRoots: readonly HTMLElement[],
+): HTMLElement | null {
+  return findAll(adapter.selectors.quotaNotice, document).find((element) => (
+    !responseRoots.some((root) => root.contains(element))
+    && !element.closest(PAGE_QUOTA_EXCLUDED_REGION)
+    && Boolean(element.closest(PAGE_QUOTA_REGION))
+  )) ?? null;
 }
 
 function currentResponseSnapshot(
@@ -331,32 +394,42 @@ function activitySignature(
   snapshot: ResponseSnapshot | undefined,
   progress: HTMLElement | null,
 ): ActivitySignature {
+  const stableId = root?.getAttribute('data-message-id') || root?.id;
+  const responseText = root && snapshot ? responseActivityTextWithoutCitations(snapshot) : undefined;
   return {
-    response: root && snapshot ? finalResponseFingerprint(root, snapshot) : undefined,
+    response: responseText === undefined ? undefined : `${stableId ? `id:${stableId}` : 'anonymous'}\u0000${responseText}`,
     progress: progressActivitySignature(progress),
   };
 }
 
-function timedOutActivityResumed(run: ActiveRun, signature: ActivitySignature): boolean {
+function timedOutActivityResumed(run: ActiveRun, signature: ActivitySignature, now = Date.now()): boolean {
   if (run.researchTimedOutAt === undefined) return false;
   if (run.timeoutActivity.phase === 'hydrating') {
     if (signature.response !== undefined || signature.progress !== undefined) {
-      run.timeoutActivity = { phase: 'baseline', signature };
+      run.timeoutActivity = {
+        phase: 'baseline', signature, responseArmed: false, responseStableSince: now,
+      };
     }
     return false;
   }
   const checkpoint = run.timeoutActivity;
-  if (signature.progress !== undefined && checkpoint.signature.progress !== undefined
-    && signature.progress !== checkpoint.signature.progress) return true;
-  if (signature.response !== undefined && checkpoint.signature.response !== undefined
-    && signature.response !== checkpoint.signature.response) return true;
-  run.timeoutActivity = {
-    phase: 'baseline',
-    signature: {
-      response: signature.response ?? checkpoint.signature.response,
-      progress: signature.progress ?? checkpoint.signature.progress,
-    },
-  };
+  if (signature.progress !== undefined && signature.progress !== checkpoint.signature.progress) return true;
+  if (signature.response === undefined) return false;
+  if (checkpoint.signature.response === undefined) {
+    checkpoint.signature.response = signature.response;
+    checkpoint.responseArmed = false;
+    checkpoint.responseStableSince = now;
+    return false;
+  }
+  if (signature.response !== checkpoint.signature.response) {
+    if (checkpoint.responseArmed) return true;
+    checkpoint.signature.response = signature.response;
+    checkpoint.responseStableSince = now;
+    return false;
+  }
+  if (!checkpoint.responseArmed && now - checkpoint.responseStableSince >= run.completionDebounceMs) {
+    checkpoint.responseArmed = true;
+  }
   return false;
 }
 
@@ -407,7 +480,8 @@ export function findResponseControl(
   baseline: ReadonlySet<HTMLElement> = new Set(),
   allowHoverTransparent = false,
 ): HTMLElement | null {
-  return new ResponseControlIndex(roots).find(root, selectors, baseline, allowHoverTransparent);
+  return new ResponseControlIndex(roots, { rootsAreNormalized: true })
+    .find(root, selectors, baseline, allowHoverTransparent);
 }
 
 async function capture(root: HTMLElement, copyControlObserved: boolean): Promise<void> {
@@ -431,7 +505,7 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
     const sourceSelectors = capturingRun.adapter.selectors.sourcesPanelToggle;
     if (root.isConnected && sourceSelectors) {
       const refreshedRoots = completedResponseRoots(capturingRun.adapter);
-      const refreshedControls = new ResponseControlIndex(refreshedRoots);
+      const refreshedControls = new ResponseControlIndex(refreshedRoots, { rootsAreNormalized: true });
       const possibleToggle = refreshedControls.find(root, sourceSelectors, new Set(), true, true);
       if (possibleToggle?.isConnected) {
         const actionable = isResponseControlActionable(possibleToggle, true, root);
@@ -530,68 +604,78 @@ function inspectPage(): void {
   const pageIdentity = classifyProviderPage(location.href, adapter.id);
   const conversationWasBound = active.conversationKey !== undefined;
   if (active.conversationKey) {
-    if (pageIdentity.kind === 'entry'
-      || (pageIdentity.kind === 'conversation'
-        && !conversationKeysMatch(active.conversationKey, pageIdentity.key, adapter.id))) {
+    if (pageIdentity.kind !== 'conversation'
+      || !conversationKeysMatch(active.conversationKey, pageIdentity.key, adapter.id)) {
       reportEventually('interrupted', 'Provider tab navigated to a different conversation.');
       return;
     }
   } else if (pageIdentity.kind === 'conversation') {
     active.conversationKey = pageIdentity.key;
   }
-  if (pageIdentity.kind === 'unsupported') {
-    if (researchTimeoutDue) reportTimeout();
-    return;
-  }
+  if (pageIdentity.kind === 'unsupported') return;
 
   const candidateRoots = candidateResponseRoots(adapter);
-  const finalRoots = completedResponseRoots(adapter);
+  const finalRoots = completedResponseRootsForCandidates(adapter, candidateRoots);
   const latestResponse = candidateRoots.at(-1) ?? null;
   const latestFinalResponse = latestResponse && finalRoots.includes(latestResponse) ? latestResponse : null;
-  const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
+  const plan = adapter.selectors.planApproval ? findElement(adapter.selectors.planApproval) : null;
+  let latestSnapshot: ResponseSnapshot | undefined;
+  const getLatestSnapshot = () => {
+    if (latestResponse && !latestSnapshot) latestSnapshot = createResponseSnapshot(latestResponse);
+    return latestSnapshot;
+  };
+  const planState = active.planApproval;
+  if (plan) {
+    planState.element = plan;
+    if (!planState.seen) {
+      planState.seen = true;
+      const snapshot = getLatestSnapshot();
+      if (latestResponse && snapshot) {
+        planState.responseGuard = {
+          root: latestResponse,
+          activityText: responseActivityTextWithoutCitations(snapshot),
+        };
+      }
+    }
+  }
 
-  // Page-level terminal notices are authoritative even while a response or plan
-  // control is still mounted. Response-local partial text remains streaming-gated.
+  // Only semantic page-level notices preempt streaming. Generic matching text in
+  // the conversation, sidebar, or composer is classified in its local context.
   if (active.status !== 'capturing' && active.captureFailureCount === 0
-    && findElement(adapter.selectors.quotaNotice, document, candidateRoots)) {
+    && findTrustedPageQuotaNotice(adapter, candidateRoots)) {
     reportEventually('quota_exhausted', `${adapter.label} deep research limit reached.`);
     return;
   }
 
   const streaming = findStreamingIndicator(adapter, latestResponse);
   if (streaming) {
-    const pendingApproval = active.pendingPlanApproval;
-    const approvedPlan = Boolean(pendingApproval && pendingApproval.attempts > 0 && !pendingApproval.confirmed);
-    if (pendingApproval) pendingApproval.confirmed = true;
-    const latestSnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
-      ? (latestResponse ? createResponseSnapshot(latestResponse) : undefined)
+    const approvedPlan = planState.seen && !planState.confirmed;
+    if (approvedPlan) planState.confirmed = true;
+    const activitySnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
+      ? getLatestSnapshot()
       : undefined;
-    const signature = activitySignature(latestResponse, latestSnapshot, streaming);
+    const signature = activitySignature(latestResponse, activitySnapshot, streaming);
     active.completionCandidate = undefined;
-    if (researchTimeoutDue) reportTimeout(signature);
-    else if (active.researchTimedOutAt !== undefined ? timedOutActivityResumed(active, signature)
-      : approvedPlan || ['awaiting_user', 'manual_required', 'submitting'].includes(active.status)) {
+    if (approvedPlan || (active.researchTimedOutAt !== undefined
+      ? timedOutActivityResumed(active, signature, now)
+      : !researchTimeoutDue && ['awaiting_user', 'manual_required', 'submitting'].includes(active.status))) {
       reportEventually('researching', undefined, Date.now());
+    } else if (researchTimeoutDue) {
+      reportTimeout(signature);
     } else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
       reportEventually('researching', undefined, active.submittedAt);
     }
     return;
   }
 
-  let planState = plan ? active.planApprovals.get(plan) : undefined;
-  if (plan && !planState?.confirmed) {
+  if (plan && !planState.confirmed) {
     active.completionCandidate = undefined;
-    if (!planState) {
-      planState = { attempts: 0, lastAttemptAt: 0, confirmed: false };
-      active.planApprovals.set(plan, planState);
-    }
-    active.pendingPlanApproval = planState;
-    const latestSnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
-      ? (latestResponse ? createResponseSnapshot(latestResponse) : undefined)
+    const activitySnapshot = active.researchTimedOutAt !== undefined || researchTimeoutDue
+      ? getLatestSnapshot()
       : undefined;
-    const signature = activitySignature(latestResponse, latestSnapshot, plan);
+    const signature = activitySignature(latestResponse, activitySnapshot, plan);
     if (researchTimeoutDue) reportTimeout(signature);
-    else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature);
+    else if (active.researchTimedOutAt !== undefined) timedOutActivityResumed(active, signature, now);
     else if (!conversationWasBound && active.conversationKey && active.status === 'researching') {
       reportEventually('researching', undefined, active.submittedAt);
     }
@@ -607,12 +691,26 @@ function inspectPage(): void {
     return;
   }
 
-  const newResponse = isNewFinalResponse(latestFinalResponse, active.finalResponseBaseline) ? latestFinalResponse : null;
-  const root = newResponse;
-  const latestSnapshot = latestResponse ? createResponseSnapshot(latestResponse) : undefined;
-  const responseSnapshot = root
-    ? (latestSnapshot?.root === root ? latestSnapshot : createResponseSnapshot(root))
-    : undefined;
+  if (!plan && planState.seen && !planState.confirmed) {
+    active.completionCandidate = undefined;
+    if (planState.element?.isConnected) return;
+    planState.confirmed = true;
+    reportEventually('researching', undefined, now);
+    return;
+  }
+
+  latestSnapshot = getLatestSnapshot();
+  const baselineAllowsResponse = isNewFinalResponse(
+    latestFinalResponse,
+    active.finalResponseBaseline,
+    latestSnapshot,
+  );
+  const responseSnapshot = baselineAllowsResponse ? latestSnapshot : undefined;
+  const root = baselineAllowsResponse && latestFinalResponse && responseSnapshot
+    && !planResponseStillGuarded(latestFinalResponse, responseSnapshot, planState.responseGuard)
+    ? latestFinalResponse
+    : null;
+  const newResponse = root;
   const signature = activitySignature(latestResponse, latestSnapshot, null);
   if (!conversationWasBound && active.conversationKey && active.status === 'researching'
     && !researchTimeoutDue && active.researchTimedOutAt === undefined) {
@@ -636,7 +734,7 @@ function inspectPage(): void {
     }
     return;
   }
-  const controls = new ResponseControlIndex(finalRoots);
+  const controls = new ResponseControlIndex(finalRoots, { rootsAreNormalized: true });
   const copy = root
     ? controls.find(root, adapter.selectors.copyButton, active.copyButtonBaseline, true)
     : null;
@@ -653,7 +751,7 @@ function inspectPage(): void {
     active.timeoutGraceUntil ??= now + (copy ? active.completionDebounceMs : Math.max(30_000, active.completionDebounceMs * 3));
     if (!completion.candidate || now >= active.timeoutGraceUntil) reportTimeout(signature);
   } else if (active.researchTimedOutAt !== undefined && !completion.ready
-    && timedOutActivityResumed(active, signature)) {
+    && timedOutActivityResumed(active, signature, now)) {
     reportEventually('researching', undefined, Date.now());
     return;
   }
@@ -741,6 +839,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
     active.conversationKey ??= normalizeConversationKey(event.conversationKey, active.adapter.id);
+    observeConversation(active);
     beginMonitoring();
     if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
     await runAutomation(active);
@@ -748,8 +847,9 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
   }
   if (active) stopRun(active);
   const adapter = ADAPTERS[event.provider];
-  const existingRoots = completedResponseRoots(adapter);
-  const latestExistingResponse = candidateResponseRoots(adapter).at(-1) ?? null;
+  const existingCandidates = candidateResponseRoots(adapter);
+  const existingRoots = completedResponseRootsForCandidates(adapter, existingCandidates);
+  const latestExistingResponse = existingCandidates.at(-1) ?? null;
   const streaming = findStreamingIndicator(adapter, latestExistingResponse);
   const plan = adapter.selectors.planApproval && findElement(adapter.selectors.planApproval);
   const setup = isSetupProviderStatus(event.status);
@@ -776,7 +876,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     submissionAttempted: !setup,
     manualSetupRequired: false,
     timeoutActivity: { phase: 'hydrating' },
-    planApprovals: new WeakMap(),
+    planApproval: { seen: false, attempts: 0, lastAttemptAt: 0, confirmed: false },
     reporter: new ProviderReporter((request, response) => {
       applyProviderState(run, response?.providerState ?? {
         status: request.status,
@@ -791,6 +891,7 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     }),
   };
   active = run;
+  observeConversation(run);
   if (isTerminalProviderStatus(event.status)) { stopRun(run); return; }
   beginMonitoring();
   if (!setup || event.resumeOnly) {

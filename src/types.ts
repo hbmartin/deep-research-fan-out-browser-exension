@@ -21,6 +21,24 @@ export type ProviderRunStatus =
 
 export type RunStatus = 'active' | 'needs_attention' | 'finalizing' | 'complete';
 export type CaptureMethod = 'copy+dom' | 'copy_only' | 'dom_only';
+export type ArtifactSaveDestination = 'directory' | 'downloads';
+export type ArtifactSaveFallbackReason = 'permission_required' | 'directory_unavailable' | 'write_failed';
+
+export interface ArtifactSaveReceipt {
+  destination: ArtifactSaveDestination;
+  requestedRelativePath: string;
+  actualRelativePath?: string;
+  savedAt: number;
+  downloadId?: number;
+  fallbackReason?: ArtifactSaveFallbackReason;
+}
+
+export interface ReportDirectoryConfig {
+  handle: FileSystemDirectoryHandle;
+  displayName: string;
+  configuredAt: number;
+  needsReconnect: boolean;
+}
 
 export interface Citation {
   index: number;
@@ -122,7 +140,10 @@ export interface ProviderRun {
   attempts: number;
   degraded: boolean;
   adapterVersion: string;
+  saveReceipt?: ArtifactSaveReceipt;
+  /** @deprecated Migrated to saveReceipt when a v1 run is read. */
   downloadId?: number;
+  /** @deprecated Migrated to saveReceipt when a v1 run is read. */
   downloadedAt?: number;
   copiedAt?: number;
   reconcileFailureCount?: number;
@@ -139,6 +160,7 @@ export interface Run {
   providerRuns: Partial<Record<ProviderId, ProviderRun>>;
   status: RunStatus;
   slug: string;
+  reportFolder: string;
   downloadFolder: string;
 }
 

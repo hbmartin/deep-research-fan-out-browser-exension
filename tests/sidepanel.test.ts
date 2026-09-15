@@ -44,7 +44,7 @@ describe('side-panel rendering', () => {
           provider: 'chatgpt', tabId: 1, status: 'researching', submittedQuery: 'existing', appendString: '',
           startedAt: 1, attempts: 0, degraded: false, adapterVersion: 'test',
         },
-      }, status: 'active', slug: 'run', downloadFolder: 'deep-research/run',
+      }, status: 'active', slug: 'run', reportFolder: 'run-00000000', downloadFolder: 'deep-research/run-00000000',
     };
     runtimeListener?.({ type: 'runs:changed', runs: [update] });
     storedSettings = {
@@ -68,5 +68,27 @@ describe('side-panel rendering', () => {
       type: 'provider:copy-current', runId: 'run', provider: 'chatgpt',
     }));
     await vi.waitFor(() => expect(document.querySelector('.notice')?.textContent).toBe('ChatGPT current response copied.'));
+
+    const completed: Run = {
+      ...update,
+      status: 'complete',
+      completedAt: 20,
+      providerRuns: {
+        chatgpt: {
+          ...update.providerRuns.chatgpt!, status: 'complete', completedAt: 20,
+          saveReceipt: {
+            destination: 'downloads', requestedRelativePath: 'deep-research/run/chatgpt.md', savedAt: 20,
+            fallbackReason: 'permission_required', downloadId: 7,
+          },
+        },
+      },
+    };
+    runtimeListener?.({ type: 'runs:changed', runs: [completed] });
+    await vi.waitFor(() => expect(document.querySelector('.save-receipt')?.textContent).toContain('Downloads fallback'));
+    const saveAgain = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Save again');
+    saveAgain!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:save', runId: 'run', provider: 'chatgpt',
+    }));
   });
 });

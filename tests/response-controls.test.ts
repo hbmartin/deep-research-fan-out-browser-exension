@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ADAPTERS } from '../src/adapters';
 import { ResponseControlIndex } from '../src/response-controls';
 
@@ -43,6 +43,15 @@ describe('bounded response ownership', () => {
     const controls = new ResponseControlIndex([outer, inner]);
     expect(controls.find(outer, selectors, new Set(), true)).toBe(document.querySelector('button'));
     expect(controls.find(inner, selectors, new Set(), true)).toBeNull();
+  });
+  it('skips containment normalization for caller-normalized roots', () => {
+    document.body.innerHTML = '<main><article>First</article><article>Second</article></main>';
+    const roots = Array.from(document.querySelectorAll<HTMLElement>('article'));
+    const contains = roots.map((root) => vi.spyOn(root, 'contains'));
+
+    new ResponseControlIndex(roots, { rootsAreNormalized: true });
+
+    for (const spy of contains) expect(spy).not.toHaveBeenCalled();
   });
   it('does not assign a shared plain-container control to the nearest preceding response', () => {
     document.body.innerHTML = `<div><article>Earlier</article><article>Latest</article>${copy}</div>`;

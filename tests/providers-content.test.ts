@@ -90,6 +90,19 @@ describe('provider content-script recovery', () => {
     expect(storedStatus).toBe('capturing');
   });
 
+  it('builds one anonymous response snapshot during a non-streaming inspection', async () => {
+    answer(report.repeat(10));
+    document.querySelector('[aria-label="Copy response"]')!.remove();
+    const root = document.querySelector<HTMLElement>('[data-message-author-role="assistant"]')!;
+    const clone = vi.spyOn(root, 'cloneNode');
+
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(clone).toHaveBeenCalledTimes(1);
+    expect(captures()).toHaveLength(0);
+  });
+
   it('does not let quota-like page text discard a finished report during capture backoff', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const sendMessage = vi.mocked(browser.runtime.sendMessage);
@@ -148,6 +161,20 @@ describe('provider content-script recovery', () => {
     expect(storedStatus).toBe('interrupted');
     await vi.advanceTimersByTimeAsync(10000);
     expect(captures()).toHaveLength(1);
+  });
+
+  it.each([
+    'https://chatgpt.com/',
+    'https://chatgpt.com/c/other',
+    'https://chatgpt.com/library',
+  ])('interrupts a bound run after provider navigation to %s', async (url) => {
+    await resume('researching');
+    vi.stubGlobal('location', new URL(url));
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(storedStatus).toBe('interrupted');
+    expect(messages).not.toContainEqual(expect.objectContaining({ reason: 'research_timeout' }));
   });
 
   it('retries a rejected state update without committing it locally', async () => {
@@ -219,12 +246,38 @@ describe('provider content-script recovery', () => {
     expect(clone).not.toHaveBeenCalled();
   });
 
+  it('ignores quota-like text in the user turn and sidebar while streaming', async () => {
+    document.body.innerHTML = `
+      <aside style="position:fixed">Upgrade for more deep research</aside>
+      <div style="position:fixed" data-message-author-role="user">Compare Upgrade research plans</div>
+      <div style="position:fixed" data-message-author-role="assistant">Partial answer</div>
+      <button style="position:fixed" aria-label="Stop generating"></button>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(storedStatus).toBe('researching');
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
+  });
+
   it('does not treat a prior answer as proof that a reloaded submission was sent', async () => {
     answer('An answer from the previous query');
     await resume('submitting');
     expect(storedStatus).toBe('manual_required');
     await vi.advanceTimersByTimeAsync(120000);
     expect(captures()).toHaveLength(0);
+  });
+
+  it('binds the current conversation before reporting an uncertain resumed submission', async () => {
+    storedStatus = 'submitting';
+    await listener({
+      type: 'content:start', runId: 'review-run', provider: 'chatgpt', query: 'Research topic', appendString: '',
+      geminiAutoApprove: true, completionDebounceMs: 3000, resumeOnly: true, status: 'submitting',
+    });
+
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'content:state', status: 'manual_required', conversationKey: 'https://chatgpt.com/c/review',
+    }));
   });
 
   it('does not use an ancestor-hidden historical Stop control to confirm a reloaded submission', async () => {
@@ -595,7 +648,7 @@ describe('provider reliability regressions', () => {
   it('ignores ticking elapsed counters and modal-only mutations after a quiet timeout checkpoint', async () => {
     document.body.innerHTML = `
       <main><div style="position:fixed" data-message-author-role="assistant">
-        <p>Researching the requested topic now…</p>
+        <p>Researching the requested topic now… <a id="late-citation" href="https://example.com/1">[1]</a></p>
         <p><span aria-label="Elapsed time">00:30</span></p>
         <li id="inline-timer">Progress details — elapsed time: 1m 30s</li>
       </div></main>
@@ -606,6 +659,8 @@ describe('provider reliability regressions', () => {
     for (let second = 31; second <= 36; second++) {
       document.querySelector('[aria-label="Elapsed time"]')!.textContent = `00:${second}`;
       document.querySelector('#inline-timer')!.textContent = `Progress details — elapsed time: 1m ${second}s`;
+      document.querySelector('#late-citation')!.textContent = `[${second}]`;
+      document.querySelector('#late-citation')!.setAttribute('href', `https://example.com/${second}`);
       document.querySelector('main')!.toggleAttribute('aria-hidden');
       await vi.advanceTimersByTimeAsync(1000);
     }
@@ -614,6 +669,20 @@ describe('provider reliability regressions', () => {
     const resumedAt = Date.now();
     document.querySelector('p')!.textContent = 'Searching the requested topic now…';
     await vi.advanceTimersByTimeAsync(2000);
+    const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
+    expect(resumed).toMatchObject({submittedAt:expect.any(Number)});
+    expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);
+  });
+  it('treats a newly appearing Stop control as post-timeout activity', async () => {
+    answer('Researching the requested topic now…');
+    storedStatus = 'manual_required';
+    await listener({...setupEvent(), resumeOnly:true, status:'manual_required', submittedAt:Date.now()-3600000, researchTimedOutAt:Date.now()-60000});
+    await vi.advanceTimersByTimeAsync(4000);
+
+    const resumedAt = Date.now();
+    document.body.insertAdjacentHTML('beforeend', '<button style="position:fixed" aria-label="Stop generating"></button>');
+    await vi.advanceTimersByTimeAsync(2000);
+
     const resumed = messages.find((message) => message.type === 'content:state' && message.status === 'researching');
     expect(resumed).toMatchObject({submittedAt:expect.any(Number)});
     expect((resumed as Extract<RuntimeRequest,{type:'content:state'}>).submittedAt).toBeGreaterThanOrEqual(resumedAt);

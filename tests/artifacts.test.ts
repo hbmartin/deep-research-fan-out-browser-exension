@@ -8,7 +8,7 @@ const providerRun: ProviderRun = {
 };
 const run: Run = {
   id: 'run-id', query: 'Query', createdAt: 1000, completedAt: 5000, windowId: 1,
-  providerRuns: { gemini: providerRun }, status: 'complete', slug: 'query', downloadFolder: 'deep-research/query',
+  providerRuns: { gemini: providerRun }, status: 'complete', slug: 'query', reportFolder: 'query-runid000', downloadFolder: 'deep-research/query-runid000',
 };
 const capture: Capture = {
   rawMarkdown: 'Report', normalizedMarkdown: 'Report [1](https://example.com)',

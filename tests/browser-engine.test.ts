@@ -26,8 +26,10 @@ describe('selector engine', () => {
 
   it.each([
     ['chatgpt', 'https://chatgpt.com/c/123/?model=research#sources', 'https://chatgpt.com/c/123'],
+    ['chatgpt', 'https://chatgpt.com/g/g-p-project/c/123/?model=research#sources', 'https://chatgpt.com/g/g-p-project/c/123'],
     ['claude', 'https://claude.ai/chat/123/?model=opus#last', 'https://claude.ai/chat/123'],
     ['gemini', 'https://gemini.google.com/app/123/?hl=en#sources', 'https://gemini.google.com/app/123'],
+    ['gemini', 'https://gemini.google.com/u/1/app/123/?hl=en#sources', 'https://gemini.google.com/u/1/app/123'],
     ['grok', 'https://grok.com/c/123/?ref=sidebar#answer', 'https://grok.com/c/123'],
   ] as const)('classifies canonical %s conversation routes', (provider, url, key) => {
     expect(classifyProviderPage(url, provider)).toEqual({ kind: 'conversation', key });
@@ -37,6 +39,7 @@ describe('selector engine', () => {
     ['chatgpt', 'https://chatgpt.com/?model=research'],
     ['claude', 'https://claude.ai/new/#composer'],
     ['gemini', 'https://gemini.google.com/app/?hl=en'],
+    ['gemini', 'https://gemini.google.com/u/1/app/?hl=en'],
     ['grok', 'https://grok.com/#composer'],
   ] as const)('classifies the %s entry route without inventing a key', (provider, url) => {
     expect(classifyProviderPage(url, provider)).toEqual({ kind: 'entry' });
@@ -44,8 +47,11 @@ describe('selector engine', () => {
 
   it.each([
     ['chatgpt', 'https://chatgpt.com/c/123/shared'],
+    ['chatgpt', 'https://chatgpt.com/gpts'],
+    ['chatgpt', 'https://chatgpt.com/library'],
     ['claude', 'https://claude.ai/project/123'],
     ['gemini', 'https://gemini.google.com/app/download'],
+    ['gemini', 'https://gemini.google.com/u/1/app/download'],
     ['grok', 'https://grok.com/share/123'],
   ] as const)('defers unsupported %s paths', (provider, url) => {
     expect(classifyProviderPage(url, provider)).toEqual({ kind: 'unsupported' });
@@ -160,8 +166,12 @@ describe('selector engine', () => {
 
   it.each([
     ['gemini', 'Researching · 23 sources'],
+    ['gemini', 'Thinking · 45s'],
+    ['gemini', 'Researching — reading sites'],
     ['grok', 'Researching · 23 sources'],
-  ] as const)('recognizes %s progress pills with source counts', (provider, label) => {
+    ['grok', 'Thinking · 1m 20s'],
+    ['grok', 'Researching — reading sites'],
+  ] as const)('recognizes constrained %s progress label %s', (provider, label) => {
     document.body.innerHTML = `<button style="position:fixed">${label}</button>`;
     expect(findElement(ADAPTERS[provider].selectors.streamingIndicator)?.textContent).toBe(label);
   });

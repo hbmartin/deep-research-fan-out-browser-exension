@@ -69,6 +69,22 @@ describe('serialized provider reporting', () => {
     expect(rejected).toHaveBeenCalledTimes(1);
   });
 
+  it('allows a later retry after a conversation mismatch rejection', async () => {
+    const send = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false, code: 'conversation_mismatch', error: 'page changed',
+        providerState: { status: 'researching' },
+      })
+      .mockResolvedValue({ ok: true, providerState: { status: 'researching' } });
+    const { instance, rejected } = reporter(send);
+
+    await expect(instance.report(request())).rejects.toMatchObject({ code: 'conversation_mismatch' });
+    await expect(instance.report(request())).resolves.toBeUndefined();
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(rejected).toHaveBeenCalledTimes(1);
+  });
+
   it('cancels queued work and ignores a late acknowledgement', async () => {
     let acknowledge!: (value: unknown) => void;
     const send = vi.fn(() => new Promise((resolve) => { acknowledge = resolve; }));

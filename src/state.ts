@@ -63,10 +63,11 @@ export function slugify(query: string): string {
     .replace(/-$/g, '') || 'research';
 }
 
-export function createDownloadFolder(root: string, createdAt: number, slug: string, runId: string): string {
-  const date = new Date(createdAt);
-  const pad = (value: number) => String(value).padStart(2, '0');
-  const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}`;
-  const suffix = runId.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  return `${root}/${stamp}_${slug}_${suffix}`;
+export function createReportFolder(slug: string, runId: string): string {
+  const suffix = runId.replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 8).padEnd(8, '0');
+  return `${slug.slice(0, 48) || 'research'}-${suffix}`;
+}
+
+export function createDownloadFolder(root: string, slug: string, runId: string): string {
+  return `${root}/${createReportFolder(slug, runId)}`;
 }
