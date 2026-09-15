@@ -1,8 +1,8 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { captureId, deleteReportDirectoryConfig, evictHistory, getCapture, getRedirect, getReportDirectoryConfig, getRun, listRuns, putCapture, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
-import type { Capture, Run } from '../src/types';
+import { captureId, deleteJob, deleteReportDirectoryConfig, getCapture, getJob, getRedirect, getReportDirectoryConfig, getRun, listRuns, nextCaptureJob, pruneExpiredRedirects, putCapture, putJob, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
+import type { Capture, CaptureJob, Run } from '../src/types';
 
 const capture: Capture = {
   rawMarkdown: 'report', normalizedMarkdown: 'report', citations: [], captureMethod: 'dom_only',
@@ -29,13 +29,13 @@ describe('run history', () => {
     }
   });
 
-  it('retains the newest twenty completed runs and removes their captures atomically', async () => {
-    await evictHistory(20);
+  it('retains completed runs and their captures beyond the old twenty-run limit', async () => {
+    await pruneExpiredRedirects();
     const runs = await listRuns();
-    expect(runs).toHaveLength(20);
+    expect(runs).toHaveLength(22);
     expect(runs[0]?.id).toBe('run-21');
-    expect(runs.at(-1)?.id).toBe('run-02');
-    expect(await getCapture(captureId('run-00', 'chatgpt'))).toBeUndefined();
+    expect(runs.at(-1)?.id).toBe('run-00');
+    expect(await getCapture(captureId('run-00', 'chatgpt'))).toBeDefined();
     expect(await getCapture(captureId('run-02', 'chatgpt'))).toBeDefined();
   });
 
@@ -43,9 +43,25 @@ describe('run history', () => {
     await putRedirect('https://wrapper.test/old', 'https://canonical.test/old', Date.now() - REDIRECT_RETENTION_MS - 1);
     await putRedirect('https://wrapper.test/current', 'https://canonical.test/current');
 
-    await evictHistory(20);
+    await pruneExpiredRedirects();
     expect(await getRedirect('https://wrapper.test/old')).toBeUndefined();
     expect(await getRedirect('https://wrapper.test/current')).toBe('https://canonical.test/current');
+  });
+
+  it('validates the optional orphan timestamp when reading capture jobs', async () => {
+    const valid: CaptureJob = {
+      id: 'orphan-valid', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      state: 'orphaned', createdAt: Date.now(), orphanedAt: Date.now(), attempts: 1,
+      domMarkdown: 'A retained report with enough text to be recovered later.', domCitations: [],
+    };
+    const invalid = { ...valid, id: 'orphan-invalid', orphanedAt: 'yesterday' } as unknown as CaptureJob;
+    await putJob(valid);
+    await putJob(invalid);
+    expect(await getJob(valid.id)).toMatchObject({ orphanedAt: valid.orphanedAt });
+    expect(await getJob(invalid.id)).toBeUndefined();
+    expect(await nextCaptureJob()).toBeUndefined();
+    await deleteJob(valid.id);
+    await deleteJob(invalid.id);
   });
 
   it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {

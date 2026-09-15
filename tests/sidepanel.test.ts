@@ -33,6 +33,7 @@ describe('side-panel rendering', () => {
       expect(document.querySelector('#query')).toBeInstanceOf(HTMLTextAreaElement);
       expect(document.querySelector('.preview')?.textContent).toContain('Initial suffix');
     });
+    expect(browser.action.setBadgeText).not.toHaveBeenCalled();
 
     const textarea = document.querySelector<HTMLTextAreaElement>('#query')!;
     textarea.value = 'draft query';
@@ -89,6 +90,16 @@ describe('side-panel rendering', () => {
     saveAgain!.click();
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:save', runId: 'run', provider: 'chatgpt',
+    }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
+      chatgpt: { ...completed.providerRuns.chatgpt!, status: 'failed', captureRecoveryPending: true },
+    } }] });
+    const retryReport = Array.from(document.querySelectorAll('button')).find((node) => node.textContent === 'Retry report');
+    expect(retryReport).toBeInstanceOf(HTMLButtonElement);
+    retryReport!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:retry-capture', runId: 'run', provider: 'chatgpt',
     }));
   });
 });

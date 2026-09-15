@@ -4,3 +4,5 @@ export const DURATION_PATTERN = String.raw`(?:\d{1,3}:\d{2}(?::\d{2})?|(?:\d+\s*
 export const PROGRESS_TRAILING_DURATION = new RegExp(
   String.raw`\s*(?:[·•—-]\s*)?${DURATION_PATTERN}\s*$`, 'i',
 );
+
+export const NAVIGATION_DEFERRAL_MS = 120_000;

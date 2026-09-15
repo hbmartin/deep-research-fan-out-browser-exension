@@ -334,6 +334,17 @@ describe('provider content-script recovery', () => {
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'quota_exhausted' }));
   });
 
+  it('keeps an unavailable banner conservative even inside an alert while streaming', async () => {
+    document.body.innerHTML = `
+      <div role="alert" style="position:fixed">Deep research is unavailable.</div>
+      <div style="position:fixed" data-message-author-role="assistant">The report is still streaming.</div>
+      <button style="position:fixed" aria-label="Stop generating"></button>
+    `;
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(storedStatus).toBe('researching');
+  });
+
   it('still accepts a completed assistant quota response without a page-level alert', async () => {
     await resume('researching');
     answer("You've reached your deep research limit. Please try again later.");
@@ -643,6 +654,16 @@ describe('provider reliability regressions', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(messages).not.toContainEqual(expect.objectContaining({ type: 'content:state', status: 'awaiting_ready' }));
     expect(captures()).toHaveLength(1);
+  });
+  it('submits from a restored setup phase after pre-submission sign-in', async () => {
+    storedStatus = 'manual_required';
+    const send = setupPage();
+    await listener({ ...setupEvent(), status: 'manual_required', resumeOnly: true });
+    storedStatus = 'awaiting_ready';
+    await listener({ ...setupEvent(), status: 'awaiting_ready' });
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'content:state', status: 'setting_mode' }));
   });
   it('latches manual setup synchronously while its report acknowledgement is delayed', async () => {
     storedStatus = 'setting_mode';

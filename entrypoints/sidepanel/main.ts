@@ -95,7 +95,8 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
       setNotice(`${ADAPTERS[provider].label} current response copied.`);
     }));
   }
-  if (isTerminalProviderStatus(providerRun.status)) actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
+  if (providerRun.captureRecoveryPending) actions.append(button('Retry report', () => command({ type: 'provider:retry-capture', runId: run.id, provider }), 'secondary'));
+  if (isTerminalProviderStatus(providerRun.status) && !providerRun.captureRecoveryPending) actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
   else actions.append(button('End provider', () => command({ type: 'provider:end', runId: run.id, provider }), 'danger'));
   row.append(actions);
   return row;
@@ -200,8 +201,6 @@ browser.storage.onChanged.addListener((_changes, areaName) => {
 async function initialize(): Promise<void> {
   settings = await loadSettings();
   renderShell();
-  const action = (browser.action ?? (browser as unknown as { browserAction: typeof browser.action }).browserAction);
-  await action.setBadgeText({ text: '' });
   await reload();
   window.setInterval(refreshTimers, 1000);
 }

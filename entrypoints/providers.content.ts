@@ -688,8 +688,12 @@ function inspectPage(): void {
     return latestSnapshot;
   };
   const planState = active.planApproval;
-  if (latestResponse) planState.guards = planState.guards.filter((guard) => guard.root === latestResponse);
-  else planState.guards = [];
+  if (latestResponse) {
+    planState.guards = planState.guards.filter((guard) => guard.root === latestResponse);
+    if (!planState.guards.length && planState.current?.responseGuard.root === latestResponse) {
+      planState.guards = [planState.current.responseGuard];
+    }
+  } else planState.guards = planState.guards.filter((guard) => guard.root.isConnected);
   if (planState.current && !planState.current.autoApproveAllowed && latestResponse
     && findElement(adapter.selectors.copyButton, latestResponse)) {
     // A completed response is stronger evidence than a stale control carried
@@ -706,6 +710,7 @@ function inspectPage(): void {
     const newEpisode = !episode || (responseChanged && controlChanged);
     const manualRevisedPlan = Boolean(episode && responseChanged && !controlChanged
       && (episode.confirmed || rawText !== episode.rawText)
+      && normalizeActivityText(rawText).length <= PLAN_APPENDED_REPORT_MIN_CHARS
       && /\b(?:research plan|proposed research steps?|plan for (?:this|the) research)\b/i.test(rawText)
       && !(latestResponse && findElement(adapter.selectors.copyButton, latestResponse)));
     const needsSnapshot = newEpisode || manualRevisedPlan || !episode
@@ -957,6 +962,15 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
     if (active.stopped || active.captureSent) return;
+    if (!event.resumeOnly && isSetupProviderStatus(event.status) && active.status === 'manual_required'
+      && active.submittedAt === undefined) {
+      active.submissionAttempted = false;
+      active.manualSetupRequired = false;
+    }
+    if (!event.resumeOnly && isSetupProviderStatus(event.status) && !active.submissionAttempted) {
+      applyProviderState(active, { status: event.status, submittedAt: event.submittedAt,
+        researchTimedOutAt: event.researchTimedOutAt, conversationKey: event.conversationKey });
+    }
     active.conversationKey ??= normalizeConversationKey(event.conversationKey, active.adapter.id);
     observeConversation(active);
     beginMonitoring();
