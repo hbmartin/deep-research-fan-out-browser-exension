@@ -79,6 +79,7 @@ function validProviderRun(value: unknown, provider: ProviderId): value is Provid
     && optionalNumber(value.detachedAt)
     && (value.detachedSetupStatus === undefined || ['opening', 'awaiting_ready', 'setting_mode'].includes(String(value.detachedSetupStatus)))
     && (value.captureRecoveryPending === undefined || typeof value.captureRecoveryPending === 'boolean')
+    && (value.captureReviewPending === undefined || typeof value.captureReviewPending === 'boolean')
     && validSaveReceipt(value.saveReceipt);
 }
 
@@ -102,14 +103,64 @@ function validCaptureJob(value: unknown): value is CaptureJob {
     && (value.copyControlObserved === undefined || typeof value.copyControlObserved === 'boolean');
 }
 
-function normalizeCaptureJobRecord(value: unknown): { job?: CaptureJob; changed: boolean } {
-  if (validCaptureJob(value)) return { job: value, changed: false };
-  if (!record(value) || value.state !== 'leased' || finiteNumber(value.leasedAt)) {
-    return { changed: false };
+interface CaptureJobInspection {
+  job?: CaptureJob;
+  changed: boolean;
+  retainedReport?: string;
+}
+
+function normalizeCaptureJobRecord(value: unknown, expectedId?: string): CaptureJobInspection {
+  if (validCaptureJob(value) && (expectedId === undefined || value.id === expectedId)) {
+    return { job: value, changed: false };
   }
-  const repaired: Record<string, unknown> = { ...value, state: 'queued' };
-  delete repaired.leasedAt;
-  return validCaptureJob(repaired) ? { job: repaired, changed: true } : { changed: false };
+  if (!record(value)) return { changed: false };
+  const retainedReport = typeof value.domMarkdown === 'string' && value.domMarkdown.trim()
+    ? value.domMarkdown : undefined;
+  const identityValid = typeof value.id === 'string' && Boolean(value.id)
+    && (expectedId === undefined || value.id === expectedId)
+    && typeof value.runId === 'string' && Boolean(value.runId)
+    && PROVIDERS.includes(value.provider as ProviderId)
+    && finiteNumber(value.tabId)
+    && ['queued', 'leased', 'paused', 'orphaned'].includes(String(value.state))
+    && finiteNumber(value.createdAt)
+    && finiteNumber(value.attempts)
+    && typeof value.domMarkdown === 'string'
+    && optionalString(value.conversationKey);
+  if (!identityValid) return { changed: false, retainedReport };
+
+  const repaired: Record<string, unknown> = { ...value };
+  let changed = false;
+  if (repaired.state === 'leased' && !finiteNumber(repaired.leasedAt)) {
+    repaired.state = 'queued';
+    delete repaired.leasedAt;
+    changed = true;
+  } else if (repaired.state !== 'leased' && !optionalNumber(repaired.leasedAt)) {
+    delete repaired.leasedAt;
+    changed = true;
+  }
+  for (const key of ['orphanedAt', 'deferredAt'] as const) {
+    if (!optionalNumber(repaired[key])) {
+      delete repaired[key];
+      changed = true;
+    }
+  }
+  if (!Array.isArray(repaired.domCitations)) {
+    repaired.domCitations = [];
+    changed = true;
+  }
+  if (!optionalString(repaired.title)) {
+    delete repaired.title;
+    changed = true;
+  }
+  for (const key of ['tabUnavailable', 'deferredForNavigation', 'copyControlObserved'] as const) {
+    if (repaired[key] !== undefined && typeof repaired[key] !== 'boolean') {
+      delete repaired[key];
+      changed = true;
+    }
+  }
+  return validCaptureJob(repaired)
+    ? { job: repaired, changed }
+    : { changed: false, retainedReport };
 }
 
 function normalizeRunRecord(value: unknown): { run?: Run; changed: boolean } {
@@ -211,22 +262,37 @@ function captureContentSignature(capture: Capture): string {
   return JSON.stringify(content);
 }
 
+function createRunStore(database: IDBPDatabase<ResearchDb>): void {
+  const runs = database.createObjectStore('runs', { keyPath: 'id' });
+  runs.createIndex('by-created', 'createdAt');
+  runs.createIndex('by-status', 'status');
+}
+
+function createJobStore(database: IDBPDatabase<ResearchDb>): void {
+  const jobs = database.createObjectStore('jobs', { keyPath: 'id' });
+  jobs.createIndex('by-created', 'createdAt');
+  jobs.createIndex('by-state', 'state');
+}
+
 function db(): Promise<IDBPDatabase<ResearchDb>> {
   if (databasePromise) return databasePromise;
-  const opening = openDB<ResearchDb>('deep-research-fan-out', 2, {
+  const opening = openDB<ResearchDb>('deep-research-fan-out', 3, {
     upgrade(database, oldVersion) {
       if (oldVersion < 1) {
-        const runs = database.createObjectStore('runs', { keyPath: 'id' });
-        runs.createIndex('by-created', 'createdAt');
-        runs.createIndex('by-status', 'status');
-        const jobs = database.createObjectStore('jobs', { keyPath: 'id' });
-        jobs.createIndex('by-created', 'createdAt');
-        jobs.createIndex('by-state', 'state');
+        createRunStore(database);
+        createJobStore(database);
         database.createObjectStore('captures');
         database.createObjectStore('redirects', { keyPath: 'wrapper' });
       }
       if (oldVersion < 2) {
         database.createObjectStore('configuration');
+      }
+      if (oldVersion > 0 && oldVersion < 3) {
+        for (const name of ['runs', 'jobs', 'captures', 'redirects'] as const) database.deleteObjectStore(name);
+        createRunStore(database);
+        createJobStore(database);
+        database.createObjectStore('captures');
+        database.createObjectStore('redirects', { keyPath: 'wrapper' });
       }
     },
   });
@@ -298,30 +364,98 @@ export async function putJob(job: CaptureJob): Promise<void> {
   await (await db()).put('jobs', job);
 }
 export async function getJob(id: string): Promise<CaptureJob | undefined> {
-  const transaction = (await db()).transaction('jobs', 'readwrite');
-  const normalized = normalizeCaptureJobRecord(await transaction.store.get(id));
-  if (normalized.changed) await transaction.store.put(normalized.job!);
-  await transaction.done;
-  return normalized.job;
+  return normalizeCaptureJobRecord(await (await db()).get('jobs', id), id).job;
 }
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
+
+export async function hasCaptureOrJob(id: string): Promise<boolean> {
+  const database = await db();
+  const [captureKey, jobKey] = await Promise.all([
+    database.getKey('captures', id),
+    database.getKey('jobs', id),
+  ]);
+  return captureKey !== undefined || jobKey !== undefined;
+}
+
+export async function getBlockedCaptureJobReport(id: string): Promise<string | undefined> {
+  const stored = await (await db()).get('jobs', id);
+  const inspection = normalizeCaptureJobRecord(stored, id);
+  return inspection.job ? undefined : inspection.retainedReport;
+}
+
+export class CaptureJobReviewRequiredError extends Error {
+  constructor() {
+    super('A retained report needs review before another capture can be accepted.');
+    this.name = 'CaptureJobReviewRequiredError';
+  }
+}
 
 /** Caller holds the run lock. Validation and both writes share one commit. */
 export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | undefined) => Run): Promise<Run> {
   const transaction = (await db()).transaction(['runs', 'jobs'], 'readwrite');
+  let reviewRequired = false;
+  let acceptedRun: Run | undefined;
   try {
     const stored = await transaction.objectStore('runs').get(job.runId);
     const normalized = stored ? normalizeRunRecord(stored) : { run: undefined, changed: false };
     if (stored && !normalized.run) warnInvalidRun(stored);
-    const run = validate(normalized.run);
-    if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
     if (!validCaptureJob(job)) throw new Error('Cannot persist a malformed capture job.');
     const existing = await transaction.objectStore('jobs').get(job.id);
     if (existing) {
-      const normalizedJob = normalizeCaptureJobRecord(existing);
-      if (!normalizedJob.job) throw new Error('Cannot accept capture over a malformed stored job.');
-      if (normalizedJob.changed) await transaction.objectStore('jobs').put(normalizedJob.job);
-    } else await transaction.objectStore('jobs').put(job);
+      const normalizedJob = normalizeCaptureJobRecord(existing, job.id);
+      if (!normalizedJob.job && normalizedJob.retainedReport) {
+        const run = normalized.run;
+        const providerRun = run?.providerRuns[job.provider];
+        if (!run || !providerRun) throw new Error('Run not found for retained capture review.');
+        const validated = validate(structuredClone(run));
+        if (!normalizeRunRecord(validated).run) throw new Error('Cannot persist a malformed research run.');
+        providerRun.captureReviewPending = true;
+        if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
+        await transaction.objectStore('runs').put(run);
+        acceptedRun = run;
+        reviewRequired = true;
+      } else {
+        const run = validate(normalized.run);
+        if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
+        if (normalizedJob.job) {
+          if (normalizedJob.changed) await transaction.objectStore('jobs').put(normalizedJob.job);
+        } else await transaction.objectStore('jobs').put(job);
+        await transaction.objectStore('runs').put(run);
+        acceptedRun = run;
+      }
+    } else {
+      const run = validate(normalized.run);
+      if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
+      await transaction.objectStore('jobs').put(job);
+      await transaction.objectStore('runs').put(run);
+      acceptedRun = run;
+    }
+    await transaction.done;
+  } catch (error) {
+    try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
+    await transaction.done.catch(() => undefined);
+    throw error;
+  }
+  if (reviewRequired) throw new CaptureJobReviewRequiredError();
+  return acceptedRun!;
+}
+
+export async function discardBlockedCaptureJob(id: string, runId: RunId, provider: ProviderId): Promise<Run> {
+  const transaction = (await db()).transaction(['runs', 'jobs'], 'readwrite');
+  try {
+    const inspection = normalizeCaptureJobRecord(await transaction.objectStore('jobs').get(id), id);
+    if (inspection.job || !inspection.retainedReport) throw new Error('No blocked retained report is available.');
+    const stored = await transaction.objectStore('runs').get(runId);
+    const normalized = stored ? normalizeRunRecord(stored) : { run: undefined, changed: false };
+    const run = normalized.run;
+    const providerRun = run?.providerRuns[provider];
+    if (!run || !providerRun) throw new Error('Provider run not found.');
+    providerRun.captureReviewPending = undefined;
+    if (providerRun.status === 'failed' && providerRun.captureRecoveryPending) {
+      providerRun.captureRecoveryPending = undefined;
+      providerRun.statusDetail = 'The blocked retained report was discarded. Save again can save the failed run details.';
+    }
+    await transaction.objectStore('jobs').delete(id);
     await transaction.objectStore('runs').put(run);
     await transaction.done;
     return run;
@@ -331,17 +465,15 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
     throw error;
   }
 }
+
 export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
   const database = await db();
-  const transaction = database.transaction('jobs', 'readwrite');
   const jobs: CaptureJob[] = [];
-  for (const stored of await transaction.store.index('by-created').getAll()) {
+  for (const stored of await database.getAllFromIndex('jobs', 'by-created')) {
     const normalized = normalizeCaptureJobRecord(stored);
     if (!normalized.job) continue;
-    if (normalized.changed) await transaction.store.put(normalized.job);
     jobs.push(normalized.job);
   }
-  await transaction.done;
   jobs.sort((a, b) => a.createdAt - b.createdAt);
   for (const job of jobs) {
     if (job.state === 'paused') continue;
@@ -353,7 +485,8 @@ export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
     }
     const run = await getRun(job.runId);
     if (run?.providerRuns[job.provider]?.captureRecoveryPending) continue;
-    if (job.state !== 'queued' && !(job.leasedAt !== undefined && Date.now() - job.leasedAt > 60_000)) continue;
+    const leaseAge = job.leasedAt === undefined ? undefined : Date.now() - job.leasedAt;
+    if (job.state !== 'queued' && !(leaseAge !== undefined && (leaseAge < 0 || leaseAge > 60_000))) continue;
     if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) return job;
     if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) return job;
   }

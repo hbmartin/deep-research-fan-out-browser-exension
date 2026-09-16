@@ -131,5 +131,40 @@ describe('side-panel rendering', () => {
       },
     } }] });
     expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'Save again']);
+
+    const reviewRun: Run = { ...completed, providerRuns: {
+      chatgpt: {
+        ...completed.providerRuns.chatgpt!, status: 'failed', captureId: undefined,
+        saveReceipt: undefined, captureRecoveryPending: true, captureReviewPending: true,
+      },
+    } };
+    runtimeListener?.({ type: 'runs:changed', runs: [reviewRun] });
+    expect(providerActionLabels()).toEqual(['Open', 'Copy retained report', 'Discard blocked job']);
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.provider-row button'))
+      .find((node) => node.textContent === 'Copy retained report')!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:copy-retained-job', runId: 'run', provider: 'chatgpt',
+    }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [reviewRun] });
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.provider-row button'))
+      .find((node) => node.textContent === 'Discard blocked job')!.click();
+    await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'provider:discard-blocked-job', runId: 'run', provider: 'chatgpt',
+    }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [update] });
+    const sendMessage = browser.runtime.sendMessage as unknown as ReturnType<typeof vi.fn>;
+    const original = sendMessage.getMockImplementation() as (request: unknown) => Promise<unknown>;
+    sendMessage.mockImplementation(async (request: unknown) => (request as { type?: string }).type === 'provider:end'
+      ? { ok: false, code: 'provider_terminal', error: 'Provider run has ended.' }
+      : original(request));
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.provider-row button'))
+      .find((node) => node.textContent === 'End provider')!.click();
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
+      type: 'provider:end', runId: 'run', provider: 'chatgpt',
+    }));
+    expect(document.querySelector('.notice')?.textContent).not.toBe('Provider run has ended.');
   });
 });

@@ -9,7 +9,8 @@ export interface CurrentResponseSnapshot {
   domCitations: DomCitation[];
 }
 
-export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found' | 'conversation_mismatch';
+export type RuntimeErrorCode = 'provider_terminal' | 'invalid_transition' | 'run_not_found'
+  | 'conversation_mismatch' | 'capture_review_required';
 export type ContentStateReason = 'research_timeout' | 'provider_navigation';
 
 export interface ProviderSnapshot {
@@ -30,6 +31,8 @@ export type RuntimeRequest =
   | { type: 'provider:copy-current'; runId: RunId; provider: ProviderId }
   | { type: 'provider:save'; runId: RunId; provider: ProviderId }
   | { type: 'provider:retry-capture'; runId: RunId; provider: ProviderId }
+  | { type: 'provider:copy-retained-job'; runId: RunId; provider: ProviderId }
+  | { type: 'provider:discard-blocked-job'; runId: RunId; provider: ProviderId }
   | { type: 'content:hello'; provider: ProviderId; url: string }
   | { type: 'content:state'; runId: RunId; provider: ProviderId; status: ProviderRunStatus; detail?: string; submittedAt?: number; reason?: ContentStateReason; conversationKey?: string }
   | { type: 'content:capture'; runId: RunId; provider: ProviderId; conversationKey?: string; domMarkdown: string; domCitations: DomCitation[]; researchTrail?: CapturedResearchTrail; title?: string; copyControlObserved?: boolean }

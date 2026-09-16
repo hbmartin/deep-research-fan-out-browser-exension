@@ -6,7 +6,7 @@ import { getCapture, putCapture } from '../src/db';
 
 it('does not let a legacy revision read overwrite a concurrently replaced capture', async () => {
   await getCapture('opening');
-  const raw = await openDB('deep-research-fan-out', 2);
+  const raw = await openDB('deep-research-fan-out', 3);
   const legacy = {
     rawMarkdown: 'Old report', normalizedMarkdown: 'Old report', citations: [],
     captureMethod: 'dom_only' as const, unplacedCitationCount: 0, capturedAt: 1, urlsResolved: 0, urlsUnresolved: 0,

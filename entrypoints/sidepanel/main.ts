@@ -1,6 +1,6 @@
 import './style.css';
 import { ADAPTERS } from '@/src/adapters';
-import type { BackgroundEvent } from '@/src/messages';
+import type { BackgroundEvent, RuntimeErrorCode } from '@/src/messages';
 import { sendRequest } from '@/src/messages';
 import { loadSettings, type Settings } from '@/src/settings';
 import { isTerminalProviderStatus, PROVIDERS, type ProviderId, type Run } from '@/src/types';
@@ -54,9 +54,18 @@ function refreshTimers(): void {
   });
 }
 
-async function command(request: Parameters<typeof sendRequest>[0]): Promise<void> {
+async function command(
+  request: Parameters<typeof sendRequest>[0],
+  ignoredCodes: readonly RuntimeErrorCode[] = [],
+): Promise<void> {
   const response = await sendRequest(request);
-  if (!response.ok) throw new Error(response.error);
+  if (!response.ok) {
+    if (response.code && ignoredCodes.includes(response.code)) {
+      await reload();
+      return;
+    }
+    throw new Error(response.error);
+  }
   if (response.runs) runs = response.runs;
   await reload();
 }
@@ -84,7 +93,18 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
   }
   const actions = element('div', 'actions');
   actions.append(button('Open', () => command({ type: 'provider:focus', runId: run.id, provider }), 'secondary'));
-  if (providerRun.captureId) {
+  if (providerRun.captureReviewPending) {
+    row.append(element('p', 'warning', 'A retained report needs review before capture can continue.'));
+    actions.append(button('Copy retained report', async () => {
+      await command({ type: 'provider:copy-retained-job', runId: run.id, provider });
+      setNotice(`${ADAPTERS[provider].label} retained report copied.`);
+    }, 'secondary'));
+    actions.append(button('Discard blocked job', async () => {
+      if (!window.confirm('Discard this blocked retained report? This cannot be undone.')) return;
+      await command({ type: 'provider:discard-blocked-job', runId: run.id, provider });
+      setNotice(`${ADAPTERS[provider].label} blocked report discarded.`);
+    }, 'danger'));
+  } else if (providerRun.captureId) {
     actions.append(button('Copy', async () => {
       await command({ type: 'provider:copy', runId: run.id, provider });
       setNotice(`${ADAPTERS[provider].label} report copied.`);
@@ -95,11 +115,15 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
       setNotice(`${ADAPTERS[provider].label} current response copied.`);
     }));
   }
-  if (providerRun.captureRecoveryPending) actions.append(button('Retry report', () => command({ type: 'provider:retry-capture', runId: run.id, provider }), 'secondary'));
+  if (providerRun.captureRecoveryPending && !providerRun.captureReviewPending) {
+    actions.append(button('Retry report', () => command({ type: 'provider:retry-capture', runId: run.id, provider }), 'secondary'));
+  }
   if (isTerminalProviderStatus(providerRun.status) && !providerRun.captureRecoveryPending) {
     actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
   } else if (!isTerminalProviderStatus(providerRun.status)) {
-    actions.append(button('End provider', () => command({ type: 'provider:end', runId: run.id, provider }), 'danger'));
+    actions.append(button('End provider', () => command(
+      { type: 'provider:end', runId: run.id, provider }, ['provider_terminal'],
+    ), 'danger'));
   }
   row.append(actions);
   return row;

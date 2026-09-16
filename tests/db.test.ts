@@ -1,7 +1,7 @@
 // @vitest-environment node
 import 'fake-indexeddb/auto';
 import { openDB } from 'idb';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { captureId, deleteJob, deleteReportDirectoryConfig, getCapture, getJob, getRedirect, getReportDirectoryConfig, getRun, listRuns, nextCaptureJob, pruneExpiredRedirects, putCapture, putJob, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
 import type { Capture, CaptureJob, Run } from '../src/types';
 
@@ -11,7 +11,8 @@ const capture: Capture = {
 };
 
 async function putLegacyJob(job: CaptureJob): Promise<void> {
-  const database = await openDB('deep-research-fan-out', 2);
+  await getJob('__initialize__');
+  const database = await openDB('deep-research-fan-out', 3);
   try { await database.put('jobs', job); }
   finally { database.close(); }
 }
@@ -55,7 +56,7 @@ describe('run history', () => {
     expect(await getRedirect('https://wrapper.test/current')).toBe('https://canonical.test/current');
   });
 
-  it('validates the optional orphan timestamp when reading capture jobs', async () => {
+  it('normalizes a malformed optional orphan timestamp without writing during the read', async () => {
     const valid: CaptureJob = {
       id: 'orphan-valid', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
       state: 'orphaned', createdAt: Date.now(), orphanedAt: Date.now(), attempts: 1,
@@ -67,7 +68,12 @@ describe('run history', () => {
       await expect(putJob(invalid)).rejects.toThrow('malformed capture job');
       await putLegacyJob(invalid);
       expect(await getJob(valid.id)).toMatchObject({ orphanedAt: valid.orphanedAt });
-      expect(await getJob(invalid.id)).toBeUndefined();
+      const normalized = await getJob(invalid.id);
+      expect(normalized?.id).toBe(invalid.id);
+      expect(normalized?.orphanedAt).toBeUndefined();
+      const raw = await openDB('deep-research-fan-out', 3);
+      expect((await raw.get('jobs', invalid.id))?.orphanedAt).toBe('yesterday');
+      raw.close();
       expect(await nextCaptureJob()).toBeUndefined();
     } finally {
       await deleteJob(valid.id);
@@ -108,6 +114,31 @@ describe('run history', () => {
     }
   });
 
+  it('returns in-memory repairs when job writes are unavailable', async () => {
+    const job = {
+      id: 'readonly-repair', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      state: 'leased', createdAt: 1, attempts: 1, leasedAt: undefined,
+      deferredAt: null, domMarkdown: 'A retained report available during storage pressure.', domCitations: [],
+    } as unknown as CaptureJob;
+    await putLegacyJob(job);
+    const originalPut = IDBObjectStore.prototype.put;
+    const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
+      if (this.name === 'jobs') throw new DOMException('storage full', 'QuotaExceededError');
+      return originalPut.call(this, value, key);
+    });
+    try {
+      const normalized = await getJob(job.id);
+      expect(normalized?.state).toBe('queued');
+      expect(normalized?.leasedAt).toBeUndefined();
+      expect(normalized?.deferredAt).toBeUndefined();
+      expect(await nextCaptureJob()).toMatchObject({ id: job.id, state: 'queued' });
+      expect(putSpy).not.toHaveBeenCalled();
+    } finally {
+      putSpy.mockRestore();
+      await deleteJob(job.id);
+    }
+  });
+
   it('reclaims zero leases and normalizes malformed leases directly from the queue', async () => {
     const zeroLease: CaptureJob = {
       id: 'lease-zero', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
@@ -126,6 +157,18 @@ describe('run history', () => {
       await deleteJob(zeroLease.id);
       await deleteJob(missingLease.id);
     }
+  });
+
+  it('reclaims a lease stamped in the future after the wall clock moves backward', async () => {
+    const job: CaptureJob = {
+      id: 'lease-from-future', runId: 'missing-run', provider: 'chatgpt', tabId: 1,
+      state: 'leased', createdAt: 1, leasedAt: Date.now() + 60 * 60 * 1000, attempts: 1,
+      domMarkdown: 'A retained report from a future-stamped lease.', domCitations: [],
+    };
+    try {
+      await putJob(job);
+      expect(await nextCaptureJob()).toMatchObject({ id: job.id });
+    } finally { await deleteJob(job.id); }
   });
 
   it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {
