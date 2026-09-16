@@ -193,6 +193,29 @@ describe('run history', () => {
     }
   });
 
+  it('skips paused jobs without reading their runs', async () => {
+    const runId = `missing-paused-${crypto.randomUUID()}`;
+    const job: CaptureJob = {
+      id: `${runId}:chatgpt`, runId, provider: 'chatgpt', tabId: 1,
+      state: 'paused', createdAt: Date.now(), attempts: 3,
+      domMarkdown: 'A retained paused report that must not trigger a run lookup.', domCitations: [],
+    };
+    const originalGet = IDBObjectStore.prototype.get;
+    let runReads = 0;
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (this: IDBObjectStore, key) {
+      if (this.name === 'runs' && key === runId) runReads += 1;
+      return originalGet.call(this, key);
+    });
+    try {
+      await putJob(job);
+      await nextCaptureJob();
+      expect(runReads).toBe(0);
+    } finally {
+      getSpy.mockRestore();
+      await deleteJob(job.id);
+    }
+  });
+
   it('rejects obsolete run records instead of migrating them on read', async () => {
     const obsolete = {
       id: 'obsolete-v1-run', query: 'legacy', createdAt: Date.now(), windowId: 1, status: 'complete',
