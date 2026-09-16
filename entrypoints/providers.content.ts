@@ -603,7 +603,8 @@ async function capture(root: HTMLElement, copyControlObserved: boolean): Promise
     } catch (error) {
       if (error instanceof ContentMessageError && error.providerState) applyProviderState(capturingRun, error.providerState);
       if (error instanceof ContentMessageError && error.code === 'invalid_transition') return;
-      if (error instanceof ContentMessageError && ['provider_terminal', 'run_not_found'].includes(error.code ?? '')) {
+      if (error instanceof ContentMessageError
+        && ['provider_terminal', 'run_not_found', 'capture_review_required'].includes(error.code ?? '')) {
         if (active === capturingRun) stopRun(capturingRun);
         return;
       }
@@ -961,22 +962,26 @@ async function runAutomation(run: ActiveRun): Promise<void> {
 
 async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>): Promise<void> {
   if (active?.id === event.runId) {
-    if (active.stopped || active.captureSent) return;
-    if (!event.resumeOnly && isSetupProviderStatus(event.status) && active.status === 'manual_required'
-      && active.submittedAt === undefined) {
-      active.submissionAttempted = false;
-      active.manualSetupRequired = false;
+    if (active.captureSent) return;
+    if (active.stopped) {
+      active = undefined;
+    } else {
+      if (!event.resumeOnly && isSetupProviderStatus(event.status) && active.status === 'manual_required'
+        && active.submittedAt === undefined) {
+        active.submissionAttempted = false;
+        active.manualSetupRequired = false;
+      }
+      if (!event.resumeOnly && isSetupProviderStatus(event.status) && !active.submissionAttempted) {
+        applyProviderState(active, { status: event.status, submittedAt: event.submittedAt,
+          researchTimedOutAt: event.researchTimedOutAt, conversationKey: event.conversationKey });
+      }
+      active.conversationKey ??= normalizeConversationKey(event.conversationKey, active.adapter.id);
+      observeConversation(active);
+      beginMonitoring();
+      if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
+      await runAutomation(active);
+      return;
     }
-    if (!event.resumeOnly && isSetupProviderStatus(event.status) && !active.submissionAttempted) {
-      applyProviderState(active, { status: event.status, submittedAt: event.submittedAt,
-        researchTimedOutAt: event.researchTimedOutAt, conversationKey: event.conversationKey });
-    }
-    active.conversationKey ??= normalizeConversationKey(event.conversationKey, active.adapter.id);
-    observeConversation(active);
-    beginMonitoring();
-    if (event.resumeOnly || active.submissionAttempted || active.manualSetupRequired) return;
-    await runAutomation(active);
-    return;
   }
   if (active) stopRun(active);
   const adapter = ADAPTERS[event.provider];
@@ -1021,7 +1026,8 @@ async function start(event: Extract<BackgroundEvent, { type: 'content:start' }>)
     }, (error) => {
       if (active !== run) return;
       if (error.providerState) applyProviderState(run, error.providerState);
-      if (error.code === 'provider_terminal' || error.code === 'run_not_found') stopRun(run);
+      if (error.code === 'provider_terminal' || error.code === 'run_not_found'
+        || error.code === 'capture_review_required') stopRun(run);
     }),
   };
   active = run;

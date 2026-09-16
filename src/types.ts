@@ -163,6 +163,8 @@ export interface ProviderRun {
   detachedSetupStatus?: 'opening' | 'awaiting_ready' | 'setting_mode';
   /** A verified DOM report is retained for an explicit capture-storage retry. */
   captureRecoveryPending?: boolean;
+  /** A retained raw report could not be safely associated with this provider and needs review. */
+  captureReviewPending?: boolean;
 }
 
 export interface Run {
