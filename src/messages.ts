@@ -43,7 +43,7 @@ export type RuntimeRequest =
   | { type: 'capture:offscreen-result'; requestId: string; ok: boolean; text?: string; error?: string };
 
 export type RuntimeResponse =
-  | { ok: true; runs?: Run[]; run?: Run; job?: CaptureJob; text?: string; providerState?: ProviderSnapshot }
+  | { ok: true; runs?: Run[]; run?: Run; job?: CaptureJob; providerState?: ProviderSnapshot }
   | { ok: false; error: string; code?: RuntimeErrorCode; providerState?: ProviderSnapshot };
 
 export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {

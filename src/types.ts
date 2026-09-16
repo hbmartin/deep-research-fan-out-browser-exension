@@ -151,10 +151,6 @@ export interface ProviderRun {
   degraded: boolean;
   adapterVersion: string;
   saveReceipt?: ArtifactSaveReceipt;
-  /** @deprecated Migrated to saveReceipt when a v1 run is read. */
-  downloadId?: number;
-  /** @deprecated Migrated to saveReceipt when a v1 run is read. */
-  downloadedAt?: number;
   copiedAt?: number;
   reconcileFailureCount?: number;
   /** The run-owned tab is temporarily on an auxiliary page for this provider. */
@@ -169,7 +165,7 @@ export interface ProviderRun {
 
 export interface Run {
   /** Data-record version, independent of the IndexedDB object-store version. */
-  recordVersion?: 2;
+  recordVersion: 2;
   id: RunId;
   browserSessionId?: string;
   query: string;

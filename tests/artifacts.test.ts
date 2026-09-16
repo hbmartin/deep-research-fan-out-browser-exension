@@ -7,7 +7,7 @@ const providerRun: ProviderRun = {
   startedAt: 1000, completedAt: 5000, attempts: 0, degraded: false, adapterVersion: 'gemini@test',
 };
 const run: Run = {
-  id: 'run-id', query: 'Query', createdAt: 1000, completedAt: 5000, windowId: 1,
+  recordVersion: 2, id: 'run-id', query: 'Query', createdAt: 1000, completedAt: 5000, windowId: 1,
   providerRuns: { gemini: providerRun }, status: 'complete', slug: 'query', reportFolder: 'query-runid000', downloadFolder: 'deep-research/query-runid000',
 };
 const capture: Capture = {
