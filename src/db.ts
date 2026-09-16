@@ -1,6 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import { NAVIGATION_DEFERRAL_MS } from './durations';
-import { createReportFolder, slugify } from './state';
 import { PROVIDERS, isTerminalProviderStatus, type Capture, type CaptureJob, type ProviderId, type ProviderRun, type ReportDirectoryConfig, type Run, type RunId } from './types';
 
 interface ResearchDb extends DBSchema {
@@ -72,8 +71,6 @@ function validProviderRun(value: unknown, provider: ProviderId): value is Provid
     && optionalNumber(value.submittedAt)
     && optionalNumber(value.researchTimedOutAt)
     && optionalNumber(value.completedAt)
-    && optionalNumber(value.downloadId)
-    && optionalNumber(value.downloadedAt)
     && optionalNumber(value.copiedAt)
     && optionalNumber(value.reconcileFailureCount)
     && optionalNumber(value.detachedAt)
@@ -83,40 +80,9 @@ function validProviderRun(value: unknown, provider: ProviderId): value is Provid
     && validSaveReceipt(value.saveReceipt);
 }
 
-function validCaptureJob(value: unknown): value is CaptureJob {
+function validCaptureJobIdentity(value: unknown, expectedId?: string): value is Record<string, unknown> {
   if (!record(value)) return false;
-  return typeof value.id === 'string' && typeof value.runId === 'string'
-    && PROVIDERS.includes(value.provider as ProviderId)
-    && finiteNumber(value.tabId)
-    && ['queued', 'leased', 'paused', 'orphaned'].includes(String(value.state))
-    && finiteNumber(value.createdAt)
-    && finiteNumber(value.attempts)
-    && typeof value.domMarkdown === 'string'
-    && Array.isArray(value.domCitations)
-    && (value.state === 'leased' ? finiteNumber(value.leasedAt) : optionalNumber(value.leasedAt))
-    && optionalNumber(value.orphanedAt)
-    && optionalNumber(value.deferredAt)
-    && optionalString(value.conversationKey)
-    && optionalString(value.title)
-    && (value.tabUnavailable === undefined || typeof value.tabUnavailable === 'boolean')
-    && (value.deferredForNavigation === undefined || typeof value.deferredForNavigation === 'boolean')
-    && (value.copyControlObserved === undefined || typeof value.copyControlObserved === 'boolean');
-}
-
-interface CaptureJobInspection {
-  job?: CaptureJob;
-  changed: boolean;
-  retainedReport?: string;
-}
-
-function normalizeCaptureJobRecord(value: unknown, expectedId?: string): CaptureJobInspection {
-  if (validCaptureJob(value) && (expectedId === undefined || value.id === expectedId)) {
-    return { job: value, changed: false };
-  }
-  if (!record(value)) return { changed: false };
-  const retainedReport = typeof value.domMarkdown === 'string' && value.domMarkdown.trim()
-    ? value.domMarkdown : undefined;
-  const identityValid = typeof value.id === 'string' && Boolean(value.id)
+  return typeof value.id === 'string' && Boolean(value.id)
     && (expectedId === undefined || value.id === expectedId)
     && typeof value.runId === 'string' && Boolean(value.runId)
     && PROVIDERS.includes(value.provider as ProviderId)
@@ -126,7 +92,37 @@ function normalizeCaptureJobRecord(value: unknown, expectedId?: string): Capture
     && finiteNumber(value.attempts)
     && typeof value.domMarkdown === 'string'
     && optionalString(value.conversationKey);
-  if (!identityValid) return { changed: false, retainedReport };
+}
+
+function validCaptureJob(value: unknown): value is CaptureJob {
+  if (!validCaptureJobIdentity(value)) return false;
+  return Array.isArray(value.domCitations)
+    && (value.state === 'leased' ? finiteNumber(value.leasedAt) : optionalNumber(value.leasedAt))
+    && optionalNumber(value.orphanedAt)
+    && optionalNumber(value.deferredAt)
+    && optionalString(value.title)
+    && (value.tabUnavailable === undefined || typeof value.tabUnavailable === 'boolean')
+    && (value.deferredForNavigation === undefined || typeof value.deferredForNavigation === 'boolean')
+    && (value.copyControlObserved === undefined || typeof value.copyControlObserved === 'boolean');
+}
+
+export interface CaptureJobInspection {
+  exists: boolean;
+  job?: CaptureJob;
+  changed: boolean;
+  retainedReport?: string;
+}
+
+function normalizeCaptureJobRecord(value: unknown, expectedId?: string): CaptureJobInspection {
+  if (validCaptureJob(value) && (expectedId === undefined || value.id === expectedId)) {
+    return { exists: true, job: value, changed: false };
+  }
+  if (!record(value)) return { exists: value !== undefined, changed: false };
+  const retainedReport = typeof value.domMarkdown === 'string' && value.domMarkdown.trim()
+    ? value.domMarkdown : undefined;
+  if (!validCaptureJobIdentity(value, expectedId)) {
+    return { exists: true, changed: false, retainedReport };
+  }
 
   const repaired: Record<string, unknown> = { ...value };
   let changed = false;
@@ -159,12 +155,13 @@ function normalizeCaptureJobRecord(value: unknown, expectedId?: string): Capture
     }
   }
   return validCaptureJob(repaired)
-    ? { job: repaired, changed }
-    : { changed: false, retainedReport };
+    ? { exists: true, job: repaired, changed }
+    : { exists: true, changed: false, retainedReport };
 }
 
-function normalizeRunRecord(value: unknown): { run?: Run; changed: boolean } {
+function validRunRecord(value: unknown): value is Run {
   if (!record(value)
+    || value.recordVersion !== 2
     || typeof value.id !== 'string' || !value.id
     || typeof value.query !== 'string'
     || !finiteNumber(value.createdAt)
@@ -174,70 +171,15 @@ function normalizeRunRecord(value: unknown): { run?: Run; changed: boolean } {
     || !optionalString(value.browserSessionId)
     || !optionalNumber(value.completedAt)
     || !optionalNumber(value.tabGroupId)
-    || (value.recordVersion !== undefined && value.recordVersion !== 2)
-    || !optionalString(value.slug)
-    || !optionalString(value.reportFolder)
-    || !optionalString(value.downloadFolder)) return { changed: false };
+    || typeof value.slug !== 'string' || !value.slug
+    || typeof value.reportFolder !== 'string' || !value.reportFolder
+    || typeof value.downloadFolder !== 'string' || !value.downloadFolder) return false;
   for (const [provider, providerRun] of Object.entries(value.providerRuns)) {
     if (!PROVIDERS.includes(provider as ProviderId) || !validProviderRun(providerRun, provider as ProviderId)) {
-      return { changed: false };
+      return false;
     }
   }
-  const run = value as unknown as Run;
-  let changed = false;
-  const legacyDownloadFolder = typeof run.downloadFolder === 'string' ? run.downloadFolder : 'deep-research';
-  const slug = typeof run.slug === 'string' && run.slug ? run.slug : slugify(run.query);
-  if (run.slug !== slug) {
-    run.slug = slug;
-    changed = true;
-  }
-  const reportFolder = typeof run.reportFolder === 'string' && run.reportFolder
-    ? run.reportFolder
-    : createReportFolder(slug, run.id);
-  if (run.reportFolder !== reportFolder) {
-    run.reportFolder = reportFolder;
-    changed = true;
-  }
-  const downloadRoot = legacyDownloadFolder?.split('/').filter(Boolean)[0] || 'deep-research';
-  const downloadFolder = `${downloadRoot}/${reportFolder}`;
-  if (run.downloadFolder !== downloadFolder) {
-    run.downloadFolder = downloadFolder;
-    changed = true;
-  }
-  for (const providerRun of Object.values(run.providerRuns)) {
-    if (!providerRun.saveReceipt && providerRun.downloadedAt !== undefined) {
-      // v1 always used the provider filename, including failed runs.
-      const filename = `${providerRun.provider}.md`;
-      const relativePath = `${legacyDownloadFolder}/${filename}`;
-      providerRun.saveReceipt = {
-        destination: 'downloads',
-        requestedRelativePath: relativePath,
-        savedAt: providerRun.downloadedAt,
-        downloadId: providerRun.downloadId,
-      };
-      changed = true;
-    }
-    const receipt = providerRun.saveReceipt;
-    if (receipt?.destination === 'downloads'
-      && !receipt.requestedRelativePath.startsWith(`${downloadFolder}/`)
-      && receipt.requestedRelativePath.endsWith(`/FAILED-${providerRun.provider}.md`)
-    ) {
-      receipt.requestedRelativePath = receipt.requestedRelativePath.replace(
-        `/FAILED-${providerRun.provider}.md`, `/${providerRun.provider}.md`,
-      );
-      changed = true;
-    }
-    if (providerRun.downloadedAt !== undefined || providerRun.downloadId !== undefined) {
-      delete providerRun.downloadedAt;
-      delete providerRun.downloadId;
-      changed = true;
-    }
-  }
-  if (run.recordVersion !== 2) {
-    run.recordVersion = 2;
-    changed = true;
-  }
-  return { run, changed };
+  return true;
 }
 
 function warnInvalidRun(value: unknown): void {
@@ -288,6 +230,8 @@ function db(): Promise<IDBPDatabase<ResearchDb>> {
         database.createObjectStore('configuration');
       }
       if (oldVersion > 0 && oldVersion < 3) {
+        // v3 intentionally resets disposable prerelease research data while
+        // preserving the separately stored report-directory configuration.
         for (const name of ['runs', 'jobs', 'captures', 'redirects'] as const) database.deleteObjectStore(name);
         createRunStore(database);
         createJobStore(database);
@@ -306,32 +250,29 @@ function db(): Promise<IDBPDatabase<ResearchDb>> {
 }
 
 export async function putRun(run: Run): Promise<void> {
-  const normalized = normalizeRunRecord(run);
-  if (!normalized.run) throw new Error('Cannot persist a malformed research run.');
-  await (await db()).put('runs', normalized.run);
+  if (!validRunRecord(run)) throw new Error('Cannot persist a malformed research run.');
+  await (await db()).put('runs', run);
 }
 export async function getRun(id: RunId): Promise<Run | undefined> {
   const database = await db();
   const stored = await database.get('runs', id);
   if (!stored) return undefined;
-  const normalized = normalizeRunRecord(stored);
-  if (!normalized.run) {
+  if (!validRunRecord(stored)) {
     warnInvalidRun(stored);
     return undefined;
   }
-  return normalized.run;
+  return stored;
 }
 export async function listRuns(): Promise<Run[]> {
   const database = await db();
   const storedRuns = await database.getAllFromIndex('runs', 'by-created');
   const runs: Run[] = [];
   for (const stored of storedRuns) {
-    const normalized = normalizeRunRecord(stored);
-    if (!normalized.run) {
+    if (!validRunRecord(stored)) {
       warnInvalidRun(stored);
       continue;
     }
-    runs.push(normalized.run);
+    runs.push(stored);
   }
   return runs.sort((a, b) => b.createdAt - a.createdAt);
 }
@@ -363,24 +304,21 @@ export async function putJob(job: CaptureJob): Promise<void> {
   if (!validCaptureJob(job)) throw new Error('Cannot persist a malformed capture job.');
   await (await db()).put('jobs', job);
 }
+export async function inspectCaptureJob(id: string): Promise<CaptureJobInspection> {
+  return normalizeCaptureJobRecord(await (await db()).get('jobs', id), id);
+}
 export async function getJob(id: string): Promise<CaptureJob | undefined> {
-  return normalizeCaptureJobRecord(await (await db()).get('jobs', id), id).job;
+  return (await inspectCaptureJob(id)).job;
 }
 export async function deleteJob(id: string): Promise<void> { await (await db()).delete('jobs', id); }
 
-export async function hasCaptureOrJob(id: string): Promise<boolean> {
-  const database = await db();
-  const [captureKey, jobKey] = await Promise.all([
-    database.getKey('captures', id),
-    database.getKey('jobs', id),
-  ]);
-  return captureKey !== undefined || jobKey !== undefined;
+export async function hasCapture(id: string): Promise<boolean> {
+  return (await (await db()).getKey('captures', id)) !== undefined;
 }
 
-export async function getBlockedCaptureJobReport(id: string): Promise<string | undefined> {
-  const stored = await (await db()).get('jobs', id);
-  const inspection = normalizeCaptureJobRecord(stored, id);
-  return inspection.job ? undefined : inspection.retainedReport;
+export function isUsableCaptureJobReport(job: CaptureJob): boolean {
+  const dom = job.domMarkdown.trim();
+  return dom.length >= 40 || Boolean(job.copyControlObserved && dom);
 }
 
 export class CaptureJobReviewRequiredError extends Error {
@@ -397,39 +335,30 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
   let acceptedRun: Run | undefined;
   try {
     const stored = await transaction.objectStore('runs').get(job.runId);
-    const normalized = stored ? normalizeRunRecord(stored) : { run: undefined, changed: false };
-    if (stored && !normalized.run) warnInvalidRun(stored);
+    const currentRun = stored && validRunRecord(stored) ? stored : undefined;
+    if (stored && !currentRun) warnInvalidRun(stored);
     if (!validCaptureJob(job)) throw new Error('Cannot persist a malformed capture job.');
     const existing = await transaction.objectStore('jobs').get(job.id);
-    if (existing) {
-      const normalizedJob = normalizeCaptureJobRecord(existing, job.id);
-      if (!normalizedJob.job && normalizedJob.retainedReport) {
-        const run = normalized.run;
-        const providerRun = run?.providerRuns[job.provider];
-        if (!run || !providerRun) throw new Error('Run not found for retained capture review.');
-        const validated = validate(structuredClone(run));
-        if (!normalizeRunRecord(validated).run) throw new Error('Cannot persist a malformed research run.');
-        providerRun.captureReviewPending = true;
-        if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
-        await transaction.objectStore('runs').put(run);
-        acceptedRun = run;
-        reviewRequired = true;
-      } else {
-        const run = validate(normalized.run);
-        if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
-        if (normalizedJob.job) {
-          if (normalizedJob.changed) await transaction.objectStore('jobs').put(normalizedJob.job);
-        } else await transaction.objectStore('jobs').put(job);
-        await transaction.objectStore('runs').put(run);
-        acceptedRun = run;
-      }
-    } else {
-      const run = validate(normalized.run);
-      if (!normalizeRunRecord(run).run) throw new Error('Cannot persist a malformed research run.');
-      await transaction.objectStore('jobs').put(job);
-      await transaction.objectStore('runs').put(run);
-      acceptedRun = run;
+    const inspection = normalizeCaptureJobRecord(existing, job.id);
+    reviewRequired = Boolean(existing && !inspection.job && inspection.retainedReport);
+    const validated = validate(reviewRequired && currentRun ? structuredClone(currentRun) : currentRun);
+    if (!validRunRecord(validated)) throw new Error('Cannot persist a malformed research run.');
+
+    let runToStore = validated;
+    let jobToStore: CaptureJob | undefined;
+    if (reviewRequired) {
+      const providerRun = currentRun?.providerRuns[job.provider];
+      if (!currentRun || !providerRun) throw new Error('Run not found for retained capture review.');
+      providerRun.captureReviewPending = true;
+      runToStore = currentRun;
+    } else if (!inspection.job) {
+      jobToStore = job;
+    } else if (inspection.changed) {
+      jobToStore = inspection.job;
     }
+    if (jobToStore) await transaction.objectStore('jobs').put(jobToStore);
+    await transaction.objectStore('runs').put(runToStore);
+    acceptedRun = runToStore;
     await transaction.done;
   } catch (error) {
     try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
@@ -440,22 +369,37 @@ export async function acceptCaptureJob(job: CaptureJob, validate: (run: Run | un
   return acceptedRun!;
 }
 
-export async function discardBlockedCaptureJob(id: string, runId: RunId, provider: ProviderId): Promise<Run> {
+export async function discardBlockedCaptureJob(
+  id: string,
+  runId: RunId,
+  provider: ProviderId,
+  options: { inspection?: CaptureJobInspection; unavailable?: boolean } = {},
+): Promise<Run> {
   const transaction = (await db()).transaction(['runs', 'jobs'], 'readwrite');
   try {
-    const inspection = normalizeCaptureJobRecord(await transaction.objectStore('jobs').get(id), id);
-    if (inspection.job || !inspection.retainedReport) throw new Error('No blocked retained report is available.');
+    const inspection = options.inspection
+      ?? normalizeCaptureJobRecord(await transaction.objectStore('jobs').get(id), id);
     const stored = await transaction.objectStore('runs').get(runId);
-    const normalized = stored ? normalizeRunRecord(stored) : { run: undefined, changed: false };
-    const run = normalized.run;
+    const run = stored && validRunRecord(stored) ? stored : undefined;
     const providerRun = run?.providerRuns[provider];
     if (!run || !providerRun) throw new Error('Provider run not found.');
-    providerRun.captureReviewPending = undefined;
-    if (providerRun.status === 'failed' && providerRun.captureRecoveryPending) {
-      providerRun.captureRecoveryPending = undefined;
-      providerRun.statusDetail = 'The blocked retained report was discarded. Save again can save the failed run details.';
+    const staleState = providerRun.captureReviewPending || providerRun.captureRecoveryPending;
+    const discardable = Boolean(inspection.retainedReport)
+      || Boolean(inspection.job && !isUsableCaptureJobReport(inspection.job))
+      || staleState;
+    if (!discardable || (inspection.job && isUsableCaptureJobReport(inspection.job))) {
+      throw new Error('No blocked retained report is available.');
     }
-    await transaction.objectStore('jobs').delete(id);
+    providerRun.captureReviewPending = undefined;
+    if (providerRun.captureRecoveryPending) {
+      providerRun.captureRecoveryPending = undefined;
+      if (providerRun.status === 'failed') {
+        providerRun.statusDetail = options.unavailable
+          ? 'No retained report is available for retry. Save again can save the failed run details.'
+          : 'The blocked retained report was discarded. Save again can save the failed run details.';
+      }
+    }
+    if (inspection.exists) await transaction.objectStore('jobs').delete(id);
     await transaction.objectStore('runs').put(run);
     await transaction.done;
     return run;
@@ -466,31 +410,50 @@ export async function discardBlockedCaptureJob(id: string, runId: RunId, provide
   }
 }
 
-export async function nextCaptureJob(): Promise<CaptureJob | undefined> {
+export interface CaptureJobCursor {
+  createdAt: number;
+  id: string;
+}
+
+export async function nextCaptureJob(after?: CaptureJobCursor): Promise<CaptureJob | undefined> {
   const database = await db();
-  const jobs: CaptureJob[] = [];
-  for (const stored of await database.getAllFromIndex('jobs', 'by-created')) {
-    const normalized = normalizeCaptureJobRecord(stored);
-    if (!normalized.job) continue;
-    jobs.push(normalized.job);
-  }
-  jobs.sort((a, b) => a.createdAt - b.createdAt);
-  for (const job of jobs) {
+  const transaction = database.transaction(['jobs', 'runs'], 'readonly');
+  const range = after ? IDBKeyRange.lowerBound(after.createdAt) : undefined;
+  let selected: CaptureJob | undefined;
+  for await (const cursor of transaction.objectStore('jobs').index('by-created').iterate(range)) {
+    if (after && cursor.key === after.createdAt && indexedDB.cmp(cursor.primaryKey, after.id) <= 0) continue;
+    const normalized = normalizeCaptureJobRecord(cursor.value, String(cursor.primaryKey));
+    const job = normalized.job;
+    if (!job) continue;
+    const storedRun = await transaction.objectStore('runs').get(job.runId);
+    const run = storedRun && validRunRecord(storedRun) ? storedRun : undefined;
+    if (storedRun && !run) warnInvalidRun(storedRun);
     if (job.state === 'paused') continue;
     if (job.state === 'orphaned') {
-      if (Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) return job;
-      const run = await getRun(job.runId);
-      if (run?.providerRuns[job.provider]) return job;
+      if (Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
+        selected = job;
+        break;
+      }
+      if (run?.providerRuns[job.provider]) {
+        selected = job;
+        break;
+      }
       continue;
     }
-    const run = await getRun(job.runId);
     if (run?.providerRuns[job.provider]?.captureRecoveryPending) continue;
     const leaseAge = job.leasedAt === undefined ? undefined : Date.now() - job.leasedAt;
     if (job.state !== 'queued' && !(leaseAge !== undefined && (leaseAge < 0 || leaseAge > 60_000))) continue;
-    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) return job;
-    if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) return job;
+    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) {
+      selected = job;
+      break;
+    }
+    if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) {
+      selected = job;
+      break;
+    }
   }
-  return undefined;
+  await transaction.done;
+  return selected;
 }
 export async function getRedirect(wrapper: string): Promise<string | undefined> { return (await db()).get('redirects', wrapper).then((item) => item?.canonical); }
 export async function putRedirect(wrapper: string, canonical: string, resolvedAt = Date.now()): Promise<void> {

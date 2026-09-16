@@ -23,7 +23,7 @@ describe('run history', () => {
       const id = `run-${String(index).padStart(2, '0')}`;
       const storedCapture = captureId(id, 'chatgpt');
       const run: Run = {
-        id, query: id, createdAt: index, completedAt: index + 1, windowId: 1, status: 'complete', slug: id,
+        recordVersion: 2, id, query: id, createdAt: index, completedAt: index + 1, windowId: 1, status: 'complete', slug: id,
         reportFolder: `${id}-00000000`, downloadFolder: `deep-research/${id}-00000000`,
         providerRuns: {
           chatgpt: {
@@ -171,31 +171,35 @@ describe('run history', () => {
     } finally { await deleteJob(job.id); }
   });
 
-  it('migrates legacy download metadata into a receipt and adopts query-based folders', async () => {
-    const legacy = {
-      id: 'legacy-run-12345678', query: 'Legacy query', createdAt: 1, windowId: 1, status: 'active', slug: 'legacy-query',
-      downloadFolder: 'deep-research/2026-01-01_1200_legacy-query_legacyrun12345678',
-      providerRuns: {
-        chatgpt: {
-          provider: 'chatgpt', tabId: 1, status: 'complete', submittedQuery: 'Legacy query', appendString: '', attempts: 0,
-          degraded: false, adapterVersion: 'test', captureId: 'legacy:capture', downloadedAt: 123, downloadId: 9,
-        },
-        claude: {
-          provider: 'claude', tabId: 2, status: 'researching', submittedQuery: 'Legacy query', appendString: '', attempts: 0,
-          degraded: false, adapterVersion: 'test',
-        },
-      },
-    } as unknown as Run;
-    await putRun(legacy);
+  it('continues queue scans across equal timestamps without loading all jobs', async () => {
+    const createdAt = Date.now();
+    const jobs: CaptureJob[] = ['cursor-a', 'cursor-b'].map((id, index) => ({
+      id, runId: `missing-cursor-${index}`, provider: 'chatgpt', tabId: index + 1,
+      state: 'queued', createdAt, attempts: 0,
+      domMarkdown: `A retained cursor report ${index} with enough content for queue processing.`, domCitations: [],
+    }));
+    const getAllSpy = vi.spyOn(IDBIndex.prototype, 'getAll');
+    try {
+      for (const job of jobs) await putJob(job);
+      const first = await nextCaptureJob();
+      expect(first?.id).toBe('cursor-a');
+      const second = await nextCaptureJob({ createdAt: first!.createdAt, id: first!.id });
+      expect(second?.id).toBe('cursor-b');
+      expect(await nextCaptureJob({ createdAt: second!.createdAt, id: second!.id })).toBeUndefined();
+      expect(getAllSpy).not.toHaveBeenCalled();
+    } finally {
+      getAllSpy.mockRestore();
+      for (const job of jobs) await deleteJob(job.id);
+    }
+  });
 
-    const migrated = await getRun(legacy.id);
-    expect(migrated).toMatchObject({
-      reportFolder: 'legacy-query-legacyru',
-      downloadFolder: 'deep-research/legacy-query-legacyru',
-      providerRuns: { chatgpt: { saveReceipt: { destination: 'downloads', savedAt: 123, downloadId: 9 } } },
-    });
-    expect(migrated?.providerRuns.chatgpt?.saveReceipt?.requestedRelativePath).toContain('2026-01-01_1200_legacy-query_legacyrun12345678/chatgpt.md');
-    expect(migrated?.providerRuns.chatgpt?.downloadedAt).toBeUndefined();
+  it('rejects obsolete run records instead of migrating them on read', async () => {
+    const obsolete = {
+      id: 'obsolete-v1-run', query: 'legacy', createdAt: Date.now(), windowId: 1, status: 'complete',
+      providerRuns: {}, slug: 'legacy',
+    } as unknown as Run;
+    await expect(putRun(obsolete)).rejects.toThrow('malformed research run');
+    expect(await getRun(obsolete.id)).toBeUndefined();
   });
 
   it('keeps the chosen directory configuration in the local database', async () => {

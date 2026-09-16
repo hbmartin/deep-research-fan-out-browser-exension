@@ -8,7 +8,7 @@ function provider(status: ProviderRun['status']): ProviderRun {
 
 function run(statuses: ProviderRun['status'][]): Run {
   return {
-    id: 'run', query: 'query', createdAt: 0, windowId: 1, status: 'active', slug: 'query', reportFolder: 'query-run00000', downloadFolder: 'deep-research/query-run00000',
+    recordVersion: 2, id: 'run', query: 'query', createdAt: 0, windowId: 1, status: 'active', slug: 'query', reportFolder: 'query-run00000', downloadFolder: 'deep-research/query-run00000',
     providerRuns: Object.fromEntries(statuses.map((status, index) => [['chatgpt', 'claude', 'gemini', 'grok'][index], { ...provider(status), provider: ['chatgpt', 'claude', 'gemini', 'grok'][index] }])) as Run['providerRuns'],
   };
 }

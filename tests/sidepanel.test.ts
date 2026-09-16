@@ -46,7 +46,7 @@ describe('side-panel rendering', () => {
     textarea.focus();
     textarea.setSelectionRange(2, 7);
     const update: Run = {
-      id: 'run', query: 'existing', createdAt: 1, windowId: 1, providerRuns: {
+      recordVersion: 2, id: 'run', query: 'existing', createdAt: 1, windowId: 1, providerRuns: {
         chatgpt: {
           provider: 'chatgpt', tabId: 1, status: 'researching', submittedQuery: 'existing', appendString: '',
           startedAt: 1, attempts: 0, degraded: false, adapterVersion: 'test',
@@ -153,6 +153,13 @@ describe('side-panel rendering', () => {
     await vi.waitFor(() => expect(browser.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'provider:discard-blocked-job', runId: 'run', provider: 'chatgpt',
     }));
+
+    runtimeListener?.({ type: 'runs:changed', runs: [{ ...reviewRun, providerRuns: {
+      chatgpt: {
+        ...reviewRun.providerRuns.chatgpt!, captureRecoveryPending: undefined, captureReviewPending: undefined,
+      },
+    } }] });
+    expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'Save again']);
 
     runtimeListener?.({ type: 'runs:changed', runs: [update] });
     const sendMessage = browser.runtime.sendMessage as unknown as ReturnType<typeof vi.fn>;

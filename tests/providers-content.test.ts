@@ -955,6 +955,25 @@ describe('provider reliability regressions', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(captures()).toHaveLength(2);
   });
+  it('stops capture retries when the owning run no longer exists', async () => {
+    const sendMessage = vi.mocked(browser.runtime.sendMessage);
+    const original = sendMessage.getMockImplementation() as (message: unknown) => Promise<unknown>;
+    let rejected = 0;
+    sendMessage.mockImplementation(async (message: unknown) => {
+      if ((message as RuntimeRequest).type === 'content:capture') {
+        rejected += 1;
+        return { ok: false, code: 'run_not_found', error: 'run removed' };
+      }
+      return original(message);
+    });
+    answer();
+    await resume('researching');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(rejected).toBe(1);
+    document.body.append(document.createElement('div'));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(rejected).toBe(1);
+  });
   it('does not capture a labeled progress pill even when an unrelated Copy exists', async () => {
     document.body.innerHTML = '<main><div style="position:fixed" data-message-author-role="assistant"><button>Researching…</button><span>Elapsed 00:30</span></div></main><dialog open><button style="position:fixed" aria-label="Copy">Copy</button></dialog>';
     await resume('researching');
