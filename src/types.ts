@@ -159,6 +159,8 @@ export interface ProviderRun {
   detachedSetupStatus?: 'opening' | 'awaiting_ready' | 'setting_mode';
   /** A verified DOM report is retained for an explicit capture-storage retry. */
   captureRecoveryPending?: boolean;
+  /** A retained report retry was durably scheduled and is being processed. */
+  captureRecoveryInProgress?: boolean;
   /** A retained raw report could not be safely associated with this provider and needs review. */
   captureReviewPending?: boolean;
 }
@@ -189,6 +191,8 @@ export interface CaptureJob {
   state: 'queued' | 'leased' | 'paused' | 'orphaned';
   createdAt: number;
   leasedAt?: number;
+  /** Unique claim generation used to reject stale asynchronous capture work. */
+  leaseToken?: string;
   orphanedAt?: number;
   attempts: number;
   tabUnavailable?: boolean;

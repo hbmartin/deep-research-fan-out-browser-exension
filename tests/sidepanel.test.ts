@@ -126,6 +126,16 @@ describe('side-panel rendering', () => {
 
     runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
       chatgpt: {
+        ...completed.providerRuns.chatgpt!, status: 'capturing', captureId: undefined,
+        saveReceipt: undefined, captureRecoveryPending: undefined,
+        captureReviewPending: true, captureRecoveryInProgress: true,
+      },
+    } }] });
+    expect(providerActionLabels()).toEqual(['Open', 'Copy current', 'End provider']);
+    expect(document.querySelector('.warning')?.textContent).toBe('Retrying the retained report…');
+
+    runtimeListener?.({ type: 'runs:changed', runs: [{ ...completed, providerRuns: {
+      chatgpt: {
         ...completed.providerRuns.chatgpt!, status: 'failed', captureId: undefined,
         saveReceipt: undefined, captureRecoveryPending: undefined,
       },
