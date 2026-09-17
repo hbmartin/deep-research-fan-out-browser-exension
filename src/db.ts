@@ -321,6 +321,19 @@ export function isUsableCaptureJobReport(job: CaptureJob): boolean {
   return dom.length >= 40 || Boolean(job.copyControlObserved && dom);
 }
 
+export interface CaptureRecoveryAvailability {
+  run: Run;
+  captureAvailable: boolean;
+  jobAvailable: boolean;
+  cleared: boolean;
+}
+
+export type UnusableCaptureRecoveryResult =
+  | { outcome: 'cleared'; run: Run }
+  | { outcome: 'capture_available'; run: Run }
+  | { outcome: 'review_required'; run: Run }
+  | { outcome: 'usable_job'; run: Run; job: CaptureJob };
+
 export class CaptureJobReviewRequiredError extends Error {
   constructor() {
     super('A retained report needs review before another capture can be accepted.');
@@ -373,33 +386,32 @@ export async function discardBlockedCaptureJob(
   id: string,
   runId: RunId,
   provider: ProviderId,
-  options: { inspection?: CaptureJobInspection; unavailable?: boolean } = {},
 ): Promise<Run> {
-  const transaction = (await db()).transaction(['runs', 'jobs'], 'readwrite');
+  const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
   try {
-    const inspection = options.inspection
-      ?? normalizeCaptureJobRecord(await transaction.objectStore('jobs').get(id), id);
-    const stored = await transaction.objectStore('runs').get(runId);
+    const [rawJob, captureKey, stored] = await Promise.all([
+      transaction.objectStore('jobs').get(id),
+      transaction.objectStore('captures').getKey(id),
+      transaction.objectStore('runs').get(runId),
+    ]);
+    const inspection = normalizeCaptureJobRecord(rawJob, id);
     const run = stored && validRunRecord(stored) ? stored : undefined;
     const providerRun = run?.providerRuns[provider];
     if (!run || !providerRun) throw new Error('Provider run not found.');
-    const staleState = providerRun.captureReviewPending || providerRun.captureRecoveryPending;
-    const discardable = Boolean(inspection.retainedReport)
-      || Boolean(inspection.job && !isUsableCaptureJobReport(inspection.job))
-      || staleState;
-    if (!discardable || (inspection.job && isUsableCaptureJobReport(inspection.job))) {
+    if (captureKey !== undefined
+      || !providerRun.captureReviewPending
+      || inspection.job
+      || !inspection.retainedReport) {
       throw new Error('No blocked retained report is available.');
     }
     providerRun.captureReviewPending = undefined;
     if (providerRun.captureRecoveryPending) {
       providerRun.captureRecoveryPending = undefined;
       if (providerRun.status === 'failed') {
-        providerRun.statusDetail = options.unavailable
-          ? 'No retained report is available for retry. Save again can save the failed run details.'
-          : 'The blocked retained report was discarded. Save again can save the failed run details.';
+        providerRun.statusDetail = 'The blocked retained report was discarded. Save again can save the failed run details.';
       }
     }
-    if (inspection.exists) await transaction.objectStore('jobs').delete(id);
+    await transaction.objectStore('jobs').delete(id);
     await transaction.objectStore('runs').put(run);
     await transaction.done;
     return run;
@@ -408,6 +420,95 @@ export async function discardBlockedCaptureJob(
     await transaction.done.catch(() => undefined);
     throw error;
   }
+}
+
+/** Atomically clears stale recovery flags without loading a retained report body. */
+export async function clearUnavailableCaptureRecovery(
+  id: string,
+  runId: RunId,
+  provider: ProviderId,
+): Promise<CaptureRecoveryAvailability> {
+  const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
+  try {
+    const [jobKey, captureKey, stored] = await Promise.all([
+      transaction.objectStore('jobs').getKey(id),
+      transaction.objectStore('captures').getKey(id),
+      transaction.objectStore('runs').get(runId),
+    ]);
+    const run = stored && validRunRecord(stored) ? stored : undefined;
+    const providerRun = run?.providerRuns[provider];
+    if (!run || !providerRun) throw new Error('Provider run not found.');
+    const jobAvailable = jobKey !== undefined;
+    const captureAvailable = captureKey !== undefined;
+    let cleared = false;
+    if (!jobAvailable && !captureAvailable
+      && (providerRun.captureReviewPending || providerRun.captureRecoveryPending)) {
+      const recoveryPending = providerRun.captureRecoveryPending;
+      providerRun.captureReviewPending = undefined;
+      providerRun.captureRecoveryPending = undefined;
+      if (recoveryPending && providerRun.status === 'failed') {
+        providerRun.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
+      }
+      await transaction.objectStore('runs').put(run);
+      cleared = true;
+    }
+    await transaction.done;
+    return { run, captureAvailable, jobAvailable, cleared };
+  } catch (error) {
+    try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
+    await transaction.done.catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Rechecks and clears an unusable recovery record in one commit. */
+export async function clearUnusableCaptureRecoveryJob(
+  id: string,
+  runId: RunId,
+  provider: ProviderId,
+): Promise<UnusableCaptureRecoveryResult> {
+  const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
+  try {
+    const [rawJob, captureKey, stored] = await Promise.all([
+      transaction.objectStore('jobs').get(id),
+      transaction.objectStore('captures').getKey(id),
+      transaction.objectStore('runs').get(runId),
+    ]);
+    const run = stored && validRunRecord(stored) ? stored : undefined;
+    const providerRun = run?.providerRuns[provider];
+    if (!run || !providerRun) throw new Error('Provider run not found.');
+    if (captureKey !== undefined) {
+      await transaction.done;
+      return { outcome: 'capture_available', run };
+    }
+    const inspection = normalizeCaptureJobRecord(rawJob, id);
+    if (inspection.job && isUsableCaptureJobReport(inspection.job)) {
+      await transaction.done;
+      return { outcome: 'usable_job', run, job: inspection.job };
+    }
+    if (inspection.retainedReport) {
+      await transaction.done;
+      return { outcome: 'review_required', run };
+    }
+    providerRun.captureReviewPending = undefined;
+    const recoveryPending = providerRun.captureRecoveryPending;
+    providerRun.captureRecoveryPending = undefined;
+    if (recoveryPending && providerRun.status === 'failed') {
+      providerRun.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
+    }
+    if (inspection.exists) await transaction.objectStore('jobs').delete(id);
+    await transaction.objectStore('runs').put(run);
+    await transaction.done;
+    return { outcome: 'cleared', run };
+  } catch (error) {
+    try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
+    await transaction.done.catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function listPausedCaptureJobIds(): Promise<string[]> {
+  return (await db()).getAllKeysFromIndex('jobs', 'by-state', 'paused');
 }
 
 export interface CaptureJobCursor {
@@ -425,10 +526,10 @@ export async function nextCaptureJob(after?: CaptureJobCursor): Promise<CaptureJ
     const normalized = normalizeCaptureJobRecord(cursor.value, String(cursor.primaryKey));
     const job = normalized.job;
     if (!job) continue;
+    if (job.state === 'paused') continue;
     const storedRun = await transaction.objectStore('runs').get(job.runId);
     const run = storedRun && validRunRecord(storedRun) ? storedRun : undefined;
     if (storedRun && !run) warnInvalidRun(storedRun);
-    if (job.state === 'paused') continue;
     if (job.state === 'orphaned') {
       if (Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
         selected = job;

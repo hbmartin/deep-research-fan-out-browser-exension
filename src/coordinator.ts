@@ -1,7 +1,7 @@
 import { ADAPTERS, classifyProviderPage, conversationKeysMatch, isProviderUrl, normalizeConversationKey, providerFromUrl, type ProviderPageIdentity } from './adapters';
 import { buildArtifact, buildCurrentResponseCopy } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
-import { acceptCaptureJob, CaptureJobReviewRequiredError, captureId, deleteJob, discardBlockedCaptureJob, getCapture, getJob, getRedirect, getRun, hasCapture, inspectCaptureJob, isUsableCaptureJobReport, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, ORPHAN_JOB_RETENTION_MS, pruneExpiredRedirects, putCapture, putJob, putRedirect, putRun } from './db';
+import { acceptCaptureJob, CaptureJobReviewRequiredError, captureId, clearUnavailableCaptureRecovery, clearUnusableCaptureRecoveryJob, deleteJob, discardBlockedCaptureJob, getCapture, getJob, getRedirect, getRun, inspectCaptureJob, isUsableCaptureJobReport, listPausedCaptureJobIds, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, ORPHAN_JOB_RETENTION_MS, pruneExpiredRedirects, putCapture, putJob, putRedirect, putRun, type CaptureJobCursor } from './db';
 import { NAVIGATION_DEFERRAL_MS } from './durations';
 import type { ContentStateReason, CurrentResponseSnapshot, ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
@@ -16,7 +16,8 @@ const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
 let contextMenuRegistrationTail = Promise.resolve();
 const clipboardMutationTails = new Map<string, Promise<void>>();
 const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
-let captureWorkerRunning = false;
+let captureWorkerPromise: Promise<void> | undefined;
+let captureWorkerRerunRequested = false;
 let reconcileWorkerRunning = false;
 let lastNonRunInteractionAt = 0;
 const knownRunTabIds = new Set<number>();
@@ -190,6 +191,14 @@ async function restoreDetachedSetupPhase(runId: string, provider: ProviderId): P
 
 function serializeCapture<T>(id: string, operation: () => Promise<T>): Promise<T> {
   return serializeByKey(captureMutationTails, id, operation);
+}
+
+function withCaptureAndRunLock<T>(
+  runId: string,
+  provider: ProviderId,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return serializeCapture(captureId(runId, provider), () => withRunLock(runId, operation));
 }
 
 function setKnownRunTabs(runs: Run[]): void {
@@ -744,8 +753,8 @@ async function completeProviderCapture(
   captureIdValue: string,
   degraded: boolean,
   captureRevision?: string,
-  recoverStorageFailure = false,
   interruptForNavigation = false,
+  stopContent = true,
 ): Promise<boolean> {
   const revision = captureRevision ?? (await getCapture(captureIdValue))?.revision;
   if (!revision) throw new Error('Captured report revision is unavailable.');
@@ -759,14 +768,16 @@ async function completeProviderCapture(
     const captureChanged = providerRun.captureId !== captureIdValue
       || (providerRun.artifactRevision !== undefined && providerRun.artifactRevision !== revision)
       || (degraded && !providerRun.degraded);
+    const recoveredStorageFailure = providerRun.status === 'failed' && providerRun.captureRecoveryPending;
     providerRun.captureId = captureIdValue;
     providerRun.artifactRevision = revision;
+    providerRun.captureReviewPending = undefined;
+    providerRun.captureRecoveryPending = undefined;
     if (legacyReceiptForSameCapture) providerRun.saveReceipt!.artifactRevision = revision;
     providerRun.degraded ||= degraded;
-    if (recoverStorageFailure && providerRun.status === 'failed' && providerRun.captureRecoveryPending) {
+    if (recoveredStorageFailure) {
       providerRun.status = 'complete';
       providerRun.statusDetail = undefined;
-      providerRun.captureRecoveryPending = undefined;
       providerRun.saveReceipt = undefined;
       storedRun.completedAt = undefined;
       storedRun.status = deriveRunStatus(storedRun);
@@ -797,11 +808,16 @@ async function completeProviderCapture(
     return { completed: true, attached: true };
   });
   if (!value.attached) throw new Error(`Could not link ${provider} capture to its provider run.`);
-  await settleProvider(runId, provider, value.completed);
+  await settleProvider(runId, provider, value.completed, stopContent);
   return value.completed;
 }
 
-async function failProviderIfActive(runId: string, provider: ProviderId, detail: string): Promise<void> {
+async function failProviderIfActive(
+  runId: string,
+  provider: ProviderId,
+  detail: string,
+  stopContent = true,
+): Promise<void> {
   const { value: failed } = await mutateStoredRun(runId, (storedRun) => {
     const providerRun = storedRun.providerRuns[provider];
     if (!providerRun || isTerminalProviderStatus(providerRun.status)) return false;
@@ -813,17 +829,18 @@ async function failProviderIfActive(runId: string, provider: ProviderId, detail:
     return true;
   });
   if (!failed) return;
-  await settleProvider(runId, provider);
+  await settleProvider(runId, provider, false, stopContent);
 }
 
 async function containCaptureJobFailure(
   runId: string,
   provider: ProviderId,
   error: unknown,
+  stopContent = true,
 ): Promise<void> {
   console.error(`Capture job failed for ${provider}.`, error);
   try {
-    await failProviderIfActive(runId, provider, error instanceof Error ? error.message : String(error));
+    await failProviderIfActive(runId, provider, error instanceof Error ? error.message : String(error), stopContent);
   } catch (transitionError) {
     console.error(`Could not persist the failed capture state for ${provider}.`, transitionError);
   }
@@ -841,7 +858,7 @@ async function markProviderInterruptedAfterNavigation(runId: string, provider: P
   });
 }
 
-async function markCaptureStorageFailure(runId: string, provider: ProviderId): Promise<void> {
+async function markCaptureStorageFailure(runId: string, provider: ProviderId, stopContent = true): Promise<void> {
   const { value: changed } = await mutateStoredRun(runId, (storedRun) => {
     const current = storedRun.providerRuns[provider];
     if (!current || isTerminalProviderStatus(current.status)) return false;
@@ -853,10 +870,10 @@ async function markCaptureStorageFailure(runId: string, provider: ProviderId): P
     storedRun.status = deriveRunStatus(storedRun);
     return true;
   });
-  if (changed) await settleProvider(runId, provider);
+  if (changed) await settleProvider(runId, provider, false, stopContent);
 }
 
-async function pauseCaptureForStorageFailure(job: CaptureJob, error: unknown): Promise<void> {
+async function pauseCaptureForStorageFailure(job: CaptureJob, error: unknown, stopContent = true): Promise<void> {
   job.state = 'paused';
   job.leasedAt = undefined;
   job.tabUnavailable = true;
@@ -864,7 +881,7 @@ async function pauseCaptureForStorageFailure(job: CaptureJob, error: unknown): P
   job.deferredAt = undefined;
   try { await putJob(job); }
   catch (pauseError) { console.error('Could not pause the retained capture job.', pauseError); }
-  try { await markCaptureStorageFailure(job.runId, job.provider); }
+  try { await markCaptureStorageFailure(job.runId, job.provider, stopContent); }
   catch (stateError) { console.error('Could not persist the capture-storage failure.', stateError); }
   await createPlatform().notify(
     `attention:${job.runId}:${job.provider}`,
@@ -875,31 +892,6 @@ async function pauseCaptureForStorageFailure(job: CaptureJob, error: unknown): P
   console.error(`Could not persist the verified ${job.provider} DOM report.`, error);
 }
 
-async function reconcileRetainedCaptureState(runId: string, provider: ProviderId): Promise<boolean> {
-  const id = captureId(runId, provider);
-  return serializeCapture(id, () => withRunLock(runId, async () => {
-    const [captureAvailable, inspection, run] = await Promise.all([
-      hasCapture(id), inspectCaptureJob(id), getRun(runId),
-    ]);
-    const current = run?.providerRuns[provider];
-    if (!run || !current || (!current.captureRecoveryPending && !current.captureReviewPending)) return false;
-    if (captureAvailable || (inspection.job && isUsableCaptureJobReport(inspection.job))) {
-      if (!current.captureReviewPending) return false;
-      current.captureReviewPending = undefined;
-      await putRun(run);
-      return true;
-    }
-    if (inspection.retainedReport) {
-      if (current.captureReviewPending) return false;
-      current.captureReviewPending = true;
-      await putRun(run);
-      return true;
-    }
-    await discardBlockedCaptureJob(id, runId, provider, { inspection, unavailable: true });
-    return true;
-  }));
-}
-
 async function markCaptureReviewRequired(runId: string, provider: ProviderId): Promise<Run> {
   return (await mutateStoredRun(runId, (storedRun) => {
     const current = storedRun.providerRuns[provider];
@@ -908,46 +900,48 @@ async function markCaptureReviewRequired(runId: string, provider: ProviderId): P
   })).run;
 }
 
-async function discardUnavailableCaptureState(
-  runId: string,
-  provider: ProviderId,
-  inspection: Awaited<ReturnType<typeof inspectCaptureJob>>,
-): Promise<Run> {
-  const id = captureId(runId, provider);
-  return withRunLock(runId, () => discardBlockedCaptureJob(
-    id, runId, provider, { inspection, unavailable: true },
-  ));
-}
-
 async function retryPausedCapture(runId: string, provider: ProviderId): Promise<void> {
   const id = captureId(runId, provider);
   await serializeCapture(id, async () => {
     const run = await getRun(runId);
     const providerRun = run?.providerRuns[provider];
-    const inspection = await inspectCaptureJob(id);
-    const existingCapture = await getCapture(id);
-    if (!providerRun || providerRun.status !== 'failed' || !providerRun.captureRecoveryPending) {
+    if (!run || !providerRun) {
+      throw new CoordinatorRequestError('Run not found.', 'run_not_found');
+    }
+    if (providerRun.status !== 'failed' || !providerRun.captureRecoveryPending) {
       throw new CoordinatorRequestError('No retained report is available for capture retry.', 'invalid_transition');
     }
-    if (!existingCapture && (!inspection.job || !isUsableCaptureJobReport(inspection.job))) {
-      if (inspection.retainedReport) {
-        const reviewed = await markCaptureReviewRequired(runId, provider);
-        await broadcastRuns().catch((error) => console.error('Could not broadcast capture review state.', error));
-        throw new CoordinatorRequestError(
-          'A retained report needs review before capture recovery can continue.',
-          'capture_review_required',
-          providerSnapshot(reviewed.providerRuns[provider]!),
-        );
-      }
-      await discardUnavailableCaptureState(runId, provider, inspection);
+    const existingCapture = await getCapture(id);
+    if (existingCapture) {
+      await completeProviderCapture(runId, provider, id, captureIsDegraded(existingCapture), existingCapture.revision);
+      await deleteJob(id);
+      return;
+    }
+    const cleanup = await withRunLock(runId, () => clearUnusableCaptureRecoveryJob(id, runId, provider));
+    if (cleanup.outcome === 'capture_available') {
+      const capture = await getCapture(id);
+      if (!capture) throw new CoordinatorRequestError('No retained report is available for capture retry.', 'invalid_transition');
+      await completeProviderCapture(runId, provider, id, captureIsDegraded(capture), capture.revision);
+      await deleteJob(id);
+      return;
+    }
+    if (cleanup.outcome === 'usable_job') {
+      const persisted = await persistCaptureJob(cleanup.job);
+      await completeProviderCapture(runId, provider, persisted.id, true, persisted.revision);
+      await deleteJob(id);
+      return;
+    }
+    if (cleanup.outcome === 'cleared') {
       await broadcastRuns().catch((error) => console.error('Could not broadcast cleared capture recovery.', error));
       throw new CoordinatorRequestError('No retained report is available for capture retry.', 'invalid_transition');
     }
-    const persisted = existingCapture
-      ? { id, degraded: true, revision: existingCapture.revision! }
-      : await persistCaptureJob(inspection.job!);
-    await completeProviderCapture(runId, provider, persisted.id, true, persisted.revision, true);
-    await deleteJob(id);
+    const reviewed = await markCaptureReviewRequired(runId, provider);
+    await broadcastRuns().catch((error) => console.error('Could not broadcast capture review state.', error));
+    throw new CoordinatorRequestError(
+      'A retained report needs review before capture recovery can continue.',
+      'capture_review_required',
+      providerSnapshot(reviewed.providerRuns[provider]!),
+    );
   });
 }
 
@@ -971,134 +965,162 @@ async function classifyOwnedProviderTab(providerRun: ProviderRun): Promise<{ kin
     ? { kind: 'original' } : { kind: 'recoverable' };
 }
 
-async function processCaptureQueue(): Promise<void> {
-  if (captureWorkerRunning) return;
-  captureWorkerRunning = true;
-  const platform = createPlatform();
-  try {
-    let cursor: { createdAt: number; id: string } | undefined;
-    for (;;) {
-      const job = await nextCaptureJob(cursor);
-      if (!job) break;
-      cursor = { createdAt: job.createdAt, id: job.id };
-      const run = await getRun(job.runId);
-      const providerRun = run?.providerRuns[job.provider];
-      if (!run || !providerRun) {
-        if (job.state === 'orphaned' && Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
-          await deleteJob(job.id);
-          continue;
-        }
-        job.state = 'orphaned';
-        job.orphanedAt ??= Date.now();
-        job.leasedAt = undefined;
-        await putJob(job);
-        continue;
+async function processCaptureJob(
+  id: string,
+  platform: BrowserPlatform,
+  browserSessionId: string,
+): Promise<void> {
+  await serializeCapture(id, async () => {
+    const job = await getJob(id);
+    if (!job) return;
+    const run = await getRun(job.runId);
+    const providerRun = run?.providerRuns[job.provider];
+    if (!run || !providerRun) {
+      if (job.state === 'orphaned' && Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
+        await deleteJob(job.id);
+        return;
       }
-      if (job.state === 'orphaned') {
-        job.state = 'queued';
-        job.orphanedAt = undefined;
-        await putJob(job);
-        if (providerRun.captureRecoveryPending) continue;
-      }
-      const existingCapture = await getCapture(job.id);
-      if (existingCapture) {
-        job.state = 'leased';
-        job.leasedAt = Date.now();
-        await putJob(job);
-        try {
-          await completeProviderCapture(run.id, job.provider, job.id, captureIsDegraded(existingCapture), existingCapture.revision);
-          await deleteJob(job.id);
-        } catch (error) {
-          console.error(`Could not link the persisted ${job.provider} capture; retaining its recovery job.`, error);
-        }
-        continue;
-      }
-      const page = job.tabUnavailable ? { kind: 'unavailable' } as const : await classifyOwnedProviderTab(providerRun);
-      const navigatedAway = page.kind === 'different_conversation' || page.kind === 'external';
-      let forceDomFallback = job.tabUnavailable
-        || isTerminalProviderStatus(providerRun.status)
-        || job.attempts >= MAX_CAPTURE_ATTEMPTS
-        || (job.deferredForNavigation && Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS);
-      if (page.kind === 'unavailable') {
-        job.tabUnavailable = true;
-        forceDomFallback = true;
-      } else if (navigatedAway) {
-        forceDomFallback = true;
-      } else if (page.kind === 'recoverable' && !forceDomFallback) {
-        job.deferredForNavigation = true;
-        job.deferredAt ??= Date.now();
-        job.state = 'queued';
-        job.leasedAt = undefined;
-        await putJob(job);
-        const { run: detachedRun, value: newlyDetached } = await mutateStoredRun(run.id, (storedRun) => {
-          const current = storedRun.providerRuns[job.provider];
-          if (!current || isTerminalProviderStatus(current.status)) return false;
-          const first = current.detachedAt === undefined;
-          assertTransition(current.status, 'manual_required');
-          rememberDetachedSetupPhase(current);
-          current.status = 'manual_required';
-          current.statusDetail = `Return to the original ${ADAPTERS[job.provider].label} conversation to finish saving.`;
-          current.detachedAt ??= Date.now();
-          storedRun.status = deriveRunStatus(storedRun);
-          return first;
-        });
-        if (newlyDetached) await platform.notify(
-          `attention:${run.id}:${job.provider}`,
-          `${ADAPTERS[job.provider].label} needs your input`,
-          detachedRun.providerRuns[job.provider]!.statusDetail!,
-        ).catch(() => undefined);
-        continue;
-      } else if (page.kind === 'original' && job.deferredForNavigation) {
-        job.deferredForNavigation = undefined;
-        job.deferredAt = undefined;
-        await putJob(job);
-      }
-      if (!isTerminalProviderStatus(providerRun.status) && providerRun.status !== 'capturing') {
-        try {
-          await ensureProviderCapturing(run.id, job.provider);
-        } catch (error) {
-          if (error instanceof CoordinatorRequestError && error.code === 'invalid_transition') {
-            await deleteJob(job.id);
-            continue;
-          }
-          if (!(error instanceof CoordinatorRequestError && error.code === 'provider_terminal')) throw error;
-        }
-      }
+      job.state = 'orphaned';
+      job.orphanedAt ??= Date.now();
+      job.leasedAt = undefined;
+      await putJob(job);
+      return;
+    }
+    const stopContent = run.browserSessionId === browserSessionId;
+    if (job.state === 'orphaned') {
+      job.state = 'queued';
+      job.orphanedAt = undefined;
+      await putJob(job);
+      if (providerRun.captureRecoveryPending) return;
+    }
+    const existingCapture = await getCapture(job.id);
+    if (existingCapture) {
       job.state = 'leased';
       job.leasedAt = Date.now();
-      if (job.attempts < MAX_CAPTURE_ATTEMPTS) job.attempts += 1;
       await putJob(job);
       try {
-        const copied = forceDomFallback ? undefined : await clipboardCapture(platform, job);
-        const persisted = await persistCaptureJob(job, copied);
-        try {
-          await completeProviderCapture(run.id, job.provider, persisted.id, persisted.degraded, persisted.revision, false, navigatedAway);
-          await deleteJob(job.id);
-        } catch (error) {
-          console.error(`Could not link the persisted ${job.provider} report; retaining its recovery job.`, error);
-        }
+        await completeProviderCapture(
+          run.id, job.provider, job.id, captureIsDegraded(existingCapture), existingCapture.revision, false, stopContent,
+        );
+        await deleteJob(job.id);
       } catch (error) {
-        if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
-          if (isUsableCaptureJobReport(job)) {
-            await pauseCaptureForStorageFailure(job, error);
-          } else {
-            if (navigatedAway) {
-              await markProviderInterruptedAfterNavigation(run.id, job.provider);
-              await settleProvider(run.id, job.provider);
-            } else await containCaptureJobFailure(run.id, job.provider, error);
-            await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
-          }
-          continue;
+        console.error(`Could not link the persisted ${job.provider} capture; retaining its recovery job.`, error);
+      }
+      return;
+    }
+    const page = job.tabUnavailable ? { kind: 'unavailable' } as const : await classifyOwnedProviderTab(providerRun);
+    const navigatedAway = page.kind === 'different_conversation' || page.kind === 'external';
+    let forceDomFallback = job.tabUnavailable
+      || isTerminalProviderStatus(providerRun.status)
+      || job.attempts >= MAX_CAPTURE_ATTEMPTS
+      || (job.deferredForNavigation && Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS);
+    if (page.kind === 'unavailable') {
+      job.tabUnavailable = true;
+      forceDomFallback = true;
+    } else if (navigatedAway) {
+      forceDomFallback = true;
+    } else if (page.kind === 'recoverable' && !forceDomFallback) {
+      job.deferredForNavigation = true;
+      job.deferredAt ??= Date.now();
+      job.state = 'queued';
+      job.leasedAt = undefined;
+      await putJob(job);
+      const { run: detachedRun, value: newlyDetached } = await mutateStoredRun(run.id, (storedRun) => {
+        const current = storedRun.providerRuns[job.provider];
+        if (!current || isTerminalProviderStatus(current.status)) return false;
+        const first = current.detachedAt === undefined;
+        assertTransition(current.status, 'manual_required');
+        rememberDetachedSetupPhase(current);
+        current.status = 'manual_required';
+        current.statusDetail = `Return to the original ${ADAPTERS[job.provider].label} conversation to finish saving.`;
+        current.detachedAt ??= Date.now();
+        storedRun.status = deriveRunStatus(storedRun);
+        return first;
+      });
+      if (newlyDetached) await platform.notify(
+        `attention:${run.id}:${job.provider}`,
+        `${ADAPTERS[job.provider].label} needs your input`,
+        detachedRun.providerRuns[job.provider]!.statusDetail!,
+      ).catch(() => undefined);
+      return;
+    } else if (page.kind === 'original' && job.deferredForNavigation) {
+      job.deferredForNavigation = undefined;
+      job.deferredAt = undefined;
+      await putJob(job);
+    }
+    if (!isTerminalProviderStatus(providerRun.status) && providerRun.status !== 'capturing') {
+      try {
+        await ensureProviderCapturing(run.id, job.provider);
+      } catch (error) {
+        if (error instanceof CoordinatorRequestError && error.code === 'invalid_transition') {
+          await deleteJob(job.id);
+          return;
         }
-        console.error(`Capture job attempt failed for ${job.provider}; retaining its DOM fallback.`, error);
-        job.state = 'leased';
-        job.leasedAt = Date.now();
-        await putJob(job).catch((putError) => console.error('Could not retain the failed capture job.', putError));
+        if (!(error instanceof CoordinatorRequestError && error.code === 'provider_terminal')) throw error;
       }
     }
-  } finally {
-    captureWorkerRunning = false;
+    job.state = 'leased';
+    job.leasedAt = Date.now();
+    if (job.attempts < MAX_CAPTURE_ATTEMPTS) job.attempts += 1;
+    await putJob(job);
+    try {
+      const copied = forceDomFallback ? undefined : await clipboardCapture(platform, job);
+      const persisted = await persistCaptureJob(job, copied);
+      try {
+        await completeProviderCapture(
+          run.id, job.provider, persisted.id, persisted.degraded, persisted.revision, navigatedAway, stopContent,
+        );
+        await deleteJob(job.id);
+      } catch (error) {
+        console.error(`Could not link the persisted ${job.provider} report; retaining its recovery job.`, error);
+      }
+    } catch (error) {
+      if (job.attempts >= MAX_CAPTURE_ATTEMPTS) {
+        if (isUsableCaptureJobReport(job)) {
+          await pauseCaptureForStorageFailure(job, error, stopContent);
+        } else {
+          if (navigatedAway) {
+            await markProviderInterruptedAfterNavigation(run.id, job.provider);
+            await settleProvider(run.id, job.provider, false, stopContent);
+          } else await containCaptureJobFailure(run.id, job.provider, error, stopContent);
+          await deleteJob(job.id).catch((deleteError) => console.error('Could not remove a failed capture job.', deleteError));
+        }
+        return;
+      }
+      console.error(`Capture job attempt failed for ${job.provider}; retaining its DOM fallback.`, error);
+      job.state = 'leased';
+      job.leasedAt = Date.now();
+      await putJob(job).catch((putError) => console.error('Could not retain the failed capture job.', putError));
+    }
+  });
+}
+
+async function processCaptureQueuePass(): Promise<void> {
+  const platform = createPlatform();
+  const browserSessionId = await getBrowserSessionId();
+  let cursor: CaptureJobCursor | undefined;
+  for (;;) {
+    const job = await nextCaptureJob(cursor);
+    if (!job) return;
+    cursor = { createdAt: job.createdAt, id: job.id };
+    await processCaptureJob(job.id, platform, browserSessionId);
   }
+}
+
+function processCaptureQueue(): Promise<void> {
+  captureWorkerRerunRequested = true;
+  if (captureWorkerPromise) return captureWorkerPromise;
+  const worker = (async () => {
+    while (captureWorkerRerunRequested) {
+      captureWorkerRerunRequested = false;
+      await processCaptureQueuePass();
+    }
+  })();
+  const tracked = worker.finally(() => {
+    if (captureWorkerPromise === tracked) captureWorkerPromise = undefined;
+  });
+  captureWorkerPromise = tracked;
+  return tracked;
 }
 
 async function ensureProviderCapturing(runId: string, provider: ProviderId): Promise<boolean> {
@@ -1122,7 +1144,7 @@ async function queueCapture(
   const id = captureId(request.runId, request.provider);
   let run: Run;
   try {
-    run = await serializeCapture(id, () => withRunLock(request.runId, async () => {
+    run = await withCaptureAndRunLock(request.runId, request.provider, async () => {
       const existingJob = await getJob(id);
       const job: CaptureJob = {
         id,
@@ -1165,7 +1187,7 @@ async function queueCapture(
         storedRun.status = deriveRunStatus(storedRun);
         return storedRun;
       });
-    }));
+    });
   } catch (error) {
     if (!(error instanceof CaptureJobReviewRequiredError)) throw error;
     const storedRun = await getRun(request.runId);
@@ -1295,8 +1317,7 @@ async function saveProviderArtifact(runId: string, provider: ProviderId, force =
   });
 }
 
-async function maybeFinalize(runInput: Run, skipSaveProviders: ReadonlySet<ProviderId> = new Set()): Promise<void> {
-  const runId = runInput.id;
+async function maybeFinalize(runId: string, skipSaveProviders: ReadonlySet<ProviderId> = new Set()): Promise<void> {
   if (finalizingRunIds.has(runId)) return;
   finalizingRunIds.add(runId);
   try {
@@ -1340,10 +1361,9 @@ async function settleProvider(
   notifyComplete = false,
   stopContent = true,
 ): Promise<void> {
-  let runForFinalization: Run | undefined;
   if (stopContent) {
-    runForFinalization = await getRun(runId);
-    const stoppedProvider = runForFinalization?.providerRuns[provider];
+    const currentRun = await getRun(runId);
+    const stoppedProvider = currentRun?.providerRuns[provider];
     if (stoppedProvider && isTerminalProviderStatus(stoppedProvider.status)) {
       await sendTabEvent(stoppedProvider.tabId, { type: 'content:stop', runId }).catch(() => undefined);
     }
@@ -1360,32 +1380,37 @@ async function settleProvider(
       'The normalized report is ready.',
     ).catch(() => undefined);
   }
-  runForFinalization ??= await getRun(runId);
-  if (runForFinalization) await maybeFinalize(runForFinalization, saveFailed ? new Set([provider]) : undefined);
+  await maybeFinalize(runId, saveFailed ? new Set([provider]) : undefined);
   await broadcastRuns();
 }
 
 async function markCaptureJobTabUnavailable(runId: string, provider: ProviderId): Promise<boolean> {
-  const job = await getJob(captureId(runId, provider));
-  if (!job || job.state === 'paused' || job.state === 'orphaned') return false;
-  job.tabUnavailable = true;
-  job.deferredForNavigation = undefined;
-  job.deferredAt = undefined;
-  job.state = 'queued';
-  job.leasedAt = undefined;
-  await putJob(job);
-  return true;
+  const id = captureId(runId, provider);
+  return serializeCapture(id, async () => {
+    const job = await getJob(id);
+    if (!job || job.state === 'paused' || job.state === 'orphaned') return false;
+    job.tabUnavailable = true;
+    job.deferredForNavigation = undefined;
+    job.deferredAt = undefined;
+    job.state = 'queued';
+    job.leasedAt = undefined;
+    await putJob(job);
+    return true;
+  });
 }
 
 async function unblockNavigationDeferredCapture(runId: string, provider: ProviderId): Promise<boolean> {
-  const job = await getJob(captureId(runId, provider));
-  if (!job?.deferredForNavigation) return false;
-  job.deferredForNavigation = undefined;
-  job.deferredAt = undefined;
-  job.state = 'queued';
-  job.leasedAt = undefined;
-  await putJob(job);
-  return true;
+  const id = captureId(runId, provider);
+  return serializeCapture(id, async () => {
+    const job = await getJob(id);
+    if (!job?.deferredForNavigation) return false;
+    job.deferredForNavigation = undefined;
+    job.deferredAt = undefined;
+    job.state = 'queued';
+    job.leasedAt = undefined;
+    await putJob(job);
+    return true;
+  });
 }
 
 async function endProvider(runId: string, provider: ProviderId, allowFinished = false): Promise<void> {
@@ -1443,27 +1468,60 @@ async function recordReconcileCheck(runId: string, provider: ProviderId, valid: 
   })).run;
 }
 
+async function reconcileCaptureRecoveryRecords(
+  runId: string,
+  provider: ProviderId,
+  browserSessionId: string,
+): Promise<boolean> {
+  const id = captureId(runId, provider);
+  const availability = await withCaptureAndRunLock(runId, provider, () => (
+    clearUnavailableCaptureRecovery(id, runId, provider)
+  ));
+  if (!availability.captureAvailable) return availability.cleared;
+  await serializeCapture(id, async () => {
+    const capture = await getCapture(id);
+    if (!capture) return;
+    await completeProviderCapture(
+      runId,
+      provider,
+      id,
+      captureIsDegraded(capture),
+      capture.revision,
+      false,
+      availability.run.browserSessionId === browserSessionId,
+    );
+    await deleteJob(id);
+  });
+  return false;
+}
+
 async function reconcileRuns(): Promise<void> {
   if (reconcileWorkerRunning) return;
   reconcileWorkerRunning = true;
   try {
     const browserSessionId = await getBrowserSessionId();
     const pendingRuns = await listRuns();
+    const pausedJobIds = new Set(await listPausedCaptureJobIds());
     let recoveryChanged = false;
     for (const snapshot of pendingRuns) for (const providerRun of Object.values(snapshot.providerRuns)) {
-      if (providerRun.captureRecoveryPending || providerRun.captureReviewPending) {
+      const id = captureId(snapshot.id, providerRun.provider);
+      const paused = pausedJobIds.has(id);
+      if (paused && !isTerminalProviderStatus(providerRun.status)) {
         try {
-          const reconciled = await reconcileRetainedCaptureState(snapshot.id, providerRun.provider);
-          recoveryChanged ||= reconciled;
+          await markCaptureStorageFailure(
+            snapshot.id,
+            providerRun.provider,
+            snapshot.browserSessionId === browserSessionId,
+          );
+        }
+        catch (error) { console.error('Could not reconcile a paused capture-storage failure.', error); }
+      }
+      if (paused || providerRun.captureRecoveryPending || providerRun.captureReviewPending) {
+        try {
+          const changed = await reconcileCaptureRecoveryRecords(snapshot.id, providerRun.provider, browserSessionId);
+          recoveryChanged ||= changed;
         }
         catch (error) { console.error('Could not reconcile retained capture state.', error); }
-        continue;
-      }
-      if (isTerminalProviderStatus(providerRun.status)) continue;
-      const job = await getJob(captureId(snapshot.id, providerRun.provider));
-      if (job?.state === 'paused') {
-        try { await markCaptureStorageFailure(snapshot.id, providerRun.provider); }
-        catch (error) { console.error('Could not reconcile a paused capture-storage failure.', error); }
       }
     }
     if (recoveryChanged) {
@@ -1475,10 +1533,10 @@ async function reconcileRuns(): Promise<void> {
       if (snapshot.browserSessionId !== browserSessionId) {
         for (const providerRun of Object.values(snapshot.providerRuns)) {
           if (isTerminalProviderStatus(providerRun.status)) continue;
-          if (providerRun.captureReviewPending) continue;
           const id = captureId(snapshot.id, providerRun.provider);
-          const capture = await getCapture(id);
-          if (capture) {
+          const captureLinked = await serializeCapture(id, async () => {
+            const capture = await getCapture(id);
+            if (!capture) return false;
             await mutateStoredRun(snapshot.id, (storedRun) => {
               const currentProviderRun = storedRun.providerRuns[providerRun.provider];
               if (!currentProviderRun || isTerminalProviderStatus(currentProviderRun.status)) return;
@@ -1486,10 +1544,13 @@ async function reconcileRuns(): Promise<void> {
               currentProviderRun.statusDetail = 'Linking a saved report after browser restart.';
               storedRun.status = deriveRunStatus(storedRun);
             });
-            await completeProviderCapture(snapshot.id, providerRun.provider, id, captureIsDegraded(capture), capture.revision);
+            await completeProviderCapture(
+              snapshot.id, providerRun.provider, id, captureIsDegraded(capture), capture.revision, false, false,
+            );
             await deleteJob(id).catch(() => undefined);
-            continue;
-          }
+            return true;
+          });
+          if (captureLinked) continue;
           const captureQueued = await markCaptureJobTabUnavailable(snapshot.id, providerRun.provider);
           const { run: reconciledRun } = await mutateStoredRun(snapshot.id, (storedRun) => {
             const currentProviderRun = storedRun.providerRuns[providerRun.provider];
@@ -1506,7 +1567,7 @@ async function reconcileRuns(): Promise<void> {
             storedRun.status = deriveRunStatus(storedRun);
           });
           if (isTerminalProviderStatus(reconciledRun.providerRuns[providerRun.provider]!.status)) {
-            await settleProvider(snapshot.id, providerRun.provider);
+            await settleProvider(snapshot.id, providerRun.provider, false, false);
           }
         }
         continue;
@@ -1553,7 +1614,7 @@ async function reconcileRuns(): Promise<void> {
     await pruneExpiredRedirects().catch((error) => console.error('Could not prune expired redirects.', error));
     for (const snapshot of runs) {
       const latest = await getRun(snapshot.id);
-      if (latest && latest.completedAt === undefined) await maybeFinalize(latest);
+      if (latest && latest.completedAt === undefined) await maybeFinalize(latest.id);
     }
     const latestRuns = await listRuns();
     if (JSON.stringify(latestRuns) !== JSON.stringify(runs)) await broadcastRuns();
@@ -1670,11 +1731,13 @@ async function handleRequest(message: RuntimeRequest, sender: Browser.runtime.Me
       }
       case 'provider:discard-blocked-job': {
         const id = captureId(message.runId, message.provider);
-        const run = await serializeCapture(id, () => withRunLock(message.runId, () => (
+        const run = await withCaptureAndRunLock(message.runId, message.provider, () => (
           discardBlockedCaptureJob(id, message.runId, message.provider)
-        )));
+        ));
         const providerRun = run.providerRuns[message.provider];
-        if (providerRun && !isTerminalProviderStatus(providerRun.status)) {
+        const browserSessionId = await getBrowserSessionId();
+        if (run.browserSessionId === browserSessionId
+          && providerRun && !isTerminalProviderStatus(providerRun.status)) {
           await startContent(run, message.provider, true);
         }
         await broadcastRuns().catch((error) => console.error('Could not broadcast discarded capture review.', error));
@@ -1758,6 +1821,7 @@ export const coordinatorTestHooks = {
   handleRequest,
   serializeCapture,
   withRunLock,
+  withCaptureAndRunLock,
   withClipboardLock,
   mutateStoredRun,
   maybeFinalize,
@@ -1783,6 +1847,8 @@ export const coordinatorTestHooks = {
     captureMutationTails.clear();
     artifactSaveMutationTails.clear();
     clipboardMutationTails.clear();
+    captureWorkerPromise = undefined;
+    captureWorkerRerunRequested = false;
     contextMenuRegistrationTail = Promise.resolve();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
