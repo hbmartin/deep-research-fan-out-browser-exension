@@ -62,7 +62,7 @@ export type BackgroundEvent = { type: 'runs:changed'; runs: Run[] } | {
   captureAccepted?: boolean;
 } | { type: 'content:ping'; provider: ProviderId }
   | { type: 'capture:dom-current'; provider: ProviderId; runId?: RunId; conversationKey?: string }
-  | { type: 'capture:copy-now'; jobId: string; conversationKey?: string }
+  | { type: 'capture:copy-now'; jobId: string; conversationKey?: string; expiresAt: number }
   | { type: 'content:stop'; runId: RunId };
 
 export async function sendRequest(request: RuntimeRequest): Promise<RuntimeResponse> {

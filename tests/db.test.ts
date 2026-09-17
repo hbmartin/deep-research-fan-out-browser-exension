@@ -2,7 +2,7 @@
 import 'fake-indexeddb/auto';
 import { openDB } from 'idb';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { captureId, deleteJob, deleteReportDirectoryConfig, getCapture, getJob, getRedirect, getReportDirectoryConfig, getRun, listRuns, nextCaptureJob, pruneExpiredRedirects, putCapture, putJob, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
+import { captureId, captureJobIsEligible, deleteJob, deleteReportDirectoryConfig, getCapture, getJob, getRedirect, getReportDirectoryConfig, getRun, inspectCaptureRecovery, listPausedCaptureJobIds, listRuns, nextCaptureJob, pruneExpiredRedirects, putCapture, putJob, putRedirect, putReportDirectoryConfig, putRun, REDIRECT_RETENTION_MS } from '../src/db';
 import type { Capture, CaptureJob, Run } from '../src/types';
 
 const capture: Capture = {
@@ -94,6 +94,9 @@ describe('run history', () => {
       { ...valid, id: 'lease-infinite', createdAt: valid.createdAt + 3, leasedAt: Infinity },
       { ...valid, id: 'queued-without-lease', createdAt: valid.createdAt + 4, state: 'queued', leasedAt: undefined },
     ] as CaptureJob[];
+    const invalidToken = { ...valid, id: 'lease-invalid-token', createdAt: valid.createdAt + 5, leaseToken: 42 } as unknown as CaptureJob;
+    const staleQueuedToken = { ...valid, id: 'queued-stale-token', createdAt: valid.createdAt + 6,
+      state: 'queued', leasedAt: undefined, leaseToken: 'stale' } as CaptureJob;
     try {
       await putJob(valid);
       for (const job of jobs.slice(1, 4)) {
@@ -101,6 +104,8 @@ describe('run history', () => {
         await putLegacyJob(job);
       }
       await putJob(jobs[4]!);
+      await putLegacyJob(invalidToken);
+      await putLegacyJob(staleQueuedToken);
       expect(await getJob(valid.id)).toMatchObject({ leasedAt: valid.leasedAt });
       for (const job of jobs.slice(1, 4)) {
         expect(await getJob(job.id)).toMatchObject({
@@ -108,9 +113,15 @@ describe('run history', () => {
         });
       }
       expect(await getJob('queued-without-lease')).toMatchObject({ state: 'queued' });
+      expect(await getJob(invalidToken.id)).toMatchObject({ state: 'leased' });
+      expect((await getJob(invalidToken.id))?.leaseToken).toBeUndefined();
+      expect(await getJob(staleQueuedToken.id)).toMatchObject({ state: 'queued' });
+      expect((await getJob(staleQueuedToken.id))?.leaseToken).toBeUndefined();
       expect((await nextCaptureJob())?.id).toBe('lease-missing');
     } finally {
       for (const job of jobs) await deleteJob(job.id);
+      await deleteJob(invalidToken.id);
+      await deleteJob(staleQueuedToken.id);
     }
   });
 
@@ -171,6 +182,26 @@ describe('run history', () => {
     } finally { await deleteJob(job.id); }
   });
 
+  it('uses one eligibility table for lease backoff, recovery, and navigation deferral', () => {
+    const now = Date.now();
+    const job: CaptureJob = {
+      id: 'eligibility:chatgpt', runId: 'eligibility', provider: 'chatgpt', tabId: 1,
+      state: 'queued', createdAt: now, attempts: 1,
+      domMarkdown: 'A retained report used to verify queue eligibility.', domCitations: [],
+    };
+    const providerRun = {
+      provider: 'chatgpt' as const, tabId: 1, status: 'capturing' as const,
+      submittedQuery: 'query', appendString: '', attempts: 0, degraded: false, adapterVersion: 'test',
+    };
+    expect(captureJobIsEligible({ ...job, state: 'leased', leasedAt: now }, providerRun, now)).toBe(false);
+    expect(captureJobIsEligible({ ...job, state: 'leased', leasedAt: now - 60_001 }, providerRun, now)).toBe(true);
+    expect(captureJobIsEligible(job, { ...providerRun, captureRecoveryPending: true }, now)).toBe(false);
+    expect(captureJobIsEligible({ ...job, deferredForNavigation: true, deferredAt: now }, providerRun, now)).toBe(false);
+    expect(captureJobIsEligible(
+      { ...job, deferredForNavigation: true, deferredAt: now }, { ...providerRun, status: 'abandoned' }, now,
+    )).toBe(true);
+  });
+
   it('continues queue scans across equal timestamps without loading all jobs', async () => {
     const createdAt = Date.now();
     const jobs: CaptureJob[] = ['cursor-a', 'cursor-b'].map((id, index) => ({
@@ -214,6 +245,54 @@ describe('run history', () => {
       getSpy.mockRestore();
       await deleteJob(job.id);
     }
+  });
+
+  it('lists paused jobs through index keys without opening value cursors', async () => {
+    const runId = `paused-keys-${crypto.randomUUID()}`;
+    const id = `${runId}:chatgpt`;
+    const getAllKeysSpy = vi.spyOn(IDBIndex.prototype, 'getAllKeys');
+    const openCursorSpy = vi.spyOn(IDBIndex.prototype, 'openCursor');
+    try {
+      await putJob({
+        id, runId, provider: 'chatgpt', tabId: 1, state: 'paused', createdAt: Date.now(), attempts: 3,
+        domMarkdown: 'A retained paused report discovered through its index key.', domCitations: [],
+      });
+      expect(await listPausedCaptureJobIds()).toContain(id);
+      expect(getAllKeysSpy).toHaveBeenCalled();
+      expect(openCursorSpy).not.toHaveBeenCalled();
+    } finally {
+      getAllKeysSpy.mockRestore();
+      openCursorSpy.mockRestore();
+      await deleteJob(id);
+    }
+  });
+
+  it('classifies saved recovery through its capture key without loading the report body', async () => {
+    const runId = `capture-key-${crypto.randomUUID()}`;
+    const id = `${runId}:chatgpt`;
+    const stored: Run = {
+      recordVersion: 2, id: runId, query: 'query', createdAt: Date.now(), windowId: 1,
+      status: 'complete', slug: 'query', reportFolder: 'query-capture-key',
+      downloadFolder: 'deep-research/query-capture-key',
+      providerRuns: {
+        chatgpt: {
+          provider: 'chatgpt', tabId: 1, status: 'failed', submittedQuery: 'query', appendString: '',
+          attempts: 0, degraded: false, adapterVersion: 'test', completedAt: Date.now(),
+        },
+      },
+    };
+    await putRun(stored);
+    await putCapture(id, { ...capture });
+    const originalGet = IDBObjectStore.prototype.get;
+    let captureReads = 0;
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (this: IDBObjectStore, key) {
+      if (this.name === 'captures' && key === id) captureReads += 1;
+      return originalGet.call(this, key);
+    });
+    try {
+      await expect(inspectCaptureRecovery(id, runId, 'chatgpt')).resolves.toMatchObject({ kind: 'saved_capture' });
+      expect(captureReads).toBe(0);
+    } finally { getSpy.mockRestore(); }
   });
 
   it('rejects obsolete run records instead of migrating them on read', async () => {

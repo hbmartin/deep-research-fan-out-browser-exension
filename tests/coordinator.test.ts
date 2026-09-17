@@ -713,6 +713,48 @@ describe('coordinator run guards', () => {
     }
   });
 
+  it('runs at most two capture tasks through slow artifact saves at once', async () => {
+    const storedRuns = [
+      run({ chatgpt: provider('chatgpt', 945, 'capturing') }),
+      run({ claude: provider('claude', 946, 'capturing') }),
+      run({ gemini: provider('gemini', 947, 'capturing') }),
+    ];
+    const jobs = storedRuns.map((stored, index) => {
+      const providerId = Object.keys(stored.providerRuns)[0] as ProviderId;
+      return {
+        id: `${stored.id}:${providerId}`, runId: stored.id, provider: providerId,
+        tabId: 945 + index, state: 'queued' as const, createdAt: index + 1,
+        attempts: 0, tabUnavailable: true,
+        domMarkdown: `A verified report ${index} waits behind the bounded capture dispatcher.`, domCitations: [],
+      };
+    });
+    const releases: Array<() => void> = [];
+    platform.downloadText.mockImplementation(() => new Promise<number>((resolve) => {
+      const downloadId = 200 + releases.length;
+      releases.push(() => resolve(downloadId));
+    }));
+    try {
+      for (const stored of storedRuns) await putRun(stored);
+      for (const job of jobs) await putJob(job);
+      const drain = coordinatorTestHooks.processCaptureQueue();
+      await vi.waitFor(() => expect(releases).toHaveLength(2));
+      await Promise.resolve();
+      expect(releases).toHaveLength(2);
+      releases[0]!();
+      await vi.waitFor(() => expect(releases).toHaveLength(3));
+      releases[1]!();
+      releases[2]!();
+      await drain;
+      for (const stored of storedRuns) {
+        expect((await getRun(stored.id))?.status).toBe('complete');
+      }
+    } finally {
+      for (const release of releases) release();
+      await coordinatorTestHooks.waitForCaptureQueueIdle();
+      for (const job of jobs) await deleteJob(job.id);
+    }
+  });
+
   it('releases capture locks during slow copy work and rejects the superseded lease commit', async () => {
     const stored = run({
       chatgpt: provider('chatgpt', 943, 'capturing'),
@@ -764,6 +806,12 @@ describe('coordinator run guards', () => {
 
       releaseCopy();
       await drain;
+      const copyRequests = platform.sendTabEvent.mock.calls.filter(([, event]) => (
+        event as { type?: string }
+      ).type === 'capture:copy-now');
+      expect(copyRequests).toHaveLength(1);
+      expect(browser.tabs.update).not.toHaveBeenCalledWith(943, { active: true });
+      expect(clipboard).toBe('private clipboard');
       expect(await getCapture(id)).toMatchObject({ captureMethod: 'dom_only', rawMarkdown: domReport });
       expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('complete');
     } finally {
@@ -831,6 +879,30 @@ describe('coordinator run guards', () => {
     expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('interrupted');
     expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/FAILED-chatgpt.md`, expect.any(String));
     expect(browser.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'runs:changed' }));
+  });
+
+  it('does not bypass fresh-lease backoff when a failed task finalizer rescans the queue', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 9202, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 9202, state: 'queued',
+      createdAt: Date.now(), attempts: 0, tabUnavailable: true, domMarkdown: 'short', domCitations: [],
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try { await coordinatorTestHooks.processCaptureQueue(); }
+    finally { consoleError.mockRestore(); }
+    expect(await getJob(id)).toMatchObject({
+      state: 'leased', attempts: 1, leaseToken: undefined, leasedAt: expect.any(Number),
+    });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt?.status).toBe('capturing');
+    await deleteJob(id);
+    const cleanup = (await getRun(stored.id))!;
+    cleanup.providerRuns.chatgpt!.status = 'abandoned';
+    cleanup.providerRuns.chatgpt!.completedAt = Date.now();
+    cleanup.status = 'complete';
+    cleanup.completedAt = Date.now();
+    await putRun(cleanup);
   });
 
   it('interrupts an invalid legacy binding instead of rebinding it during reconciliation', async () => {
@@ -1001,7 +1073,7 @@ describe('coordinator run guards', () => {
       }, {})).resolves.toEqual({ ok: true });
       await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
       expect((await getRun(stored.id))?.providerRuns.gemini).toMatchObject({
-        status: 'capturing', captureRecoveryInProgress: true,
+        status: 'capturing', captureRecoveryInProgress: true, captureRecoveryReason: 'storage_failure',
       });
       expect(await getJob(id)).toMatchObject({ state: 'leased', leaseToken: expect.any(String) });
 
@@ -1010,6 +1082,45 @@ describe('coordinator run guards', () => {
       expect((await getRun(stored.id))?.providerRuns.gemini).toMatchObject({
         status: 'complete', captureRecoveryInProgress: undefined, captureId: id,
       });
+    } finally {
+      releaseFetch();
+      await coordinatorTestHooks.waitForCaptureQueueIdle();
+      await deleteJob(id);
+    }
+  });
+
+  it('broadcasts a recovered capturing transition before slow report preparation finishes', async () => {
+    const stored = run({ gemini: provider('gemini', 90917, 'researching') });
+    const id = `${stored.id}:gemini`;
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    const fetchSpy = vi.fn(async () => {
+      await fetchGate;
+      return { url: 'https://canonical.test/prepared' };
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    try {
+      await putRun(stored);
+      await putJob({
+        id, runId: stored.id, provider: 'gemini', tabId: 90917,
+        state: 'queued', createdAt: Date.now(), attempts: 0, tabUnavailable: true,
+        domMarkdown: 'A verified report remains visible while its citation metadata is prepared.',
+        domCitations: [{
+          url: 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/prepared',
+          contextBefore: 'citation', contextAfter: 'metadata', domOrder: 0,
+        }],
+      });
+      const drain = coordinatorTestHooks.processCaptureQueue();
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+      const broadcasts = vi.mocked(browser.runtime.sendMessage).mock.calls
+        .filter(([message]) => (message as { type?: string }).type === 'runs:changed');
+      expect(broadcasts.some(([message]) => {
+        const changed = message as unknown as { runs: Run[] };
+        return changed.runs.some((candidate) => candidate.id === stored.id
+          && candidate.providerRuns.gemini?.status === 'capturing');
+      })).toBe(true);
+      releaseFetch();
+      await drain;
     } finally {
       releaseFetch();
       await coordinatorTestHooks.waitForCaptureQueueIdle();
@@ -1152,8 +1263,44 @@ describe('coordinator run guards', () => {
     finally { putSpy.mockRestore(); consoleError.mockRestore(); }
     expect(await getJob(id)).toMatchObject({ state: 'paused' });
     expect((await getRun(stored.id))?.providerRuns.claude?.status).toBe('capturing');
+    expect(platform.notify).toHaveBeenCalledWith(
+      `attention:${stored.id}:claude`, expect.stringContaining('retry'), expect.any(String),
+    );
     await coordinatorTestHooks.reconcileRuns();
     expect((await getRun(stored.id))?.providerRuns.claude).toMatchObject({ status: 'failed', captureRecoveryPending: true });
+    expect(platform.sendTabEvent).toHaveBeenCalledWith(9092, { type: 'content:stop', runId: stored.id });
+    expect(platform.downloadText).toHaveBeenCalledWith(`${stored.downloadFolder}/FAILED-claude.md`, expect.any(String));
+  });
+
+  it('marks and notifies a storage failure when pausing the retained job cannot be persisted', async () => {
+    const stored = run({ chatgpt: provider('chatgpt', 90922, 'capturing') });
+    const id = `${stored.id}:chatgpt`;
+    await putRun(stored);
+    await putJob({
+      id, runId: stored.id, provider: 'chatgpt', tabId: 90922, state: 'queued',
+      createdAt: Date.now(), attempts: MAX_CAPTURE_ATTEMPTS - 1, tabUnavailable: true,
+      domMarkdown: 'A verified report remains leased when its paused state cannot be persisted.', domCitations: [],
+    });
+    const originalPut = IDBObjectStore.prototype.put;
+    const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
+      if (this.name === 'captures'
+        || (this.name === 'jobs' && (value as CaptureJob).id === id && (value as CaptureJob).state === 'paused')) {
+        throw new DOMException('storage full', 'QuotaExceededError');
+      }
+      return originalPut.call(this, value, key);
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try { await coordinatorTestHooks.processCaptureQueue(); }
+    finally { putSpy.mockRestore(); consoleError.mockRestore(); }
+
+    expect(await getJob(id)).toMatchObject({ state: 'leased', leaseToken: expect.any(String) });
+    expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+      status: 'failed', captureRecoveryPending: true, captureRecoveryReason: 'storage_failure',
+    });
+    expect(platform.notify).toHaveBeenCalledWith(
+      `attention:${stored.id}:chatgpt`, expect.stringContaining('retry'), expect.any(String),
+    );
+    await deleteJob(id);
   });
 
   it('repairs a nonterminal paused job in the same sweep despite recovery flags', async () => {
@@ -1199,7 +1346,7 @@ describe('coordinator run guards', () => {
 
       expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
         status: 'failed', captureRecoveryPending: true, captureReviewPending: undefined,
-        captureRecoveryInProgress: undefined,
+        captureRecoveryInProgress: undefined, captureRecoveryReason: 'storage_failure',
       });
     } finally { await deleteJob(id); }
   });
@@ -1229,6 +1376,7 @@ describe('coordinator run guards', () => {
   it('offers Retry for an unflagged paused job owned by an already-terminal provider', async () => {
     const chatgpt = provider('chatgpt', 90927, 'abandoned');
     chatgpt.completedAt = Date.now();
+    chatgpt.statusDetail = 'Ended by the user.';
     const stored = run({ chatgpt }, 'complete');
     stored.completedAt = Date.now();
     const id = `${stored.id}:chatgpt`;
@@ -1244,6 +1392,14 @@ describe('coordinator run guards', () => {
 
       expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
         status: 'abandoned', captureRecoveryPending: true, captureReviewPending: undefined,
+      });
+      await expect(coordinatorTestHooks.handleRequest({
+        type: 'provider:retry-capture', runId: stored.id, provider: 'chatgpt',
+      }, {})).resolves.toEqual({ ok: true });
+      await coordinatorTestHooks.waitForCaptureQueueIdle();
+      expect((await getRun(stored.id))?.providerRuns.chatgpt).toMatchObject({
+        status: 'abandoned', statusDetail: 'Ended by the user.', captureId: id,
+        captureRecoveryInProgress: undefined,
       });
     } finally { await deleteJob(id); }
   });
@@ -1318,14 +1474,20 @@ describe('coordinator run guards', () => {
       });
       tabsGet.mockResolvedValue({ id: 90921, url: 'https://chatgpt.com/c/recovery' } as Browser.tabs.Tab);
       const originalPut = IDBObjectStore.prototype.put;
+      let failedJobWrites = 0;
       const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
         if (this.name === 'jobs' && (value as CaptureJob).id === id) {
+          failedJobWrites += 1;
           throw new DOMException('storage full', 'QuotaExceededError');
         }
         return originalPut.call(this, value, key);
       });
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-      try { await coordinatorTestHooks.reconcileRuns(); }
+      try {
+        await coordinatorTestHooks.reconcileRuns();
+        await coordinatorTestHooks.waitForCaptureQueueIdle();
+        expect(failedJobWrites).toBeGreaterThan(0);
+      }
       finally { putSpy.mockRestore(); consoleError.mockRestore(); }
       expect(await getRun(terminal.id)).toMatchObject({ status: 'complete', completedAt: expect.any(Number) });
     } finally { await deleteJob(id); }
@@ -2250,6 +2412,7 @@ describe('coordinator run guards', () => {
 
   it('protects a saved capture from stale Discard state and links it during normalization', async () => {
     const chatgpt = provider('chatgpt', 93152, 'failed');
+    chatgpt.statusDetail = CAPTURE_STORAGE_FAILURE_DETAIL;
     chatgpt.captureRecoveryPending = true;
     chatgpt.captureReviewPending = true;
     const stored = run({ chatgpt }, 'complete');

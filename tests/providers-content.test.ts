@@ -506,7 +506,7 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => document.dispatchEvent(new Event('copy')));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review', expiresAt: Date.now() + 60_000 }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
   });
 
@@ -515,8 +515,30 @@ describe('provider content-script recovery', () => {
     await resume('researching');
     const button = document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!;
     button.addEventListener('click', () => button.setAttribute('title', 'Response copied to the clipboard successfully'));
-    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review' }))
+    await expect(listener({ type: 'capture:copy-now', jobId: 'review-run:chatgpt', conversationKey: 'https://chatgpt.com/c/review', expiresAt: Date.now() + 60_000 }))
       .resolves.toEqual({ ok: true, copyConfirmed: true });
+  });
+
+  it('rejects an expired Copy request without activating the provider control', async () => {
+    answer();
+    await resume('researching');
+    const click = vi.fn();
+    document.querySelector<HTMLButtonElement>('[aria-label="Copy response"]')!.addEventListener('click', click);
+    await expect(listener({
+      type: 'capture:copy-now', jobId: 'review-run:chatgpt',
+      conversationKey: 'https://chatgpt.com/c/review', expiresAt: Date.now(),
+    })).rejects.toThrow('expired');
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Copy request after provider monitoring stops', async () => {
+    answer();
+    await resume('researching');
+    await listener({ type: 'content:stop', runId: 'review-run' });
+    await expect(listener({
+      type: 'capture:copy-now', jobId: 'review-run:chatgpt',
+      conversationKey: 'https://chatgpt.com/c/review', expiresAt: Date.now() + 60_000,
+    })).rejects.toThrow('stopped');
   });
 
   it('accepts a non-empty short DOM response only with owned Copy evidence', async () => {
@@ -1071,7 +1093,7 @@ describe('provider reliability regressions', () => {
     answer();
     await resume('researching');
     document.querySelector('button')!.addEventListener('click', () => { document.querySelector('button')!.innerHTML = '<svg><path d="M0 0"></path></svg>'; });
-    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review',expiresAt:Date.now()+60_000});
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
   });
@@ -1095,14 +1117,14 @@ describe('verified ChatGPT Copy feedback', () => {
       }
     });
     await resume('researching');
-    await expect(listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'})).resolves.toEqual({ok:true,copyConfirmed:true});
+    await expect(listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review',expiresAt:Date.now()+60_000})).resolves.toEqual({ok:true,copyConfirmed:true});
   });
   it('does not accept a success icon that was already present before the click', async () => {
     answer();
     const button = document.querySelector('button')!;
     button.innerHTML = '<svg><use href="#lightweight-conversation-check"></use></svg>';
     await resume('researching');
-    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
+    const result = listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review',expiresAt:Date.now()+60_000});
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});
   });
@@ -1193,7 +1215,7 @@ describe('capture cancellation and setup exceptions', () => {
   it('does not use an unrelated asynchronous copy event as provider confirmation', async () => {
     answer();
     await resume('researching');
-    const result=listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review'});
+    const result=listener({type:'capture:copy-now',jobId:'review-run:chatgpt',conversationKey:'https://chatgpt.com/c/review',expiresAt:Date.now()+60_000});
     document.dispatchEvent(new Event('copy'));
     await vi.advanceTimersByTimeAsync(600);
     await expect(result).resolves.toEqual({ok:true,copyConfirmed:false});

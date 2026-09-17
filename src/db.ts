@@ -79,6 +79,7 @@ function validProviderRun(value: unknown, provider: ProviderId): value is Provid
     && (value.detachedSetupStatus === undefined || ['opening', 'awaiting_ready', 'setting_mode'].includes(String(value.detachedSetupStatus)))
     && (value.captureRecoveryPending === undefined || typeof value.captureRecoveryPending === 'boolean')
     && (value.captureRecoveryInProgress === undefined || typeof value.captureRecoveryInProgress === 'boolean')
+    && (value.captureRecoveryReason === undefined || value.captureRecoveryReason === 'storage_failure')
     && (value.captureReviewPending === undefined || typeof value.captureReviewPending === 'boolean')
     && validSaveReceipt(value.saveReceipt);
 }
@@ -101,7 +102,7 @@ function validCaptureJob(value: unknown): value is CaptureJob {
   if (!validCaptureJobIdentity(value)) return false;
   return Array.isArray(value.domCitations)
     && (value.state === 'leased' ? finiteNumber(value.leasedAt) : optionalNumber(value.leasedAt))
-    && optionalString(value.leaseToken)
+    && (value.state === 'leased' ? optionalString(value.leaseToken) : value.leaseToken === undefined)
     && optionalNumber(value.orphanedAt)
     && optionalNumber(value.deferredAt)
     && optionalString(value.title)
@@ -133,9 +134,14 @@ function normalizeCaptureJobRecord(value: unknown, expectedId?: string): Capture
   if (repaired.state === 'leased' && !finiteNumber(repaired.leasedAt)) {
     repaired.state = 'queued';
     delete repaired.leasedAt;
+    delete repaired.leaseToken;
     changed = true;
   } else if (repaired.state !== 'leased' && !optionalNumber(repaired.leasedAt)) {
     delete repaired.leasedAt;
+    changed = true;
+  }
+  if (!optionalString(repaired.leaseToken) || (repaired.state !== 'leased' && repaired.leaseToken !== undefined)) {
+    delete repaired.leaseToken;
     changed = true;
   }
   for (const key of ['orphanedAt', 'deferredAt'] as const) {
@@ -206,6 +212,35 @@ function legacyCaptureRevision(capture: Capture): string {
 function captureContentSignature(capture: Capture): string {
   const { revision: _revision, ...content } = capture;
   return JSON.stringify(content);
+}
+
+function assignCaptureRevision(capture: Capture, existing: Capture | undefined): Capture {
+  capture.revision = existing && captureContentSignature(existing) === captureContentSignature(capture)
+    ? existing.revision ?? legacyCaptureRevision(existing)
+    : crypto.randomUUID();
+  return capture;
+}
+
+export function orphanCaptureJob(job: CaptureJob, now = Date.now()): CaptureJob {
+  job.state = 'orphaned';
+  job.orphanedAt ??= now;
+  job.leasedAt = undefined;
+  job.leaseToken = undefined;
+  return job;
+}
+
+export function clearCaptureRecovery(providerRun: ProviderRun): void {
+  providerRun.captureReviewPending = undefined;
+  providerRun.captureRecoveryPending = undefined;
+  providerRun.captureRecoveryInProgress = undefined;
+  providerRun.captureRecoveryReason = undefined;
+}
+
+function isStorageFailureRecovery(providerRun: ProviderRun): boolean {
+  return providerRun.captureRecoveryReason === 'storage_failure'
+    || (providerRun.captureRecoveryReason === undefined
+      && providerRun.status === 'failed'
+      && providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL);
 }
 
 function createRunStore(database: IDBPDatabase<ResearchDb>): void {
@@ -284,10 +319,7 @@ export async function putCapture(id: string, capture: Capture): Promise<void> {
   const database = await db();
   const transaction = database.transaction('captures', 'readwrite');
   const existing = await transaction.store.get(id);
-  capture.revision = existing && captureContentSignature(existing) === captureContentSignature(capture)
-    ? existing.revision ?? legacyCaptureRevision(existing)
-    : crypto.randomUUID();
-  await transaction.store.put(capture, id);
+  await transaction.store.put(assignCaptureRevision(capture, existing), id);
   await transaction.done;
 }
 export async function getCapture(id?: string): Promise<Capture | undefined> {
@@ -321,16 +353,22 @@ export function isUsableCaptureJobReport(job: CaptureJob): boolean {
   return dom.length >= 40 || Boolean(job.copyControlObserved && dom);
 }
 
-export type CaptureRecoveryInspection =
+type CaptureRecoveryState =
   | { kind: 'missing_owner'; id: string }
-  | { kind: 'saved_capture'; id: string; run: Run; capture: Capture }
+  | { kind: 'saved_capture'; id: string; run: Run }
   | { kind: 'usable_job'; id: string; run: Run; job: CaptureJob }
   | { kind: 'review_required'; id: string; run: Run; retainedReport: string }
   | { kind: 'unavailable'; id: string; run: Run; jobExists: boolean };
 
-export type CaptureRecoveryNormalization = CaptureRecoveryInspection & {
+export type CaptureRecoveryInspection = CaptureRecoveryState & {
+  normalizationNeeded: boolean;
+};
+
+export type CaptureRecoveryNormalization = CaptureRecoveryState & {
+  normalizationNeeded: false;
   changed: boolean;
   resumeRecommended?: boolean;
+  settlementRequired?: boolean;
 };
 
 export type CaptureRecoveryScheduleResult =
@@ -354,12 +392,12 @@ function classifyCaptureRecovery(
   stored: Run | undefined,
   provider: ProviderId,
   rawJob: unknown,
-  capture: Capture | undefined,
-): CaptureRecoveryInspection {
+  captureExists: boolean,
+): CaptureRecoveryState {
   const run = stored && validRunRecord(stored) ? stored : undefined;
   if (stored && !run) warnInvalidRun(stored);
   if (!run?.providerRuns[provider]) return { kind: 'missing_owner', id };
-  if (capture) return { kind: 'saved_capture', id, run, capture };
+  if (captureExists) return { kind: 'saved_capture', id, run };
   const inspection = normalizeCaptureJobRecord(rawJob, id);
   if (inspection.job && isUsableCaptureJobReport(inspection.job)) {
     return { kind: 'usable_job', id, run, job: inspection.job };
@@ -370,19 +408,110 @@ function classifyCaptureRecovery(
   return { kind: 'unavailable', id, run, jobExists: inspection.exists };
 }
 
+interface CaptureRecoveryPlan {
+  recovery: CaptureRecoveryState;
+  changed: boolean;
+  runChanged: boolean;
+  jobToStore?: CaptureJob;
+  deleteStoredJob: boolean;
+  resumeRecommended: boolean;
+  settlementRequired: boolean;
+}
+
+function planCaptureRecoveryNormalization(
+  input: CaptureRecoveryState,
+  provider: ProviderId,
+  now = Date.now(),
+): CaptureRecoveryPlan {
+  const recovery = structuredClone(input);
+  if (recovery.kind === 'missing_owner') {
+    return {
+      recovery, changed: false, runChanged: false, deleteStoredJob: false,
+      resumeRecommended: false, settlementRequired: false,
+    };
+  }
+  const run = recovery.run;
+  const providerRun = run.providerRuns[provider]!;
+  const before = JSON.stringify(run);
+  if (recovery.kind === 'saved_capture') {
+    if (isStorageFailureRecovery(providerRun)) providerRun.captureRecoveryReason = 'storage_failure';
+    const runChanged = JSON.stringify(run) !== before;
+    return {
+      recovery, changed: runChanged, runChanged, deleteStoredJob: false,
+      resumeRecommended: false, settlementRequired: false,
+    };
+  }
+  let jobToStore: CaptureJob | undefined;
+  let deleteStoredJob = false;
+  let resumeRecommended = false;
+  let settlementRequired = false;
+  if (recovery.kind === 'usable_job') {
+    const job = recovery.job;
+    providerRun.captureReviewPending = undefined;
+    if (job.state === 'paused') {
+      providerRun.captureRecoveryInProgress = undefined;
+      providerRun.captureRecoveryPending = true;
+      if (!isTerminalProviderStatus(providerRun.status)) {
+        providerRun.status = 'failed';
+        providerRun.statusDetail = CAPTURE_STORAGE_FAILURE_DETAIL;
+        providerRun.captureRecoveryReason = 'storage_failure';
+        providerRun.completedAt ??= now;
+        run.status = deriveRunStatus(run);
+        settlementRequired = true;
+      } else if (isStorageFailureRecovery(providerRun)) {
+        providerRun.captureRecoveryReason = 'storage_failure';
+      } else {
+        providerRun.captureRecoveryReason = undefined;
+      }
+    } else if (providerRun.captureRecoveryPending && !providerRun.captureRecoveryInProgress
+      && isTerminalProviderStatus(providerRun.status)) {
+      job.state = 'paused';
+      job.leasedAt = undefined;
+      job.leaseToken = undefined;
+      jobToStore = job;
+      if (isStorageFailureRecovery(providerRun)) providerRun.captureRecoveryReason = 'storage_failure';
+    } else if (!providerRun.captureRecoveryInProgress) {
+      providerRun.captureRecoveryPending = undefined;
+      providerRun.captureRecoveryReason = undefined;
+    }
+  } else if (recovery.kind === 'review_required') {
+    providerRun.captureReviewPending = true;
+    providerRun.captureRecoveryPending = undefined;
+    providerRun.captureRecoveryInProgress = undefined;
+    if (isStorageFailureRecovery(providerRun)) providerRun.captureRecoveryReason = 'storage_failure';
+  } else {
+    resumeRecommended = isStorageFailureRecovery(providerRun)
+      && Boolean(providerRun.captureReviewPending || providerRun.captureRecoveryPending
+        || providerRun.captureRecoveryInProgress);
+    clearCaptureRecovery(providerRun);
+    if (providerRun.status === 'failed') {
+      providerRun.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
+    }
+    deleteStoredJob = recovery.jobExists;
+  }
+  const runChanged = JSON.stringify(run) !== before;
+  const changed = runChanged || Boolean(jobToStore) || deleteStoredJob;
+  return {
+    recovery, changed, runChanged, jobToStore, deleteStoredJob,
+    resumeRecommended, settlementRequired,
+  };
+}
+
 export async function inspectCaptureRecovery(
   id: string,
   runId: RunId,
   provider: ProviderId,
 ): Promise<CaptureRecoveryInspection> {
   const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readonly');
-  const [stored, rawJob, capture] = await Promise.all([
+  const [stored, rawJob, captureKey] = await Promise.all([
     transaction.objectStore('runs').get(runId),
     transaction.objectStore('jobs').get(id),
-    transaction.objectStore('captures').get(id),
+    transaction.objectStore('captures').getKey(id),
   ]);
   await transaction.done;
-  return classifyCaptureRecovery(id, stored, provider, rawJob, capture);
+  const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, captureKey !== undefined);
+  const plan = planCaptureRecoveryNormalization(recovery, provider);
+  return { ...recovery, normalizationNeeded: plan.changed };
 }
 
 export class CaptureJobReviewRequiredError extends Error {
@@ -442,25 +571,22 @@ export async function discardBlockedCaptureJob(
 ): Promise<DiscardBlockedCaptureResult> {
   const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
   try {
-    const [rawJob, capture, stored] = await Promise.all([
+    const [rawJob, captureKey, stored] = await Promise.all([
       transaction.objectStore('jobs').get(id),
-      transaction.objectStore('captures').get(id),
+      transaction.objectStore('captures').getKey(id),
       transaction.objectStore('runs').get(runId),
     ]);
-    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, capture);
+    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, captureKey !== undefined);
     if (recovery.kind !== 'review_required') {
       await transaction.done;
       return { outcome: 'state_changed' };
     }
     const run = recovery.run;
     const providerRun = run.providerRuns[provider]!;
-    const resumeRecommended = providerRun.status === 'failed'
-      && providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL
+    const resumeRecommended = isStorageFailureRecovery(providerRun)
       && Boolean(providerRun.captureReviewPending || providerRun.captureRecoveryPending
         || providerRun.captureRecoveryInProgress);
-    providerRun.captureReviewPending = undefined;
-    providerRun.captureRecoveryPending = undefined;
-    providerRun.captureRecoveryInProgress = undefined;
+    clearCaptureRecovery(providerRun);
     if (providerRun.status === 'failed') {
       providerRun.statusDetail = 'The blocked retained report was discarded. Save again can save the failed run details.';
     }
@@ -483,72 +609,25 @@ export async function normalizeCaptureRecovery(
 ): Promise<CaptureRecoveryNormalization> {
   const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
   try {
-    const [rawJob, capture, stored] = await Promise.all([
+    const [rawJob, captureKey, stored] = await Promise.all([
       transaction.objectStore('jobs').get(id),
-      transaction.objectStore('captures').get(id),
+      transaction.objectStore('captures').getKey(id),
       transaction.objectStore('runs').get(runId),
     ]);
-    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, capture);
-    if (recovery.kind === 'missing_owner' || recovery.kind === 'saved_capture') {
-      await transaction.done;
-      return { ...recovery, changed: false };
+    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, captureKey !== undefined);
+    const plan = planCaptureRecoveryNormalization(recovery, provider);
+    if (plan.jobToStore) await transaction.objectStore('jobs').put(plan.jobToStore);
+    if (plan.deleteStoredJob) await transaction.objectStore('jobs').delete(id);
+    if (plan.runChanged && plan.recovery.kind !== 'missing_owner') {
+      await transaction.objectStore('runs').put(plan.recovery.run);
     }
-    const run = recovery.run;
-    const providerRun = run.providerRuns[provider]!;
-    const before = JSON.stringify(run);
-    let resumeRecommended = false;
-    let jobToStore: CaptureJob | undefined;
-    let deleteStoredJob = false;
-    if (recovery.kind === 'usable_job') {
-      const job = recovery.job;
-      providerRun.captureReviewPending = undefined;
-      if (job.state === 'paused') {
-        providerRun.captureRecoveryInProgress = undefined;
-        providerRun.captureRecoveryPending = true;
-        if (!isTerminalProviderStatus(providerRun.status)) {
-          providerRun.status = 'failed';
-          providerRun.statusDetail = CAPTURE_STORAGE_FAILURE_DETAIL;
-          providerRun.completedAt ??= Date.now();
-          run.status = deriveRunStatus(run);
-        }
-      } else if (providerRun.captureRecoveryPending && !providerRun.captureRecoveryInProgress
-        && isTerminalProviderStatus(providerRun.status)) {
-        job.state = 'paused';
-        job.leasedAt = undefined;
-        job.leaseToken = undefined;
-        jobToStore = job;
-      } else if (!providerRun.captureRecoveryInProgress) {
-        providerRun.captureRecoveryPending = undefined;
-      }
-    } else if (recovery.kind === 'review_required') {
-      providerRun.captureReviewPending = true;
-      providerRun.captureRecoveryPending = undefined;
-      providerRun.captureRecoveryInProgress = undefined;
-    } else {
-      resumeRecommended = providerRun.status === 'failed'
-        && providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL
-        && Boolean(providerRun.captureReviewPending || providerRun.captureRecoveryPending
-          || providerRun.captureRecoveryInProgress);
-      providerRun.captureReviewPending = undefined;
-      providerRun.captureRecoveryPending = undefined;
-      providerRun.captureRecoveryInProgress = undefined;
-      if (providerRun.status === 'failed') {
-        providerRun.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
-      }
-      deleteStoredJob = recovery.jobExists;
-    }
-    const runChanged = JSON.stringify(run) !== before;
-    if (jobToStore) await transaction.objectStore('jobs').put(jobToStore);
-    if (deleteStoredJob) await transaction.objectStore('jobs').delete(id);
-    if (runChanged) await transaction.objectStore('runs').put(run);
     await transaction.done;
-    const normalized = recovery.kind === 'usable_job' && jobToStore
-      ? { ...recovery, job: jobToStore }
-      : recovery;
     return {
-      ...normalized,
-      changed: runChanged || Boolean(jobToStore) || deleteStoredJob,
-      ...(resumeRecommended ? { resumeRecommended } : {}),
+      ...plan.recovery,
+      normalizationNeeded: false,
+      changed: plan.changed,
+      ...(plan.resumeRecommended ? { resumeRecommended: true } : {}),
+      ...(plan.settlementRequired ? { settlementRequired: true } : {}),
     };
   } catch (error) {
     try { transaction.abort(); } catch { /* The transaction may already have aborted. */ }
@@ -565,20 +644,16 @@ export async function scheduleCaptureRecovery(
 ): Promise<CaptureRecoveryScheduleResult> {
   const transaction = (await db()).transaction(['runs', 'jobs', 'captures'], 'readwrite');
   try {
-    const [rawJob, capture, stored] = await Promise.all([
+    const [rawJob, captureKey, stored] = await Promise.all([
       transaction.objectStore('jobs').get(id),
-      transaction.objectStore('captures').get(id),
+      transaction.objectStore('captures').getKey(id),
       transaction.objectStore('runs').get(runId),
     ]);
-    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, capture);
+    const recovery = classifyCaptureRecovery(id, stored, provider, rawJob, captureKey !== undefined);
     if (recovery.kind === 'missing_owner') {
       const inspection = normalizeCaptureJobRecord(rawJob, id);
       if (inspection.job) {
-        inspection.job.state = 'orphaned';
-        inspection.job.orphanedAt ??= Date.now();
-        inspection.job.leasedAt = undefined;
-        inspection.job.leaseToken = undefined;
-        await transaction.objectStore('jobs').put(inspection.job);
+        await transaction.objectStore('jobs').put(orphanCaptureJob(inspection.job));
       }
       await transaction.done;
       return { outcome: 'missing_owner' };
@@ -589,6 +664,7 @@ export async function scheduleCaptureRecovery(
       providerRun.captureReviewPending = undefined;
       providerRun.captureRecoveryPending = undefined;
       providerRun.captureRecoveryInProgress = true;
+      if (isStorageFailureRecovery(providerRun)) providerRun.captureRecoveryReason = 'storage_failure';
       await transaction.objectStore('runs').put(run);
       await transaction.done;
       return { outcome: 'scheduled', run };
@@ -597,18 +673,16 @@ export async function scheduleCaptureRecovery(
       providerRun.captureReviewPending = true;
       providerRun.captureRecoveryPending = undefined;
       providerRun.captureRecoveryInProgress = undefined;
+      if (isStorageFailureRecovery(providerRun)) providerRun.captureRecoveryReason = 'storage_failure';
       await transaction.objectStore('runs').put(run);
       await transaction.done;
       return { outcome: 'review_required', run };
     }
     if (recovery.kind === 'unavailable') {
-      const resumeRecommended = providerRun.status === 'failed'
-        && providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL
+      const resumeRecommended = isStorageFailureRecovery(providerRun)
         && Boolean(providerRun.captureReviewPending || providerRun.captureRecoveryPending
           || providerRun.captureRecoveryInProgress);
-      providerRun.captureReviewPending = undefined;
-      providerRun.captureRecoveryPending = undefined;
-      providerRun.captureRecoveryInProgress = undefined;
+      clearCaptureRecovery(providerRun);
       if (providerRun.status === 'failed') {
         providerRun.statusDetail = 'No retained report is available for retry. Save again can save the failed run details.';
       }
@@ -627,13 +701,14 @@ export async function scheduleCaptureRecovery(
     providerRun.captureReviewPending = undefined;
     providerRun.captureRecoveryPending = undefined;
     providerRun.captureRecoveryInProgress = true;
-    if (providerRun.status === 'failed' && providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL) {
+    if (isStorageFailureRecovery(providerRun)) {
+      providerRun.captureRecoveryReason = 'storage_failure';
       providerRun.status = 'capturing';
       providerRun.completedAt = undefined;
       run.completedAt = undefined;
       run.status = deriveRunStatus(run);
+      providerRun.statusDetail = 'Retrying retained report.';
     }
-    providerRun.statusDetail = 'Retrying retained report.';
     await transaction.objectStore('jobs').put(job);
     await transaction.objectStore('runs').put(run);
     await transaction.done;
@@ -646,13 +721,7 @@ export async function scheduleCaptureRecovery(
 }
 
 export async function listPausedCaptureJobIds(): Promise<string[]> {
-  const transaction = (await db()).transaction('jobs', 'readonly');
-  const ids: string[] = [];
-  for await (const cursor of transaction.store.index('by-state').iterate('paused')) {
-    ids.push(String(cursor.primaryKey));
-  }
-  await transaction.done;
-  return ids;
+  return (await db()).getAllKeysFromIndex('jobs', 'by-state', 'paused');
 }
 
 export async function commitCaptureJob(options: {
@@ -676,11 +745,7 @@ export async function commitCaptureJob(options: {
     if (!run || !providerRun) {
       const job = normalizeCaptureJobRecord(rawJob, options.id).job;
       if (job && job.runId === options.runId && job.provider === options.provider) {
-        job.state = 'orphaned';
-        job.orphanedAt ??= Date.now();
-        job.leasedAt = undefined;
-        job.leaseToken = undefined;
-        await transaction.objectStore('jobs').put(job);
+        await transaction.objectStore('jobs').put(orphanCaptureJob(job));
       }
       await transaction.done;
       return { outcome: 'missing_owner' };
@@ -698,9 +763,7 @@ export async function commitCaptureJob(options: {
       return { outcome: 'missing_capture' };
     }
     if (options.capture) {
-      capture.revision = existingCapture && captureContentSignature(existingCapture) === captureContentSignature(capture)
-        ? existingCapture.revision ?? legacyCaptureRevision(existingCapture)
-        : crypto.randomUUID();
+      capture = assignCaptureRevision(capture, existingCapture);
       await transaction.objectStore('captures').put(capture, options.id);
     } else if (!capture.revision) {
       capture.revision = legacyCaptureRevision(capture);
@@ -719,14 +782,10 @@ export async function commitCaptureJob(options: {
     const captureChanged = providerRun.captureId !== options.id
       || (providerRun.artifactRevision !== undefined && providerRun.artifactRevision !== revision)
       || (degraded && !providerRun.degraded);
-    const recoveredStorageFailure = providerRun.status === 'failed'
-      && (providerRun.captureRecoveryPending || providerRun.captureRecoveryInProgress
-        || providerRun.statusDetail === CAPTURE_STORAGE_FAILURE_DETAIL);
+    const recoveredStorageFailure = providerRun.captureRecoveryReason === 'storage_failure';
     providerRun.captureId = options.id;
     providerRun.artifactRevision = revision;
-    providerRun.captureReviewPending = undefined;
-    providerRun.captureRecoveryPending = undefined;
-    providerRun.captureRecoveryInProgress = undefined;
+    clearCaptureRecovery(providerRun);
     if (legacyReceiptForSameCapture) providerRun.saveReceipt!.artifactRevision = revision;
     providerRun.degraded ||= degraded;
     let completed = false;
@@ -769,6 +828,24 @@ export interface CaptureJobCursor {
   id: string;
 }
 
+export function captureJobIsEligible(
+  job: CaptureJob,
+  providerRun: ProviderRun | undefined,
+  now = Date.now(),
+): boolean {
+  if (job.state === 'paused') return false;
+  if (job.state === 'orphaned') {
+    return Boolean(providerRun) || now - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS;
+  }
+  if (providerRun?.captureRecoveryPending) return false;
+  const leaseAge = job.leasedAt === undefined ? undefined : now - job.leasedAt;
+  if (job.state !== 'queued' && !(leaseAge !== undefined && (leaseAge < 0 || leaseAge > 60_000))) return false;
+  if (job.deferredForNavigation
+    && now - (job.deferredAt ?? job.createdAt) < NAVIGATION_DEFERRAL_MS
+    && providerRun && !isTerminalProviderStatus(providerRun.status)) return false;
+  return true;
+}
+
 export async function nextCaptureJob(after?: CaptureJobCursor): Promise<CaptureJob | undefined> {
   const database = await db();
   const transaction = database.transaction(['jobs', 'runs'], 'readonly');
@@ -783,25 +860,7 @@ export async function nextCaptureJob(after?: CaptureJobCursor): Promise<CaptureJ
     const storedRun = await transaction.objectStore('runs').get(job.runId);
     const run = storedRun && validRunRecord(storedRun) ? storedRun : undefined;
     if (storedRun && !run) warnInvalidRun(storedRun);
-    if (job.state === 'orphaned') {
-      if (Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
-        selected = job;
-        break;
-      }
-      if (run?.providerRuns[job.provider]) {
-        selected = job;
-        break;
-      }
-      continue;
-    }
-    if (run?.providerRuns[job.provider]?.captureRecoveryPending) continue;
-    const leaseAge = job.leasedAt === undefined ? undefined : Date.now() - job.leasedAt;
-    if (job.state !== 'queued' && !(leaseAge !== undefined && (leaseAge < 0 || leaseAge > 60_000))) continue;
-    if (!job.deferredForNavigation || Date.now() - (job.deferredAt ?? job.createdAt) >= NAVIGATION_DEFERRAL_MS) {
-      selected = job;
-      break;
-    }
-    if (!run || !run.providerRuns[job.provider] || isTerminalProviderStatus(run.providerRuns[job.provider]!.status)) {
+    if (captureJobIsEligible(job, run?.providerRuns[job.provider])) {
       selected = job;
       break;
     }

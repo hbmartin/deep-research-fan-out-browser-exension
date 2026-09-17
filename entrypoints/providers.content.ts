@@ -1066,7 +1066,9 @@ export default defineContentScript({
       if (message.type === 'capture:dom-current' && message.provider === provider) {
         return currentResponseSnapshot(ADAPTERS[provider], message.runId, message.conversationKey);
       }
-      if (message.type === 'capture:copy-now' && active) {
+      if (message.type === 'capture:copy-now') {
+        if (!active || active.stopped) throw new Error('Provider copy request arrived after monitoring stopped.');
+        if (Date.now() >= message.expiresAt) throw new Error('Provider copy request expired before delivery.');
         const pageIdentity = observeConversation(active);
         const expectedJobId = `${active.id}:${active.adapter.id}`;
         const entryFallback = pageIdentity.kind === 'entry'
@@ -1082,6 +1084,9 @@ export default defineContentScript({
         const button = root ? findResponseControl(root, roots, active.adapter.selectors.copyButton, new Set(), true) : null;
         if (!button || !isResponseControlActionable(button, true, root ?? undefined)) {
           throw new Error('Provider copy button is unavailable.');
+        }
+        if (Date.now() >= message.expiresAt || active.stopped) {
+          throw new Error('Provider copy request expired before the copy control was activated.');
         }
         return { ok: true, copyConfirmed: await clickCopyControl(button, active.adapter) };
       }
