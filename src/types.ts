@@ -161,6 +161,8 @@ export interface ProviderRun {
   captureRecoveryPending?: boolean;
   /** A retained report retry was durably scheduled and is being processed. */
   captureRecoveryInProgress?: boolean;
+  /** Durable reason that determines how a successful retained report changes the provider outcome. */
+  captureRecoveryReason?: 'storage_failure';
   /** A retained raw report could not be safely associated with this provider and needs review. */
   captureReviewPending?: boolean;
 }

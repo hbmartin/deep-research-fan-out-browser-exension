@@ -1,7 +1,7 @@
 import { ADAPTERS, classifyProviderPage, conversationKeysMatch, isProviderUrl, normalizeConversationKey, providerFromUrl, type ProviderPageIdentity } from './adapters';
 import { buildArtifact, buildCurrentResponseCopy } from './artifacts';
 import { reconcileCitations, tokenContainment, tokenSimilarity } from './citations';
-import { acceptCaptureJob, CAPTURE_STORAGE_FAILURE_DETAIL, CaptureJobReviewRequiredError, captureId, commitCaptureJob, deleteJob, discardBlockedCaptureJob, getCapture, getJob, getRedirect, getRun, inspectCaptureJob, inspectCaptureRecovery, isUsableCaptureJobReport, listPausedCaptureJobIds, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, normalizeCaptureRecovery, ORPHAN_JOB_RETENTION_MS, pruneExpiredRedirects, putJob, putRedirect, putRun, scheduleCaptureRecovery, type CaptureJobCursor, type CaptureRecoveryInspection, type CaptureRecoveryNormalization } from './db';
+import { acceptCaptureJob, CAPTURE_STORAGE_FAILURE_DETAIL, CaptureJobReviewRequiredError, captureId, captureJobIsEligible, clearCaptureRecovery, commitCaptureJob, deleteJob, discardBlockedCaptureJob, getCapture, getJob, getRedirect, getRun, inspectCaptureJob, inspectCaptureRecovery, isUsableCaptureJobReport, listPausedCaptureJobIds, listRuns, MAX_CAPTURE_ATTEMPTS, nextCaptureJob, normalizeCaptureRecovery, orphanCaptureJob, ORPHAN_JOB_RETENTION_MS, pruneExpiredRedirects, putJob, putRedirect, putRun, scheduleCaptureRecovery, type CaptureJobCursor, type CaptureRecoveryInspection, type CaptureRecoveryNormalization } from './db';
 import { NAVIGATION_DEFERRAL_MS } from './durations';
 import type { ContentStateReason, CurrentResponseSnapshot, ProviderSnapshot, RuntimeErrorCode, RuntimeRequest, RuntimeResponse } from './messages';
 import { createPlatform, handleOffscreenResponse, sendTabEvent, type BrowserPlatform } from './platform';
@@ -13,14 +13,19 @@ import { ATTENTION_PROVIDER_STATUSES, isTerminalProviderStatus, PROVIDERS, type 
 
 const ALARM_NAME = 'reconcile-runs';
 const COPY_CURRENT_MENU_ID = 'copy-current-research-response';
+const MAX_CONCURRENT_CAPTURE_TASKS = 2;
+const COPY_REQUEST_VALID_MS = 4_000;
+const COPY_REQUEST_TIMEOUT_MS = 6_000;
 let contextMenuRegistrationTail = Promise.resolve();
 const clipboardMutationTails = new Map<string, Promise<void>>();
 const BROWSER_SESSION_KEY = 'coordinator.browser-session.v1';
 let captureScanPromise: Promise<void> | undefined;
 let captureScanRequested = false;
+let captureSchedulerEpoch = 0;
 const activeCaptureTasks = new Map<string, Promise<void>>();
 const activeCaptureTaskGenerations = new Map<string, string>();
-const captureTaskRerunIds = new Set<string>();
+const activeCaptureTaskControllers = new Map<string, AbortController>();
+const pendingCaptureTasks = new Map<string, { target: CaptureTaskTarget; supersede: boolean }>();
 let reconcileWorkerRunning = false;
 let lastNonRunInteractionAt = 0;
 const knownRunTabIds = new Set<number>();
@@ -613,11 +618,25 @@ async function handleCopyCurrentContextMenu(info: Browser.contextMenus.OnClickDa
   ).catch((error) => console.error('Could not show the Copy current success notification.', error));
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+class CaptureTaskCancelledError extends Error {
+  constructor() {
+    super('Capture task was superseded.');
+    this.name = 'CaptureTaskCancelledError';
+  }
+}
+
+function throwIfCaptureTaskCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new CaptureTaskCancelledError();
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      promise,
+    return await Promise.race([promise,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error(message)), timeoutMs);
       }),
@@ -627,30 +646,47 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
   }
 }
 
-async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Promise<{ text: string; restored: boolean } | undefined> {
+interface CaptureLeaseGuard {
+  signal: AbortSignal;
+  assertCurrent(): Promise<void>;
+}
+
+async function clipboardCapture(
+  platform: BrowserPlatform,
+  job: CaptureJob,
+  guard?: CaptureLeaseGuard,
+): Promise<{ text: string; restored: boolean } | undefined> {
   return withClipboardLock(async () => {
+    if (guard) await guard.assertCurrent();
     const settings = await loadSettings();
     const domMarkdown = job.domMarkdown.trim();
     const hasVerifiableDom = domMarkdown.length >= 20;
     const attemptCapture = async (allowCopyOnly = false): Promise<{ text: string; restored: boolean }> => {
+      if (guard) await guard.assertCurrent();
       const original = await platform.readClipboard();
       const sentinel = `__DRFO_COPY_${crypto.randomUUID()}__`;
       let primed = false;
       let observed: string | undefined;
       let copyConfirmed = false;
+      let providerCopyObserved = false;
       try {
+        if (guard) await guard.assertCurrent();
         await platform.writeClipboard(sentinel);
         primed = true;
         if (await platform.readClipboard() !== sentinel) throw new Error('Could not verify the clipboard capture sentinel.');
+        if (guard) await guard.assertCurrent();
+        const expiresAt = Date.now() + COPY_REQUEST_VALID_MS;
         const clickResult = await withTimeout(sendTabEvent(job.tabId, {
-          type: 'capture:copy-now', jobId: job.id, conversationKey: job.conversationKey,
-        }), 5000, 'Provider copy request timed out.');
+          type: 'capture:copy-now', jobId: job.id, conversationKey: job.conversationKey, expiresAt,
+        }), COPY_REQUEST_TIMEOUT_MS, 'Provider copy request timed out.');
         copyConfirmed = Boolean(clickResult && typeof clickResult === 'object'
           && 'copyConfirmed' in clickResult && clickResult.copyConfirmed === true);
         await new Promise((resolve) => setTimeout(resolve, 250));
         observed = await platform.readClipboard();
         const resemblesDomReport = hasVerifiableDom
           && (tokenSimilarity(observed, domMarkdown) >= 0.45 || tokenContainment(observed, domMarkdown) >= 0.8);
+        providerCopyObserved = copyConfirmed || resemblesDomReport;
+        if (guard) await guard.assertCurrent();
         const confirmedShortCopy = copyConfirmed && (resemblesDomReport || (allowCopyOnly && !hasVerifiableDom));
         if (observed === sentinel
           || !observed.trim()
@@ -671,29 +707,40 @@ async function clipboardCapture(platform: BrowserPlatform, job: CaptureJob): Pro
         if (primed) {
           const current = await platform.readClipboard().catch(() => undefined);
           if (current === sentinel
-            || (settings.restoreClipboard && copyConfirmed && observed !== undefined && current === observed)) {
+            || (settings.restoreClipboard && providerCopyObserved && observed !== undefined && current === observed)) {
             await platform.writeClipboard(original).catch(() => undefined);
           }
         }
+        if (error instanceof CaptureTaskCancelledError) throw error;
         throw error;
       }
     };
     if (hasVerifiableDom) {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try { return await attemptCapture(); }
-        catch { await new Promise((resolve) => setTimeout(resolve, 300)); }
+        catch (error) {
+          if (error instanceof CaptureTaskCancelledError) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
       }
     }
+    if (guard) await guard.assertCurrent();
     if (job.tabUnavailable || Date.now() - lastNonRunInteractionAt < 5000) return undefined;
     const [current] = await browser.tabs.query({ active: true, currentWindow: true });
+    let activatedProvider = false;
     try {
+      if (guard) await guard.assertCurrent();
       await activateTabInternally(job.tabId);
+      activatedProvider = true;
       await new Promise((resolve) => setTimeout(resolve, 150));
       return await attemptCapture(!hasVerifiableDom);
-    } catch {
+    } catch (error) {
+      if (error instanceof CaptureTaskCancelledError) throw error;
       return undefined;
     } finally {
-      if (current?.id !== undefined && current.id !== job.tabId) await activateTabInternally(current.id).catch(() => undefined);
+      if (activatedProvider && current?.id !== undefined && current.id !== job.tabId) {
+        await activateTabInternally(current.id).catch(() => undefined);
+      }
     }
   });
 }
@@ -836,22 +883,19 @@ async function claimCaptureTask(target: CaptureTaskTarget, leaseToken: string): 
       if (job.state === 'orphaned' && Date.now() - (job.orphanedAt ?? job.createdAt) >= ORPHAN_JOB_RETENTION_MS) {
         await deleteJob(job.id);
       } else {
-        job.state = 'orphaned';
-        job.orphanedAt ??= Date.now();
-        job.leasedAt = undefined;
-        job.leaseToken = undefined;
-        await putJob(job);
+        await putJob(orphanCaptureJob(job));
       }
       return { kind: 'none' };
     }
-    if (job.state === 'paused' && !providerRun.captureRecoveryInProgress) return { kind: 'none' };
+    let jobChanged = false;
     if (job.state === 'orphaned') {
       job.state = 'queued';
       job.orphanedAt = undefined;
-      if (providerRun.captureRecoveryPending && !providerRun.captureRecoveryInProgress) {
-        await putJob(job);
-        return { kind: 'none' };
-      }
+      jobChanged = true;
+    }
+    if (!captureJobIsEligible(job, providerRun)) {
+      if (jobChanged) await putJob(job);
+      return { kind: 'none' };
     }
     job.state = 'leased';
     job.leasedAt = Date.now();
@@ -865,7 +909,7 @@ type PreparedCaptureAttempt =
   | { kind: 'stale' }
   | { kind: 'discarded' }
   | { kind: 'deferred'; run: Run; notify: boolean }
-  | { kind: 'ready'; job: CaptureJob; navigatedAway: boolean; forceDomFallback: boolean };
+  | { kind: 'ready'; job: CaptureJob; navigatedAway: boolean; forceDomFallback: boolean; broadcast: boolean };
 
 async function prepareCaptureAttempt(
   target: CaptureTaskTarget,
@@ -877,14 +921,11 @@ async function prepareCaptureAttempt(
     if (!job || job.state !== 'leased' || job.leaseToken !== leaseToken) return { kind: 'stale' };
     const providerRun = run?.providerRuns[target.provider];
     if (!run || !providerRun) {
-      job.state = 'orphaned';
-      job.orphanedAt ??= Date.now();
-      job.leasedAt = undefined;
-      job.leaseToken = undefined;
-      await putJob(job);
+      await putJob(orphanCaptureJob(job));
       return { kind: 'stale' };
     }
     const navigatedAway = page.kind === 'different_conversation' || page.kind === 'external';
+    let broadcast = false;
     let forceDomFallback = Boolean(job.tabUnavailable
       || isTerminalProviderStatus(providerRun.status)
       || job.attempts >= MAX_CAPTURE_ATTEMPTS
@@ -926,10 +967,11 @@ async function prepareCaptureAttempt(
       providerRun.statusDetail = undefined;
       run.status = deriveRunStatus(run);
       await putRun(run);
+      broadcast = true;
     }
     if (job.attempts < MAX_CAPTURE_ATTEMPTS) job.attempts += 1;
     await putJob(job);
-    return { kind: 'ready', job: structuredClone(job), navigatedAway, forceDomFallback };
+    return { kind: 'ready', job: structuredClone(job), navigatedAway, forceDomFallback, broadcast };
   });
 }
 
@@ -944,11 +986,7 @@ async function handleCaptureTaskFailure(
     if (!job || job.state !== 'leased' || job.leaseToken !== leaseToken) return { kind: 'stale' } as const;
     const providerRun = run?.providerRuns[target.provider];
     if (!run || !providerRun) {
-      job.state = 'orphaned';
-      job.orphanedAt ??= Date.now();
-      job.leasedAt = undefined;
-      job.leaseToken = undefined;
-      await putJob(job);
+      await putJob(orphanCaptureJob(job));
       return { kind: 'stale' } as const;
     }
     if (job.attempts < MAX_CAPTURE_ATTEMPTS) {
@@ -965,7 +1003,10 @@ async function handleCaptureTaskFailure(
       job.tabUnavailable = true;
       job.deferredForNavigation = undefined;
       job.deferredAt = undefined;
-      await putJob(job);
+      try { await putJob(job); }
+      catch (pauseError) {
+        console.error('Could not pause the retained capture job.', pauseError);
+      }
       providerRun.captureReviewPending = undefined;
       providerRun.captureRecoveryInProgress = undefined;
       providerRun.captureRecoveryPending = true;
@@ -973,12 +1014,18 @@ async function handleCaptureTaskFailure(
       if (!isTerminalProviderStatus(providerRun.status)) {
         providerRun.status = 'failed';
         providerRun.statusDetail = CAPTURE_STORAGE_FAILURE_DETAIL;
+        providerRun.captureRecoveryReason = 'storage_failure';
         providerRun.completedAt ??= Date.now();
         run.status = deriveRunStatus(run);
         terminalized = true;
       }
-      await putRun(run);
-      return { kind: 'paused', run, terminalized } as const;
+      let runPersisted = true;
+      try { await putRun(run); }
+      catch (stateError) {
+        runPersisted = false;
+        console.error('Could not persist the capture-storage failure.', stateError);
+      }
+      return { kind: 'paused', run, terminalized: terminalized && runPersisted } as const;
     }
     await deleteJob(job.id);
     let terminalized = false;
@@ -999,8 +1046,18 @@ async function handleCaptureTaskFailure(
     return;
   }
   if (outcome.kind === 'paused') {
-    if (outcome.terminalized) await settleProvider(target.runId, target.provider);
-    else await broadcastRuns();
+    let settlementBroadcast = false;
+    if (outcome.terminalized) {
+      try {
+        await settleProvider(target.runId, target.provider);
+        settlementBroadcast = true;
+      } catch (settlementError) {
+        console.error('Could not settle the capture-storage failure.', settlementError);
+      }
+    }
+    if (!settlementBroadcast) {
+      await broadcastRuns().catch((broadcastError) => console.error('Could not broadcast the capture-storage failure.', broadcastError));
+    }
     await createPlatform().notify(
       `attention:${target.runId}:${target.provider}`,
       `${ADAPTERS[target.provider].label} report needs a retry`,
@@ -1012,9 +1069,11 @@ async function handleCaptureTaskFailure(
   }
 }
 
-async function runCaptureTask(target: CaptureTaskTarget, leaseToken: string): Promise<void> {
+async function runCaptureTask(target: CaptureTaskTarget, leaseToken: string, signal: AbortSignal): Promise<void> {
   const platform = createPlatform();
+  throwIfCaptureTaskCancelled(signal);
   const claim = await claimCaptureTask(target, leaseToken);
+  throwIfCaptureTaskCancelled(signal);
   if (claim.kind === 'none') return;
   if (claim.kind === 'link') {
     await completeProviderCapture(target.runId, target.provider, target.id);
@@ -1023,7 +1082,9 @@ async function runCaptureTask(target: CaptureTaskTarget, leaseToken: string): Pr
   const page = claim.job.tabUnavailable
     ? { kind: 'unavailable' } as const
     : await classifyOwnedProviderTab(claim.providerRun);
+  throwIfCaptureTaskCancelled(signal);
   const attempt = await prepareCaptureAttempt(target, leaseToken, page);
+  throwIfCaptureTaskCancelled(signal);
   if (attempt.kind === 'stale' || attempt.kind === 'discarded') return;
   if (attempt.kind === 'deferred') {
     if (attempt.notify) await platform.notify(
@@ -1033,8 +1094,24 @@ async function runCaptureTask(target: CaptureTaskTarget, leaseToken: string): Pr
     ).catch(() => undefined);
     return;
   }
+  if (attempt.broadcast) {
+    await broadcastRuns().catch((error) => console.error('Could not broadcast capture preparation.', error));
+  }
+  const guard: CaptureLeaseGuard = {
+    signal,
+    assertCurrent: async () => {
+      throwIfCaptureTaskCancelled(signal);
+      const current = await getJob(target.id);
+      throwIfCaptureTaskCancelled(signal);
+      if (!current || current.state !== 'leased' || current.leaseToken !== leaseToken) {
+        throw new CaptureTaskCancelledError();
+      }
+    },
+  };
   try {
-    const copied = attempt.forceDomFallback ? undefined : await clipboardCapture(platform, attempt.job);
+    await guard.assertCurrent();
+    const copied = attempt.forceDomFallback ? undefined : await clipboardCapture(platform, attempt.job, guard);
+    await guard.assertCurrent();
     const capture = await persistCaptureJob(attempt.job, copied);
     const committed = await withCaptureAndRunLock(target.runId, target.provider, () => commitCaptureJob({
       id: target.id,
@@ -1048,53 +1125,90 @@ async function runCaptureTask(target: CaptureTaskTarget, leaseToken: string): Pr
       await settleProvider(target.runId, target.provider, committed.completed);
     }
   } catch (error) {
+    if (error instanceof CaptureTaskCancelledError) return;
     await handleCaptureTaskFailure(target, leaseToken, error, attempt.navigatedAway);
   }
 }
 
-function scheduleCaptureTask(target: CaptureTaskTarget, supersede = false): void {
-  if (activeCaptureTaskGenerations.has(target.id) && !supersede) {
-    captureTaskRerunIds.add(target.id);
-    return;
-  }
-  const generation = crypto.randomUUID();
-  const taskKey = `${target.id}\u0000${generation}`;
-  const promise = runCaptureTask(target, generation)
-    .catch((error) => console.error(`Capture task failed for ${target.provider}.`, error))
-    .finally(() => {
-      activeCaptureTasks.delete(taskKey);
-      if (activeCaptureTaskGenerations.get(target.id) === generation) {
-        activeCaptureTaskGenerations.delete(target.id);
-        if (captureTaskRerunIds.delete(target.id)) scheduleCaptureTask(target);
-      }
-    });
-  activeCaptureTaskGenerations.set(target.id, generation);
-  activeCaptureTasks.set(taskKey, promise);
+function abortActiveCaptureTask(id: string): void {
+  const generation = activeCaptureTaskGenerations.get(id);
+  if (generation) activeCaptureTaskControllers.get(`${id}\u0000${generation}`)?.abort();
 }
 
-async function processCaptureQueuePass(): Promise<void> {
+function startPendingCaptureTasks(): void {
+  while (activeCaptureTasks.size < MAX_CONCURRENT_CAPTURE_TASKS) {
+    const next = [...pendingCaptureTasks].find(([id, pending]) => (
+      pending.supersede || !activeCaptureTaskGenerations.has(id)
+    ));
+    if (!next) return;
+    const [id, pending] = next;
+    const { target } = pending;
+    pendingCaptureTasks.delete(id);
+    const generation = crypto.randomUUID();
+    const taskKey = `${target.id}\u0000${generation}`;
+    const controller = new AbortController();
+    const schedulerEpoch = captureSchedulerEpoch;
+    activeCaptureTaskGenerations.set(target.id, generation);
+    activeCaptureTaskControllers.set(taskKey, controller);
+    let requestRescan = true;
+    const promise = runCaptureTask(target, generation, controller.signal)
+      .catch((error) => {
+        if (!(error instanceof CaptureTaskCancelledError)) {
+          requestRescan = false;
+          console.error(`Capture task failed for ${target.provider}.`, error);
+        }
+      })
+      .finally(() => {
+        activeCaptureTasks.delete(taskKey);
+        activeCaptureTaskControllers.delete(taskKey);
+        if (activeCaptureTaskGenerations.get(target.id) === generation) {
+          activeCaptureTaskGenerations.delete(target.id);
+        }
+        if (schedulerEpoch === captureSchedulerEpoch) {
+          startPendingCaptureTasks();
+          if (requestRescan) requestCaptureQueueScan();
+        }
+      });
+    activeCaptureTasks.set(taskKey, promise);
+  }
+}
+
+function scheduleCaptureTask(target: CaptureTaskTarget, supersede = false): void {
+  if (supersede) abortActiveCaptureTask(target.id);
+  else if (activeCaptureTaskGenerations.has(target.id) || pendingCaptureTasks.has(target.id)) return;
+  pendingCaptureTasks.set(target.id, { target, supersede });
+  startPendingCaptureTasks();
+}
+
+async function processCaptureQueuePass(schedulerEpoch = captureSchedulerEpoch): Promise<void> {
+  if (activeCaptureTasks.size + pendingCaptureTasks.size >= MAX_CONCURRENT_CAPTURE_TASKS) return;
   let cursor: CaptureJobCursor | undefined;
   for (;;) {
     const job = await nextCaptureJob(cursor);
+    if (schedulerEpoch !== captureSchedulerEpoch) return;
     if (!job) return;
     cursor = { createdAt: job.createdAt, id: job.id };
+    if (activeCaptureTaskGenerations.has(job.id) || pendingCaptureTasks.has(job.id)) continue;
     scheduleCaptureTask({ id: job.id, runId: job.runId, provider: job.provider });
+    if (activeCaptureTasks.size + pendingCaptureTasks.size >= MAX_CONCURRENT_CAPTURE_TASKS) return;
   }
 }
 
 function requestCaptureQueueScan(): void {
   captureScanRequested = true;
   if (captureScanPromise) return;
+  const schedulerEpoch = captureSchedulerEpoch;
   const worker = (async () => {
-    while (captureScanRequested) {
+    while (schedulerEpoch === captureSchedulerEpoch && captureScanRequested) {
       captureScanRequested = false;
-      await processCaptureQueuePass();
+      await processCaptureQueuePass(schedulerEpoch);
     }
   })();
   let tracked: Promise<void>;
   tracked = worker.catch((error) => {
     console.error('Could not scan the capture queue.', error);
   }).finally(() => {
+    if (schedulerEpoch !== captureSchedulerEpoch) return;
     if (captureScanPromise === tracked) captureScanPromise = undefined;
     if (captureScanRequested) requestCaptureQueueScan();
   });
@@ -1104,11 +1218,13 @@ function requestCaptureQueueScan(): void {
 async function waitForCaptureQueueIdle(): Promise<void> {
   requestCaptureQueueScan();
   for (;;) {
+    startPendingCaptureTasks();
     const scan = captureScanPromise;
     if (scan) await scan;
     const tasks = [...activeCaptureTasks.values()];
     if (tasks.length) await Promise.all(tasks);
-    if (!captureScanPromise && activeCaptureTasks.size === 0 && !captureScanRequested) return;
+    if (!captureScanPromise && activeCaptureTasks.size === 0
+      && pendingCaptureTasks.size === 0 && !captureScanRequested) return;
   }
 }
 
@@ -1162,9 +1278,7 @@ async function queueCapture(
         job.conversationKey = verifiedConversationKey;
         provider.status = 'capturing';
         provider.statusDetail = undefined;
-        provider.captureReviewPending = undefined;
-        provider.captureRecoveryPending = undefined;
-        provider.captureRecoveryInProgress = undefined;
+        clearCaptureRecovery(provider);
         storedRun.status = deriveRunStatus(storedRun);
         return storedRun;
       });
@@ -1373,6 +1487,7 @@ async function settleProvider(
 
 async function markCaptureJobTabUnavailable(runId: string, provider: ProviderId): Promise<boolean> {
   const id = captureId(runId, provider);
+  abortActiveCaptureTask(id);
   return serializeCapture(id, async () => {
     const job = await getJob(id);
     if (!job || job.state === 'paused' || job.state === 'orphaned') return false;
@@ -1460,26 +1575,6 @@ async function recordReconcileCheck(runId: string, provider: ProviderId, valid: 
   })).run;
 }
 
-function recoveryNeedsNormalization(recovery: CaptureRecoveryInspection, provider: ProviderId): boolean {
-  if (recovery.kind === 'missing_owner' || recovery.kind === 'saved_capture') return false;
-  const providerRun = recovery.run.providerRuns[provider]!;
-  if (recovery.kind === 'review_required') {
-    return !providerRun.captureReviewPending || Boolean(providerRun.captureRecoveryPending
-      || providerRun.captureRecoveryInProgress);
-  }
-  if (recovery.kind === 'unavailable') {
-    return recovery.jobExists || Boolean(providerRun.captureReviewPending
-      || providerRun.captureRecoveryPending || providerRun.captureRecoveryInProgress);
-  }
-  if (recovery.job.state === 'paused') {
-    return !providerRun.captureRecoveryPending || Boolean(providerRun.captureReviewPending
-      || providerRun.captureRecoveryInProgress)
-      || !isTerminalProviderStatus(providerRun.status);
-  }
-  return Boolean(providerRun.captureReviewPending
-    || (providerRun.captureRecoveryPending && !providerRun.captureRecoveryInProgress));
-}
-
 async function resumeProviderAfterRecoveryRemoval(
   runInput: Run,
   provider: ProviderId,
@@ -1512,21 +1607,26 @@ async function resumeProviderAfterRecoveryRemoval(
 async function reconcileCaptureRecoveryRecords(
   runId: string,
   provider: ProviderId,
-): Promise<boolean> {
+): Promise<{ changed: boolean; broadcastHandled: boolean }> {
   const id = captureId(runId, provider);
   let recovery: CaptureRecoveryInspection | CaptureRecoveryNormalization = await inspectCaptureRecovery(id, runId, provider);
+  if (recovery.normalizationNeeded) {
+    recovery = await withCaptureAndRunLock(runId, provider, () => normalizeCaptureRecovery(id, runId, provider));
+  }
   if (recovery.kind === 'saved_capture') {
     scheduleCaptureTask({ id, runId, provider }, true);
-    return false;
+    return { changed: 'changed' in recovery ? recovery.changed : false, broadcastHandled: false };
   }
-  if (recoveryNeedsNormalization(recovery, provider)) {
-    recovery = await withCaptureAndRunLock(runId, provider, () => normalizeCaptureRecovery(id, runId, provider));
+  let broadcastHandled = false;
+  if ('settlementRequired' in recovery && recovery.settlementRequired) {
+    await settleProvider(runId, provider);
+    broadcastHandled = true;
   }
   if (recovery.kind === 'usable_job' && recovery.job.state !== 'paused') requestCaptureQueueScan();
   if (recovery.kind !== 'missing_owner' && 'resumeRecommended' in recovery && recovery.resumeRecommended) {
     await resumeProviderAfterRecoveryRemoval(recovery.run, provider, true);
   }
-  return 'changed' in recovery ? recovery.changed : false;
+  return { changed: 'changed' in recovery ? recovery.changed : false, broadcastHandled };
 }
 
 async function reconcileRuns(): Promise<void> {
@@ -1543,8 +1643,8 @@ async function reconcileRuns(): Promise<void> {
       if (paused || providerRun.captureRecoveryPending || providerRun.captureRecoveryInProgress
         || providerRun.captureReviewPending) {
         try {
-          const changed = await reconcileCaptureRecoveryRecords(snapshot.id, providerRun.provider);
-          recoveryChanged ||= changed;
+          const result = await reconcileCaptureRecoveryRecords(snapshot.id, providerRun.provider);
+          recoveryChanged ||= result.changed && !result.broadcastHandled;
         }
         catch (error) { console.error('Could not reconcile retained capture state.', error); }
       }
@@ -1859,6 +1959,8 @@ export const coordinatorTestHooks = {
   reconcileCaptureRecoveryRecords,
   reconcileRuns,
   resetBrowserSession: () => {
+    captureSchedulerEpoch += 1;
+    for (const controller of activeCaptureTaskControllers.values()) controller.abort();
     browserSessionIdPromise = undefined;
     fallbackBrowserSessionId = undefined;
     runMutationTails.clear();
@@ -1869,7 +1971,8 @@ export const coordinatorTestHooks = {
     captureScanRequested = false;
     activeCaptureTasks.clear();
     activeCaptureTaskGenerations.clear();
-    captureTaskRerunIds.clear();
+    activeCaptureTaskControllers.clear();
+    pendingCaptureTasks.clear();
     contextMenuRegistrationTail = Promise.resolve();
   },
   getLastNonRunInteractionAt: () => lastNonRunInteractionAt,
