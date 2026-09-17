@@ -93,7 +93,7 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
   }
   const actions = element('div', 'actions');
   actions.append(button('Open', () => command({ type: 'provider:focus', runId: run.id, provider }), 'secondary'));
-  if (providerRun.captureReviewPending) {
+  if (providerRun.captureReviewPending && !providerRun.captureRecoveryInProgress) {
     row.append(element('p', 'warning', 'A retained report needs review before capture can continue.'));
     actions.append(button('Copy retained report', async () => {
       await command({ type: 'provider:copy-retained-job', runId: run.id, provider });
@@ -115,10 +115,14 @@ function providerRow(run: Run, provider: ProviderId): HTMLElement {
       setNotice(`${ADAPTERS[provider].label} current response copied.`);
     }));
   }
-  if (providerRun.captureRecoveryPending && !providerRun.captureReviewPending) {
+  if (providerRun.captureRecoveryInProgress) {
+    row.append(element('p', 'warning', 'Retrying the retained report…'));
+  } else if (providerRun.captureRecoveryPending && !providerRun.captureReviewPending) {
     actions.append(button('Retry report', () => command({ type: 'provider:retry-capture', runId: run.id, provider }), 'secondary'));
   }
-  if (isTerminalProviderStatus(providerRun.status) && !providerRun.captureRecoveryPending) {
+  const captureActionPending = providerRun.captureReviewPending
+    || providerRun.captureRecoveryPending || providerRun.captureRecoveryInProgress;
+  if (isTerminalProviderStatus(providerRun.status) && !captureActionPending) {
     actions.append(button('Save again', () => command({ type: 'provider:save', runId: run.id, provider }), 'secondary'));
   } else if (!isTerminalProviderStatus(providerRun.status)) {
     actions.append(button('End provider', () => command(
